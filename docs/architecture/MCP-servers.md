@@ -7,7 +7,7 @@ nav_order: 4
 
 An MCP server gives an agent extra tools (a reference library, a database, a search service). RS keeps two lists of them. The newer one sits behind a shared gateway and is managed and wired in the browser. The older one is per project and managed from the host. Both serve a research project's analysis workers.
 
-## The gateway list (Sandboxes → MCP)
+## The gateway list (Services → MCP)
 
 A server on this list is an address (`http://` or `https://`) plus optional secret request headers, such as an API key. The page adds, edits, tests and removes servers. `research mcp server list | add | edit | remove | test | reset` does the same from the host.
 
@@ -38,7 +38,7 @@ Nothing restarts. The agent sees a change in its next session, in Claude Code an
 
 ```mermaid
 flowchart TD
-    P[Sandboxes → MCP page] --> B[Broker on the host]
+    P[Services → MCP tab] --> B[Broker on the host]
     C[research mcp ...] --> L
     B --> L[Server list and wiring table on the host]
     L --> G[MCP gateway container]

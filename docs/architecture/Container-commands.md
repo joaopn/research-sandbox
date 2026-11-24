@@ -52,7 +52,7 @@ flowchart TD
 | `rs-fetch` | Maintainer | Projects and boxes created with the rs-fetch option |
 | `rs-sync` | Maintainer | Same as rs-fetch |
 | `rs-publish` | Maintainer | Same as rs-fetch |
-| `research dev image` | Operator | Host terminal; the Development page's Images tab does the same |
+| `research dev image` | Operator | Host terminal; the Services page's Images tab does the same |
 | `rs-web-restart` | Anyone in the box | Boxes with a web app (OpenKnowledge) |
 | `rs-worker` | Research supervisor | Research projects ([Research workflow](Research-workflow.md)) |
 
@@ -166,7 +166,7 @@ python research.py dev image show <repo>
 python research.py dev image discard <repo>
 ```
 
-`build` builds the image from what GitHub has now. It runs in a throwaway project with no agent and no credentials. The new image replaces the repository's previous one on the shelf. The Images tab on the Development page does the same, with a log and a Cancel button. Details: [Dev lane](Dev-lane.md), "Built images".
+`build` builds the image from what GitHub has now. It runs in a throwaway project with no agent and no credentials. The new image replaces the repository's previous one on the shelf. The Images tab on the Services page does the same, with a log and a Cancel button. Details: [Dev lane](Dev-lane.md), "Built images".
 
 ## Design decisions
 

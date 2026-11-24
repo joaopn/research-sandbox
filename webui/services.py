@@ -434,13 +434,13 @@ def partition_origin_table(data, lo: int, hi: int) -> tuple[dict, list[dict]]:
 def describe_origin_entry(project: str, service: str, gitea_key: str,
                           aldine_key: str | None = None) -> dict:
     """An origin-table entry in the operator's words: `{"where", "what"}`.
-    `where` is the project name, or the Development page for the shared-Gitea
+    `where` is the project name, or the Services page for the shared-Gitea
     entry (its project is the sentinel `gitea_key`, which server.py owns), or
     every Aldine tab for the shared-Aldine entry (sentinel `aldine_key`).
     `what` names the tab: a static service by its label (Editor, Reader), a box
     editor by its box name, an app tab by its port; an unknown id stays as is."""
     if project == gitea_key:
-        return {"where": "Development page", "what": "Gitea"}
+        return {"where": "Services page", "what": "Gitea"}
     if aldine_key is not None and project == aldine_key:
         return {"where": "every project", "what": ALDINE_TAB_LABEL}
     if service.startswith(BOX_EDITOR_ID_PREFIX):

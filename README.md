@@ -79,11 +79,11 @@ To keep settings, put them in a `.env` file next to `research.py`:
 
 <img src="docs/assets/add-box.png" alt="The box window" width="720">
 
-**5. Wire tools.** **Sandboxes → MCP**: add a server, **Test**, then pick a project, its agent or a box, tick the servers and **Save**.
+**5. Wire tools.** **Services → MCP**: add a server, **Test**, then pick a project, its agent or a box, tick the servers and **Save**.
 
-**6. Hand over code.** Turn on Gitea under **Sandboxes → Infrastructure**, then create a **dev** project with a GitHub URL. Its agent works the repository by pull request. To collect the work, create a second, non-dev project with **rs-fetch** ticked: the **Development** page's Fetch tab copies the command that pulls it into a clone there.
+**6. Hand over code.** Turn on Gitea under **Services → Gitea**, then create a **dev** project with a GitHub URL. Its agent works the repository by pull request. To collect the work, create a second, non-dev project with **rs-fetch** ticked: the **Services** page's Fetch tab copies the command that pulls it into a clone there.
 
-<img src="docs/assets/development.png" alt="Development page: Fetch tab" width="720">
+<img src="docs/assets/development.png" alt="Services page: Fetch tab" width="720">
 
 Everything also runs from the command line: [CLI reference](docs/user-guide/cli-reference.md). More in the [docs](https://joaopn.github.io/research-sandbox/).
 

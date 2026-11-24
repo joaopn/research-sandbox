@@ -116,7 +116,7 @@ def resolve_wiring() -> None:
         die(f"no dev wiring ({dev_json} missing): this container is not a "
             f"dev project or dev box, or its dev wiring was never staged; on a "
             f"dev project, ask the operator to restart it (Stop, then Start, "
-            f"in Sandboxes → Management), which stages the wiring again")
+            f"in Host → Projects), which stages the wiring again")
     try:
         data = json.loads(dev_json.read_text())
     except (OSError, ValueError) as e:
@@ -140,7 +140,7 @@ def resolve_wiring() -> None:
     if not token:
         die(f"token missing at {token_file}: this project's dev-lane access "
             f"token is not staged; ask the operator to restart the project "
-            f"(Stop, then Start, in Sandboxes → Management), which stages it "
+            f"(Stop, then Start, in Host → Projects), which stages it "
             f"again")
     _WIRING.update(url=DEV_GITEA_URL, token=token,
                    user=row["agent_user"], repo=row["repo"])

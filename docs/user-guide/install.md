@@ -17,7 +17,7 @@ Builds all container images, starts the small **`rs-router`** egress-filter cont
 
 **2. Agent + editor dists** (auto on `start`):
 
-The two agents — Claude Code and pi — and the code-server editor are **not baked into images**: they're built once into a host cache and `cp`-deployed into every container at boot. `start` pulls Claude Code and the editor if missing; pull pi before you give a project pi, and touch the rest only to upgrade (the same downloads are on Sandboxes → Software):
+The two agents — Claude Code and pi — and the code-server editor are **not baked into images**: they're built once into a host cache and `cp`-deployed into every container at boot. `start` pulls Claude Code and the editor if missing; pull pi before you give a project pi, and touch the rest only to upgrade (the same downloads are on Host → Software):
 
 ```bash
 python research.py agent show | pull | refresh [--agent claude|pi]   # the agent dists (default claude)

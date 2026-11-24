@@ -40,15 +40,15 @@ The left rail lists the projects, with four entries at its bottom.
 
 | Page | Opens as | What it does |
 |---|---|---|
-| Projects rail | Always shown | Lists projects and opens their tabs; host CPU and memory |
+| Projects rail | Always shown | Lists projects and opens their tabs; host CPU and memory, which open Host when clicked |
 | New Project | Floating window | Workflow cards to create a project; import an existing one |
-| Development | Tabs: Gitea, Fetch, Repos, Images, Reviews, Backup | The [Dev lane](Dev-lane.md): Gitea, fetch commands, repositories, image builds of mirrored repos, reviews, Gitea backups |
-| Sandboxes | Tabs: Management, Infrastructure, Software, MCP | Project table; shared services (Gitea, the shared [Aldine](Aldine.md) editor) and host settings; agent, editor and image builds; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring |
+| Services | Tabs: Gitea, Fetch, Repos, Images, Reviews, Backup, MCP, Aldine | The [Dev lane](Dev-lane.md): Gitea with its Enable, upgrade and admin password controls, fetch commands, repositories, image builds of mirrored repos, reviews and the reviewer's model, Gitea backups; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring; the shared [Aldine](Aldine.md) editor. While Gitea is not running, only Gitea, MCP and Aldine show |
+| Host | Tabs: Projects, Software, Ports, Defaults | Project table; agent, editor and image builds; pass-through ports; the default models of a new researcher-subagents project's referee, analyst and surveyor, and the task limit of each project container |
 | Settings | Floating window | Interface settings kept in the browser: themes, layout, zoom, terminal font |
 
-In the Management table each project row has Start or Stop and Destroy; a running project also has Attach and Update. Each project's gear in the sidebar opens its ⚙ window: a floating window in the middle of the screen that lists the sections Tabs, Extensions, Agents, Sharing, Ports, Alerts and Sidebar down the left and shows one at a time. It keeps one size, its corner drags, and it closes when a change made from it finishes.
+Services and Host each reopen on the tab last used. In the Host → Projects table each project row has Start or Stop and Destroy; a running project also has Attach and Update. Each project's gear in the sidebar opens its ⚙ window: a floating window in the middle of the screen that lists the sections Tabs, Extensions, Agents, Sharing, Ports, Alerts and Sidebar down the left and shows one at a time. It keeps one size, its corner drags, and it closes when a change made from it finishes.
 
-The sidebar lists every project. Running ones sit in the order and groups the operator dragged them into; each row ends with a Stop button and a ⚙ button. Stopped ones sit in a "Stopped (n)" fold below the list, each with its workflow badge (dimmed with the row), Start and ⚙. Stop and Start ask inside the row first, then run the same action as Management. The row moving is the feedback: a stopped project moves into the fold, a started one returns to its old place with its tabs. A corner notice appears only when a sidebar action fails, is interrupted, or the sign-in expires.
+The sidebar lists every project. Running ones sit in the order and groups the operator dragged them into; each row ends with a Stop button and a ⚙ button. Stopped ones sit in a "Stopped (n)" fold below the list, each with its workflow badge (dimmed with the row), Start and ⚙. Stop and Start ask inside the row first, then run the same action as the Host → Projects table. The row moving is the feedback: a stopped project moves into the fold, a started one returns to its old place with its tabs. A corner notice appears only when a sidebar action fails, is interrupted, or the sign-in expires.
 
 ## Project tabs
 
@@ -149,7 +149,7 @@ An update to RS's own code (a pull, or agent work collected with rs-fetch) reach
 | The broker | `research broker stop`, then `research broker start`; it loads the code once, when it starts |
 | The web interface | `research webui start --rebuild`; its pages are built into its image |
 | What an inner-Docker project receives at each start: RS's instructions, the working-mode and test-policy files, the box tool | Stop and start the project |
-| Container images | Sandboxes → Software → Rebuild all, then stop and start each project |
+| Container images | Host → Software → Rebuild all, then stop and start each project |
 
 When it is unclear which parts an update touched, do all of them. The cost is the rebuild time and one restart per project, which interrupts the work running in it.
 

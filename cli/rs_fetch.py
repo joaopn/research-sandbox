@@ -59,7 +59,7 @@ fetched and the SHA resolved locally.
 
 Ported from agentic-dev-sandbox's fetch-sandbox.py. The in-tool LLM review is
 deliberately ABSENT: reviews run host-side in an ephemeral sandboxed container
-and their verdicts live in the HOST ledger, surfaced on the webui Development
+and their verdicts live in the HOST ledger, surfaced on the webui Services
 page ONLY — the SYSTEM never writes a verdict into any container (they must
 not be agent-visible). The VERDICT_DIR seam below is a MANUAL human escape
 hatch: rs-fetch surfaces a verdict file if the human deliberately staged one
@@ -95,7 +95,7 @@ AGENT_USER_PREFIX = "agent-"
 TOKEN_PATH = Path.home() / ".dev-tokens" / "operator.token"
 
 # Verdict seam — a MANUAL human escape hatch only. The system NEVER writes
-# here (verdicts stay host-side; the Development page is their surface): if
+# here (verdicts stay host-side; the Services page is their surface): if
 # the human deliberately copies a verdict to VERDICT_DIR/<repo>/<n>.json (a PR
 # verdict) or VERDICT_DIR/<repo>/<full-sha>.json (a per-commit verdict — none
 # are produced yet; the per-commit reviewer is future work, and the FULL-sha
@@ -254,7 +254,7 @@ def fork_owner(repo: str) -> str:
                      for r in rows if isinstance(r, dict) and r.get("repo")})
     die(f"repo {repo!r} has no staged fork owner (staged repos: "
         f"{staged or 'none'}); add a dev project/box on it (or set the "
-        f"active fork on the Development page), then restart this "
+        f"active fork on the Services page), then restart this "
         f"box/project to refresh the wiring")
 
 
@@ -314,7 +314,7 @@ def api_get(path: str, token: str):
     except (URLError, OSError) as e:
         die(f"cannot reach gitea at {GITEA_BASE}: "
             f"{getattr(e, 'reason', e)} (is this surface wired for rs-fetch, "
-            f"and is Gitea enabled on the Sandboxes page? restarting this "
+            f"and is Gitea enabled under Services → Gitea? restarting this "
             f"box/project refreshes the wiring)")
     try:
         return json.loads(raw) if raw else None

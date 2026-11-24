@@ -28,4 +28,4 @@ Each `--mount` folder is mounted **read-only** at `/workspace/mnt/<basename>/` (
 
 **End the session.** Type `/log`. The supervisor writes a session log + per-topic executive summaries and shuts workers down cleanly.
 
-**Tear down.** Sandboxes → Management → **Destroy** (type the name and the master password), or `python research.py project destroy myproj` — removes the container, workspace dir, network, and credentials snapshot.
+**Tear down.** Host → Projects → **Destroy** (type the name and the master password), or `python research.py project destroy myproj` — removes the container, workspace dir, network, and credentials snapshot.

@@ -65,7 +65,7 @@ TOKENS_DIR = DEV_DIR / "tokens"                 # per-CONSUMER agent tokens, 070
 # token-file floor: `dev repo add` is mirror-only now and mints no tokens.
 MIRRORS_DIR = DEV_DIR / "mirrors"
 # The global per-repo ACTIVE fork map {repo: agent username}. Steers the
-# Development-page reads, the reviewer's fork resolution, and the staged
+# Services-page reads, the reviewer's fork resolution, and the staged
 # dev-gitea.json `user` rows. Absent entry = derived (single live fork, else
 # the most recently created live fork).
 ACTIVE_FORKS_PATH = DEV_DIR / "active-forks.json"
@@ -81,7 +81,7 @@ FETCH_PREFS_PATH = DEV_DIR / "fetch-repos.json"
 
 # Reviewer surface (STAGE_DEV_GITEA S4). The verdict ledger is HOST-ONLY state:
 # never bind-mounted, never written into gitea or any container (invariant 4 —
-# verdicts are not agent-visible; the Development page, via the authenticated
+# verdicts are not agent-visible; the Services page, via the authenticated
 # broker relay, is the only surface). Sibling of dev/, not inside it, so the
 # webui-adjacent dev/ tree and the ledger stay separate concerns.
 REVIEWS_DIR = Path.home() / ".research-sandbox" / "reviews"
@@ -98,7 +98,7 @@ REVIEWER_TOKEN_PATH = REVIEWER_CRED_DIR / "token"
 
 
 def reviewer_token_state() -> dict:
-    """Non-secret reviewer-token state for the Development/Fetch surfaces:
+    """Non-secret reviewer-token state for the Services/Fetch surfaces:
     {"present": bool, "set_at": str} — set_at is the file's mtime as UTC ISO
     ("" when absent/unreadable). NEVER reads token content into the payload:
     the value crosses to the browser, so this key set IS the boundary. Pure
@@ -158,7 +158,7 @@ def consumer_email(username: str) -> str:
 # guard. It's only a BACKSTOP anyway: `dev sync <repo>` (and the resume path)
 # trigger an immediate pull when the human wants GitHub changes reflected now.
 MIRROR_INTERVAL = "10m"
-# The Development-page read bound (repo_status: up to FIVE metadata GETs per
+# The Services-page read bound (repo_status: up to FIVE metadata GETs per
 # repo on the broker's serial thread — forks list (its first LIST_PAGE_SIZE
 # rows; a mirror with more forks adds one STATUS_TIMEOUT_S-bounded read per
 # further page OUTSIDE the budget below, paid only on a half-up gitea that
@@ -200,7 +200,7 @@ LIST_PAGE_SIZE = 50
 # false-fails; at 300s a wedged fork would hold the caller 5 min.
 FORK_WAIT_TRIES = 30
 
-# Page size for the Development page's lazy per-row commit dropdowns (PR rows
+# Page size for the Services page's lazy per-row commit dropdowns (PR rows
 # and branch rows alike — the dropdown pages, it does not clamp). The browser
 # walks older history by asking for page 2, 3, … so this is a PAGE size, never
 # a display ceiling. It MUST stay <= gitea's server-side list clamp
@@ -1308,7 +1308,7 @@ def _mirror_source_error(repo: str, info: dict, url: str, *,
     recorded = info.get("original_url")
     have = _source_key(recorded)
     requested = _source_slug(url) or "the requested repository"
-    remedy = (f"remove it with its Remove button on the Development page's "
+    remedy = (f"remove it with its Remove button on the Services page's "
               f"Fetch tab (if it is not listed there, switch its rs-fetch back "
               f"on in the Repos tab first), then add {requested} again.")
     if have is None:
@@ -1708,7 +1708,7 @@ class GiteaClient:
                 raise GiteaError(
                     f"the gitea identity {as_user!r} was retired and its fork "
                     f"of {repo!r} is archived (read-only), so it cannot be "
-                    f"reused. Purge that retired identity from the Development "
+                    f"reused. Purge that retired identity from the Services "
                     f"page, or use a different project or box name")
             return                               # live fork — resume/heal path
         self._api("POST", f"/repos/{src_owner}/{repo}/forks", {}, sudo=as_user,
@@ -2062,7 +2062,7 @@ def _mint_token(username: str, scopes: str) -> str:
     # clears it at retirement. That is why reusing a retired identity is
     # REFUSED early (retired_identity, checked by create/box_add/dev_attach)
     # and freeing the name means purging the whole user (purge_consumer — via a
-    # Development-page row, `dev fork purge`, or mirror Remove, which purges the
+    # Services-page row, `dev fork purge`, or mirror Remove, which purges the
     # fully retired owners of the forks it deletes): the callers keep this
     # function from ever meeting a surviving token.
     r = _gitea_admin(["user", "generate-access-token", "--username", username,
@@ -2340,7 +2340,7 @@ def _purge_retired_owner(host_port: str, owner: str) -> bool:
 
     G2 reads LIVE state (user_repos, strict), not the ledger: a repo the owner
     still holds may be a live orphan fork of another mirror, an archived fork
-    listed on that mirror's Development-page card, or a hand-made repo — none
+    listed on that mirror's Services-page card, or a hand-made repo — none
     of which mirror Remove was asked to delete, and deleting the user would
     purge them all. The owner is then KEPT, and the warning names both browser
     remedies (its repo card, or Site Administration in the Gitea tab) without
@@ -2360,7 +2360,7 @@ def _purge_retired_owner(host_port: str, owner: str) -> bool:
     names = sorted(r["repo"] for r in owned if r.get("repo"))
     if names:
         print(f"warning: kept {owner!r}: it also owns {', '.join(names)} — "
-              f"purge it from that repo's card on the Development page if that "
+              f"purge it from that repo's card on the Services page if that "
               f"is an archived fork, or delete the user under Site "
               f"Administration in the Gitea tab", file=sys.stderr)
         return False
@@ -2389,7 +2389,7 @@ def remove_repo(host_port: str, repo: str) -> list[str]:
     entry. Returns the users purged (the names freed for reuse).
 
     Why the user goes with the fork: a retired identity is visible on the
-    Development page ONLY through an archived fork it owns, so deleting the
+    Services page ONLY through an archived fork it owns, so deleting the
     fork while keeping the user used to leave an invisible identity that still
     blocked its project or box name (B52's normal-flow source)."""
     client = GiteaClient(api_base(host_port), read_admin_token())
@@ -2562,7 +2562,7 @@ def load_fetch_prefs() -> dict:
     """The {repo: bool} rs-fetch visibility map. TOLERANT by design (the
     load_active_forks posture): absent, unreadable or malformed all read as "no
     preferences recorded" rather than raising — this is consulted on every
-    Development-page read, and a corrupt preference file must never take the
+    Services-page read, and a corrupt preference file must never take the
     page down. Its worst case is that everything shows, which is the default."""
     if not FETCH_PREFS_PATH.is_file():
         return {}
@@ -2618,7 +2618,7 @@ def active_fork_for(host_port: str, repo: str) -> str:
 
 def _count_or_none(value: Any) -> "int | None":
     """A gitea counter as an int, or None when it is absent or not a number.
-    None and 0 mean different things on the Development surfaces — "not known"
+    None and 0 mean different things on the Services surfaces — "not known"
     vs "none open" — so a missing counter must never collapse into a zero."""
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
@@ -2732,7 +2732,7 @@ class _ListPager:
 
 
 def repo_status(host_port: str, repo: str) -> dict:
-    """Per-repo Development-page status: mirror sync time + the ACTIVE fork's
+    """Per-repo Services-page status: mirror sync time + the ACTIVE fork's
     open PRs + branches (multi-fork reads are steered by the active-fork map —
     the deliberate simplification; no cross-fork aggregation), plus the forks
     list + active marker for the Management dropdown, plus `upstream` — where
@@ -2854,7 +2854,7 @@ def repo_status(host_port: str, repo: str) -> dict:
             "upstream": upstream}
 
 
-# --- per-row commit lists (the Development-page dropdowns) --------------------
+# --- per-row commit lists (the Services-page dropdowns) --------------------
 
 def _require_active_fork(host_port: str, repo: str) -> str:
     """The active fork or a RAISE — the commit reads are row-level: the page
@@ -3362,7 +3362,7 @@ def history_claim(host_port: str, project: str, box: str,
         if not (r.get("fork") and r.get("parent", "").lower() == own_parent):
             raise GiteaError(
                 f"the Gitea account {user!r} already exists and owns repos (an "
-                f"earlier dev box of this name?); purge it from the Development "
+                f"earlier dev box of this name?); purge it from the Services "
                 f"page, or choose another box name")
     # Exists, owns nothing but forks of its own notes repo, claimed by no other
     # row: a leftover (a failed add, or an account a removal could not delete).
@@ -3627,7 +3627,7 @@ def attached_projects(repo: str) -> list[str]:
 # fork (gitea gives the new repo a NEW id) each land on their own file. That is
 # what makes this a HISTORY rather than a set of current-state markers — a
 # landed PR's review stays readable long after its row is gone, which is the
-# whole point of the Development page's Reviews tab. Commit entries stay
+# whole point of the Services page's Reviews tab. Commit entries stay
 # one-per-sha: the same sha is the same bytes, so a re-review supersedes.
 #
 # Schema — fields picked by name, coarse failure reasons only (a review error

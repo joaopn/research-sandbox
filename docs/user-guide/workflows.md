@@ -19,7 +19,7 @@ A workflow runs in one of two container kinds. An **inner-Docker** project has i
 | **`dev`** | inner Docker | Claude or pi | locked | An agent on one repository's fork in the shared Gitea, delivering through pull requests |
 | **store** workflows | either | Claude | locked | Curated public projects, set up at create (table below) |
 
-A `researcher-subagents` project's helpers (its analysts, and its surveyor under Claude) run the model and effort set in its ⚙ Agents box, starting from the defaults under **Sandboxes → Infrastructure → Analyst** and **→ Surveyor**.
+A `researcher-subagents` project's helpers (its analysts, and its surveyor under Claude) run the model and effort set in its ⚙ Agents box, starting from the defaults under **Host → Defaults → Analyst** and **→ Surveyor**.
 
 The New Project window groups the cards as **Research** (research, researcher, researcher-subagents), **Base** (sandbox-dind, sandbox, dev) and **Store** (the rest).
 

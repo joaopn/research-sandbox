@@ -99,11 +99,12 @@ ALLOWLIST_PATH = Path("/workspace/.orchestrator/mcp-allow.json")
 ROLE_MCPS_PATH = Path("/workspace/.orchestrator/role-mcps.json")
 
 # The third source of `--mcps` names: the servers the PI ticked for "Analysis
-# workers" on the webui's MCP page, served by RS's shared MCP gateway. The host
-# stages them into the research user's home (never /workspace, which the webui
-# mounts read-only for every project) as the `workers` key of the wanted set
-# rs-mcp-sync.py reads: {"servers": {<name>: <token>}, "descriptions":
-# {<name>: <text>}}. No file or no key means no gateway servers for workers.
+# workers" on the webui's MCP tab (Services → MCP), served by RS's shared MCP
+# gateway. The host stages them into the research user's home (never
+# /workspace, which the webui mounts read-only for every project) as the
+# `workers` key of the wanted set rs-mcp-sync.py reads: {"servers": {<name>:
+# <token>}, "descriptions": {<name>: <text>}}. No file or no key means no
+# gateway servers for workers.
 MCP_WANTED_PATH = Path.home() / ".rs-mcp" / "wanted.json"
 MCP_WANTED_WORKERS_KEY = "workers"
 # MIRROR of mcp_servers.NAME_RE (the gateway list's name rule; pinned).
@@ -125,7 +126,7 @@ GATEWAY_TOKEN_ENV = "RS_MCP_GATEWAY_TOKEN"
 # The names `rs-worker mcps` gives each source.
 SOURCE_ROLE = "worker service"
 SOURCE_ALLOWLIST = "project allowlist"
-SOURCE_GATEWAY = "MCP page"
+SOURCE_GATEWAY = "Services → MCP"
 
 # The project's per-container-type agent model/effort pairs, frozen at create by
 # the host (STAGE_MODEL_SELECT). Read VERBATIM — this script is staged into the
@@ -597,7 +598,7 @@ def _load_role_mcps_by_name() -> dict[str, dict]:
     return out
 
 
-# --- the MCP page's servers for analysis workers (RS's shared MCP gateway) ---
+# --- Services → MCP's servers for analysis workers (RS's shared MCP gateway) -
 
 # MIRROR of agent/rs-mcp-sync.py's _uplink_network and gateway_base (the twin;
 # rs-worker is baked standalone, so it cannot import that file). The two bodies
@@ -632,7 +633,7 @@ def gateway_base() -> str:
 
 
 def _load_workers_set() -> tuple[dict[str, str], dict[str, str], str | None]:
-    """The MCP page's servers for analysis workers, from MCP_WANTED_PATH:
+    """Services → MCP's servers for analysis workers, from MCP_WANTED_PATH:
     ``(servers, descriptions, problem)``. ``servers`` maps name -> token,
     ``descriptions`` maps each of those names -> its one-line text ("" when it
     has none). No file, or no ``workers`` key, is an empty set. A file that
@@ -714,9 +715,9 @@ def _write_mcp_config(
     wdir: Path, requested: list[str],
 ) -> tuple[str, list[tuple[str, str]], str | None]:
     """Validate ``requested`` against the per-project allowlist + role-MCP
-    registry + the MCP page's servers for analysis workers, write the worker's
+    registry + Services → MCP's servers for analysis workers, write the worker's
     .mcp.json (old-path entries pointed at the supervisor's mcp-proxy on
-    rs-inner, MCP page entries at the shared gateway), and return
+    rs-inner, Services → MCP entries at the shared gateway), and return
     ``(label, granted, token)`` where ``granted`` is a list of
     ``(name, description)`` pairs used to render the worker CLAUDE.md block and
     ``token`` is the gateway token the worker container's environment must
@@ -724,14 +725,14 @@ def _write_mcp_config(
     leave any pre-existing .mcp.json alone (a respawn may have one already) and
     surface its current contents in ``granted`` so the rendered block stays
     in sync with the actual wiring; a kept gateway entry must still be given to
-    analysis workers on the MCP page.
+    analysis workers on Services → MCP.
 
     The two registries (external in mcp-allow.json, role in role-mcps.json)
     are merged into one by_name lookup with role-MCPs overlaying — this
     mirrors `mcp_render_config.py`'s merge policy so the worker's view of
     "what MCPs exist" matches the proxy's view of "what URLs route". From
     the worker's POV both are reachable at mcp-proxy:8888/<name>/mcp. A name
-    found both there and among the MCP page's servers refuses the spawn."""
+    found both there and among Services → MCP's servers refuses the spawn."""
     if not requested:
         existing = wdir / ".mcp.json"
         if not existing.is_file():
@@ -755,12 +756,12 @@ def _write_mcp_config(
         if kept_gw:
             gw_servers, gw_desc, problem = _load_workers_set()
             if problem:
-                die(f"this worker's kept {existing} names the MCP page server(s) "
+                die(f"this worker's kept {existing} names the Services → MCP server(s) "
                     f"{', '.join(kept_gw)}, which cannot be checked: {problem}")
             gone = [n for n in kept_gw if n not in gw_servers]
             if gone:
                 die(f"{', '.join(gone)}: no longer given to analysis workers on "
-                    "the MCP page; spawn with --mcps naming the servers it should have")
+                    "Services → MCP; spawn with --mcps naming the servers it should have")
             token = _workers_token(gw_servers)
         granted = [(n, gw_desc.get(n, "") if n in kept_gw
                     else by_name.get(n, {}).get("description", "")) for n in names]
@@ -789,7 +790,7 @@ def _write_mcp_config(
     if gw_problem:
         die(f"--mcps cannot be checked: {gw_problem}. That file lists the MCP "
             "page's servers for analysis workers; RS writes it again when the PI "
-            "saves the Analysis workers wiring on the MCP page (Sandboxes → MCP).")
+            "saves the Analysis workers wiring on the MCP tab (Services → MCP).")
 
     clash = [n for n in requested if n in gw_servers and n in by_name]
     if clash:
@@ -805,8 +806,8 @@ def _write_mcp_config(
         die(
             "these MCP names are given to workers by two sources, so the server "
             "meant cannot be told apart:\n" + "\n".join(lines) + "\n"
-            "  fix: the PI unticks it for \"Analysis workers\" on the MCP page "
-            "(Sandboxes → MCP), or removes the other registration on the host."
+            "  fix: the PI unticks it for \"Analysis workers\" on the MCP tab "
+            "(Services → MCP), or removes the other registration on the host."
         )
 
     unknown = [n for n in requested if n not in by_name and n not in gw_servers]
@@ -818,11 +819,11 @@ def _write_mcp_config(
             f"these MCPs are not granted to this project: {', '.join(unknown)}\n"
             f"  external (mcp-allow.json):  {', '.join(ext_names) or '(none)'}\n"
             f"  role-MCPs (role-mcps.json): {', '.join(role_names) or '(none)'}\n"
-            f"  MCP page (analysis workers): {', '.join(gw_names) or '(none)'}\n"
+            f"  Services → MCP (analysis workers): {', '.join(gw_names) or '(none)'}\n"
             f"  fix: `research project mcp allow <project> <mcp>` for external MCPs,\n"
             f"       `research project role-mcp enable <project> <role>` for role-MCPs.\n"
-            f"       Both run on the host. A server on the MCP page: the PI can\n"
-            f"       tick it for \"Analysis workers\" on the MCP page (Sandboxes → MCP)."
+            f"       Both run on the host. A server on Services → MCP: the PI can\n"
+            f"       tick it for \"Analysis workers\" on the MCP tab (Services → MCP)."
         )
 
     gw_requested = [n for n in requested if n in gw_servers]
@@ -951,13 +952,13 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     clash = _mailbox_name_clash(args.name)
     if clash:
         die(clash)
-    # RS owns the gateway token's variable: it sets it from the MCP page's
+    # RS owns the gateway token's variable: it sets it from Services → MCP's
     # wiring below, and a caller's value would either leak a token into the
     # command line or point the worker at a token the gateway never issued.
     for kv in args.env:
         if kv.partition("=")[0] == GATEWAY_TOKEN_ENV:
             die(f"--env {GATEWAY_TOKEN_ENV}=... is refused: RS sets that variable "
-                "itself from the servers given to analysis workers on the MCP page")
+                "itself from the servers given to analysis workers on Services → MCP")
 
     if not ORCH_CREDS.is_file():
         die(
@@ -1138,7 +1139,7 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         if not k:
             die(f"invalid --env value: {kv!r} (expected K=V)")
         env[k] = v
-    # The MCP page's gateway token, for the `${RS_MCP_GATEWAY_TOKEN}` the
+    # Services → MCP's gateway token, for the `${RS_MCP_GATEWAY_TOKEN}` the
     # worker's .mcp.json names (never written to any file).
     if gateway_token:
         env[GATEWAY_TOKEN_ENV] = gateway_token

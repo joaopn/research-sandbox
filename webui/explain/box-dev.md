@@ -13,7 +13,7 @@ step with it, and opens pull requests against it, which you review on
 Gitea. Adding the box mirrors the repo, forks it and wires the box to
 the fork in one step.
 
-Needs this host's Gitea: enable it under Sandboxes → Infrastructure first, or
+Needs this host's Gitea: enable it under Services → Gitea first, or
 adding the box stops with that message.
 
 ## Good for

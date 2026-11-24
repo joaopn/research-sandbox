@@ -168,7 +168,7 @@ PASSTHROUGH_PORT_HI = int(os.environ.get("WEBUI_PASSTHROUGH_PORT_HI", "10299"))
 STATE_DIR = Path(os.environ.get("WEBUI_STATE_DIR", "/app/state"))
 ORIGIN_PORTS_FILE = STATE_DIR / "origin-ports.json"
 
-# The shared-gitea origin admission (STAGE_DEV_GITEA S3). The Development
+# The shared-gitea origin admission (STAGE_DEV_GITEA S3). The Services
 # page's Gitea tab renders gitea on its OWN origin port like any http tab, but
 # gitea is a NON-project upstream: the admission entry uses this sentinel as
 # its "project". A leading '-' is unreachable under the project-name regex
@@ -213,7 +213,7 @@ ORIGIN_PORTS: dict[int, dict] = {}
 
 # The assignments found OUTSIDE the configured range at THIS start
 # ({"port", "project", "service"}, sorted by port): their tabs get a new
-# address with fresh browser-side state, and the Sandboxes page names them
+# address with fresh browser-side state, and Host → Projects names them
 # instead of the range change dropping them in silence. Memory only, never
 # persisted, and never used to pick an upstream — nothing but the notice
 # route reads it, so the identity-only table discipline above is untouched.
@@ -224,7 +224,7 @@ def _origin_table_load() -> None:
     """Populate ORIGIN_PORTS from disk (tolerant: a missing/invalid file or a
     malformed entry → skipped). Entries outside the configured range are kept
     OUT of the live table but recorded in ORIGIN_PORTS_DROPPED for the
-    Management notice. Called once at startup; never rewrites the file."""
+    Host → Projects notice. Called once at startup; never rewrites the file."""
     ORIGIN_PORTS.clear()
     ORIGIN_PORTS_DROPPED.clear()
     try:
@@ -346,7 +346,7 @@ def _origin_table_sweep() -> None:
 def _origin_dropped_log() -> None:
     """One startup warning naming every out-of-range assignment that survived
     the sweep — called AFTER `_origin_table_sweep`, so the log names exactly
-    what the Management notice lists."""
+    what the Host → Projects notice lists."""
     if not ORIGIN_PORTS_DROPPED:
         return
     names = ", ".join(f"{e['project']}/{e['service']}@{e['port']}"
@@ -754,7 +754,7 @@ async def broker_models_handler(request: web.Request) -> web.Response:
 async def broker_models_default_handler(request: web.Request) -> web.Response:
     """POST /broker/models/default {type, model, effort} | {type, clear:true} —
     set or clear one container type's default pair in the operator's untracked
-    override file (the Sandboxes → Infrastructure → Reviewer control; the
+    override file (the reviewer's control on Services → Reviews; the
     broker verb accepts any catalog type). Origin-checked because it POSTs and
     writes host state. Args are HAND-PICKED — this handler is the fourth leg of
     the request-field ↔ MODEL_DEFAULT_WEBUI_FIELDS ↔ app.js payload lockstep,
@@ -778,7 +778,7 @@ async def broker_models_default_handler(request: web.Request) -> web.Response:
 
 
 async def broker_settings_handler(request: web.Request) -> web.Response:
-    """GET /broker/settings — the host settings (the Sandboxes → Infrastructure
+    """GET /broker/settings — the host settings (the Host → Defaults
     → Settings section: the project task cap, its default and bounds, and the
     problem text when the settings file is damaged). SameSite=Strict cookie is
     the CSRF defense for this read (mirrors /broker/models)."""
@@ -810,7 +810,7 @@ async def broker_settings_set_handler(request: web.Request) -> web.Response:
 async def broker_pin_reset_handler(request: web.Request) -> web.Response:
     """POST /broker/software/pin-reset {key} — put one version pin back to the
     value this installation ships, by removing its key from the untracked
-    versions.local.env override (the Sandboxes → Software tab's "Use repo version"
+    versions.local.env override (the Host → Software tab's "Use repo version"
     button). Origin-checked because it POSTs and writes host state. Args are
     HAND-PICKED — this handler is the fourth leg of the request-field ↔
     PIN_RESET_WEBUI_FIELDS ↔ app.js payload lockstep. The value passes through
@@ -830,7 +830,7 @@ async def broker_pin_reset_handler(request: web.Request) -> web.Response:
 
 
 async def _app_refresh_relay(request: web.Request, verb: str) -> web.Response:
-    """The Software page's OpenKnowledge card (an app pin): `verb` is
+    """Host → Software's OpenKnowledge card (an app pin): `verb` is
     app_refresh_check (npm's latest, a read) or app_refresh (move the pin to
     it, never down). Origin-checked because they POST (the second writes host
     state). Args are HAND-PICKED: only `key` crosses — the broker re-resolves
@@ -869,7 +869,7 @@ async def broker_software_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
-# --- Sandboxes → MCP: the gateway's server list ------------------------------
+# --- Services → MCP: the gateway's server list ------------------------------
 # MIRROR of cli/broker.py MAX_REQUEST_BYTES (the webui cannot import the
 # broker; a pytest pins the two equal). The broker refuses a larger frame
 # without reading it, which a large enough body turns into a broken pipe —
@@ -914,7 +914,7 @@ async def broker_mcp_wiring_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
-# --- the shared Aldine editor (Sandboxes → Infrastructure) -------------------
+# --- the shared Aldine editor (Services → Aldine) ----------------------------
 # Turn on is the build-lane verb `aldine_on` (POST /broker/software/build, in
 # _BUILD_VERBS); the status and Turn off are inline relays. None takes a field.
 
@@ -1097,7 +1097,7 @@ _REFRESH_CHECK_VERBS = frozenset({"agent_refresh_check", "editor_refresh_check",
 
 async def broker_refresh_check_handler(request: web.Request) -> web.Response:
     """POST /broker/software/refresh-check {verb, agent?} — resolve a dist's
-    upstream `latest` so the Sandboxes → Software tab can preview current→latest before the
+    upstream `latest` so the Host → Software tab can preview current→latest before the
     operator confirms a bump+rebuild. A gated read, origin-checked because it POSTs
     and triggers an in-container resolve (bounded broker-side by
     _UPSTREAM_RESOLVE_MAX_TIME_S). Returns the broker verb's {current, latest} or
@@ -1369,7 +1369,7 @@ async def broker_lifecycle_handler(request: web.Request) -> web.Response:
 async def broker_software_active_handler(request: web.Request) -> web.Response:
     """GET /broker/software/active — every software build in flight on the
     broker's build lane, {ops:[{op_id, verb, target, agent?, state}]} (gated).
-    The Sandboxes → Software tab seeds its "pulling…" / "queued…" labels and background
+    The Host → Software tab seeds its "pulling…" / "queued…" labels and background
     watchers from this after a reload, so the in-flight view does not depend on
     a page's memory. SameSite=Strict cookie is the CSRF defense for this read."""
     status, body = await _relay(request, "build_active")
@@ -1675,7 +1675,7 @@ async def broker_passthrough_handler(request: web.Request) -> web.Response:
     host. Webui-LOCAL (read off the /projects:ro mount like /broker/op/*/log —
     no broker round-trip), gated by the management session cookie; under
     /broker/ ON PURPOSE (the session cookie is Path=/broker). Drives the Ports
-    dialog's block hint AND the Sandboxes → Infrastructure → Pass-through ports subsection."""
+    dialog's block hint AND the Host → Ports tab."""
     if _broker_session(request) is None:
         return web.json_response(
             {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
@@ -1699,7 +1699,7 @@ async def broker_passthrough_handler(request: web.Request) -> web.Response:
 async def broker_origin_dropped_handler(request: web.Request) -> web.Response:
     """GET /broker/origin-ports/dropped — the tabs whose address fell outside
     the origin-port range at this webui's start, in the operator's words, for
-    the Management notice. Webui-LOCAL (no broker call), gated by the
+    the Host → Projects notice. Webui-LOCAL (no broker call), gated by the
     management session cookie; under /broker/ ON PURPOSE (that cookie is
     Path=/broker). Raw project/service ids are not returned."""
     if _broker_session(request) is None:
@@ -1730,11 +1730,11 @@ async def broker_origin_dropped_dismiss_handler(
 
 
 async def broker_dev_handler(request: web.Request) -> web.Response:
-    """GET /broker/dev — the Development-page read (gitea state + per-repo
+    """GET /broker/dev — the Services-page read (gitea state + per-repo
     mirror/PR/branch status + attachments), relayed to the token-gated
     dev_status verb. A READ: the broker never starts gitea for it (a stopped
-    gitea reports running:false; the Infrastructure Start button is the
-    explicit path). Also feeds the Sandboxes page's Infrastructure tab."""
+    gitea reports running:false; the Services → Gitea Enable button is the
+    explicit path). Also feeds the Services page's Gitea bar."""
     status, reply = await _relay(request, "dev_status", {})
     return web.json_response(reply, status=status)
 
@@ -1805,7 +1805,7 @@ async def broker_dev_reviews_handler(request: web.Request) -> web.Response:
 
 async def broker_dev_active_fork_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/active-fork {repo, user} — set the repo's GLOBAL
-    active fork (gated, origin-checked; the Development page's fork dropdown,
+    active fork (gated, origin-checked; the Services page's fork dropdown,
     shown only at ≥2 live forks). Synchronous relay — bounded gitea reads."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
@@ -1823,7 +1823,7 @@ async def broker_dev_active_fork_handler(request: web.Request) -> web.Response:
 
 async def broker_dev_fetch_enabled_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/fetch-enabled {repo, enabled} — show or hide one repo on
-    the rs-fetch lists (gated, origin-checked; the Development page's Repos tab).
+    the rs-fetch lists (gated, origin-checked; the Services page's Repos tab).
     Synchronous relay — the verb is one host-file write and makes no gitea call.
 
     BOTH keys are named below on purpose. The broker filters a relayed request
@@ -1847,8 +1847,8 @@ async def broker_dev_fetch_enabled_handler(request: web.Request) -> web.Response
 
 async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/gitea-start — DELIBERATELY enable/provision gitea (gated,
-    origin-checked; the Management Infrastructure "Enable Gitea" button + the
-    Development-page stopped branch). A TAILED op (dev_gitea_start ∈
+    origin-checked; the Services → Gitea "Enable Gitea" button + the
+    Services-page stopped branch). A TAILED op (dev_gitea_start ∈
     PROGRESS_VERBS): returns {op_id} immediately and runs as a background task so
     the one-time image pull streams milestones, instead of a bare inline relay
     that would freeze the browser on the ~30-60s pull. `op_seed` is fixed (no
@@ -3090,7 +3090,7 @@ async def _assemble_services(request: web.Request, project: str,
     # rs-fetch is an explicit operator instruction, so this follows the
     # exported-port rule below, not the inferred-service rule. A stopped gitea or
     # an unenabled dev lane renders as the pane's OWN empty state (which links to
-    # Development) rather than a tab that silently vanishes.
+    # Services) rather than a tab that silently vanishes.
     if _project_has_fetch(project):
         out[services.PROJECT_FETCH_ID] = services.project_fetch_service("Fetch")
 
@@ -3890,7 +3890,7 @@ def _project_disk_bytes(name: str) -> dict:
     still counts once here: its bytes are reachable from this workspace.
     The inode set is per call, so a link shared between two projects counts
     once in each project's figure. This is the ONE tree walk the
-    webui performs, and it runs only when the Sandboxes page's "Measure
+    webui performs, and it runs only when Host → Projects' "Measure
     sizes" button asks for it: on a host with a 110k-file dev workspace it
     costs seconds and more than a core, which is why it is no longer on any
     periodic path. Uncached on purpose — a user-triggered measurement should
@@ -3936,7 +3936,7 @@ async def projects_status_handler(request: web.Request) -> web.Response:
 async def projects_disk_handler(request: web.Request) -> web.Response:
     """GET /projects/disk?names=foo,bar — batched per-project disk usage:
     {name: {disk_bytes} | {error: not_found}}. USER-TRIGGERED ONLY (the
-    Sandboxes page's "Measure sizes" button); no timer in the SPA calls it.
+    Host → Projects "Measure sizes" button); no timer in the SPA calls it.
     Same name validation as /projects/status. Each walk runs in a worker
     thread so a deep tree on one project can't stall the event loop for the
     others — or for the terminals, which share that loop."""

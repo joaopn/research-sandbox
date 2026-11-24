@@ -1085,7 +1085,7 @@ class Gitea:
         except (URLError, OSError) as e:
             die(f"Gitea did not answer at {self.base} "
                 f"({getattr(e, 'reason', e)}); check that it is running "
-                f"(Sandboxes -> Infrastructure), then run again")
+                f"(Services -> Gitea), then run again")
         try:
             body = json.loads(data) if data else None
         except ValueError:
@@ -1528,7 +1528,7 @@ def gitea_answers() -> None:
     except (URLError, OSError) as e:
         die(f"Gitea did not answer at {GITEA_BASE} "
             f"({getattr(e, 'reason', e)}); check that it is running "
-            f"(Sandboxes -> Infrastructure), then run again")
+            f"(Services -> Gitea), then run again")
 
 
 def read_gitea(g: Gitea, owner: str, repo: str) -> dict:

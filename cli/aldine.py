@@ -99,7 +99,7 @@ RESTART_POLICY = "unless-stopped"
 # --- host state ----------------------------------------------------------------
 
 STATE_DIR = Path.home() / ".research-sandbox" / "aldine"
-# Present = the operator turned Aldine on (from the Sandboxes page or the
+# Present = the operator turned Aldine on (from Services → Aldine or the
 # CLI). `research start` resumes Aldine only then — never creates it on its own.
 ON_RECORD_PATH = STATE_DIR / "on"
 # The app's environment file (0600): the MCP token, generated once and kept
@@ -137,7 +137,7 @@ COMPILER_DIGEST_KEY = "ALDINE_COMPILER_DIGEST"
 # Dotted digits only: the version becomes a container label.
 _VERSION_RE = re.compile(r"^\d+(?:\.\d+)*$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_PIN_BAD = ("the Aldine version setting ({key}) is {what}; under Sandboxes → "
+_PIN_BAD = ("the Aldine version setting ({key}) is {what}; under Host → "
             "Software, Use repo version on its row puts the value this "
             "installation ships back")
 
@@ -266,7 +266,7 @@ def health_ok(body: str, *, app: bool) -> bool:
 CONFLICT_TEXT = (
     "the MCP server list already has a server named {name} at another address, "
     "so Aldine cannot be added under that name; rename or remove that server "
-    "under Sandboxes → MCP and turn Aldine on again")
+    "under Services → MCP and turn Aldine on again under Services → Aldine")
 
 
 def apply_gateway_entry(data: dict[str, Any], token: str) -> None:

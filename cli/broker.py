@@ -374,7 +374,7 @@ def _verb_test_policies(_args: dict, _progress=None) -> dict:
 
 
 def _verb_host_settings(_args: dict, _progress=None) -> dict:
-    """The host settings (the Sandboxes → Infrastructure → Settings section).
+    """The host settings (the Host → Defaults tab's task limit).
     Token-gated read; never raises for a damaged file — the payload names the
     problem so the page can still offer Back to default."""
     return rscore.host_settings()
@@ -390,7 +390,7 @@ def _verb_host_settings_set(args: dict, _progress=None) -> dict:
     return rscore.host_settings_set(req)
 
 
-# --- the MCP gateway's server list (Sandboxes → MCP) -------------------------
+# --- the MCP gateway's server list (Services → MCP) -------------------------
 # All inline and token-gated. Each takes ONE deadline (rscore.MCP_INLINE_DEADLINE_S)
 # that every docker call inside it shares, and takes the list lock without
 # waiting (a busy list is a refusal): nothing here can hold the accept thread
@@ -501,7 +501,7 @@ def _verb_mcp_gateway_start(_args: dict, progress=None) -> dict:
     return rscore.mcp_gateway_start(progress=progress)
 
 
-# --- the shared Aldine editor (Sandboxes page) ---------------------------------
+# --- the shared Aldine editor (Services → Aldine) ------------------------------
 # Turn on pulls ~2.4 GB the first time, so it is a build-lane verb
 # (BUILD_DISPATCH, target "aldine"). Turn off and the status are inline and
 # take ONE deadline (rscore.MCP_INLINE_DEADLINE_S) shared by every docker call;
@@ -528,8 +528,8 @@ def _verb_aldine_status(_args: dict, _progress=None) -> dict:
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
-    `models` (the Sandboxes → Infrastructure → Reviewer, Referee, Analyst and Surveyor
-    controls). Token-gated
+    `models` (the reviewer's control on Services → Reviews and the Referee, Analyst
+    and Surveyor controls on Host → Defaults). Token-gated
     (NOT in OPEN_VERBS); inline is fine — a sub-ms validated file write, no
     docker, no network. The request layer + verb map every catalog/OS error
     onto ValidationError, so nothing but the three dispatch-caught exceptions
@@ -541,7 +541,7 @@ def _verb_model_default_set(args: dict, _progress=None) -> dict:
 
 def _verb_pin_reset(args: dict, _progress=None) -> dict:
     """Remove one key from the untracked versions.local.env override, so the pin
-    reads the tracked versions.env value again (the Sandboxes → Software tab's "Use repo
+    reads the tracked versions.env value again (the Host → Software tab's "Use repo
     version" button). Token-gated (NOT in OPEN_VERBS), not step-up (reversible
     config). Inline is fine: a sub-ms file edit, no docker, no network. Every
     file error maps to ValidationError in rscore, so nothing but the three
@@ -612,7 +612,7 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
 def _verb_software_status(_args: dict, _progress=None) -> dict:
     """Read-only status of the host's agent/editor dists, the built image fleet,
     and the effective version pins (base + untracked override) — the data behind
-    the webui Sandboxes → Software tab. Token-gated (NOT in OPEN_VERBS) — deny-by-default,
+    the webui Host → Software tab. Token-gated (NOT in OPEN_VERBS) — deny-by-default,
     like every other non-`list`/`status` verb. `software_status` is crash-proof by
     construction (guarded reads, degrade-not-raise); the belt-and-braces wrap maps
     any residual exception to a clean ValidationError envelope rather than letting
@@ -1206,7 +1206,7 @@ DEV_ACTIVE_FORK_WEBUI_FIELDS = frozenset({"repo", "user"})
 # attachment ledger AND the identity's live forks. Nothing host-shaped, and no
 # repo field — the purge is user-scoped by construction.
 DEV_PURGE_WEBUI_FIELDS = frozenset({"user"})
-# rs-fetch VISIBILITY for one repo (the Development page's Repos tab): a repo
+# rs-fetch VISIBILITY for one repo (the Services page's Repos tab): a repo
 # name + a bool. Nothing host-shaped; the repo is shape-validated in from_kwargs
 # and gated on the mirror stamp in the verb. `enabled` MUST be listed here — a
 # field absent from an allowlist is dropped SILENTLY, and the request validator
@@ -1302,15 +1302,15 @@ DEV_PASSWD_WEBUI_FIELDS = frozenset({"password"})
 # can steer where the artifact is written.
 DEV_BOARD_EXPORT_WEBUI_FIELDS = frozenset({"passphrase"})
 # Set/clear one container type's model+effort default in the operator's
-# untracked override file (the Sandboxes → Infrastructure → Reviewer,
-# Referee, Analyst and Surveyor controls). Name-shaped catalog tokens + a bool only — nothing host-shaped;
+# untracked override file (the reviewer's control on Services → Reviews and
+# the Referee, Analyst and Surveyor controls on Host → Defaults). Name-shaped catalog tokens + a bool only — nothing host-shaped;
 # the contract is full-pair-or-clear (no partial writes).
 MODEL_DEFAULT_WEBUI_FIELDS = frozenset({"type", "model", "effort", "clear"})
-# Save the project task cap or put it back to the default (the Sandboxes →
-# Infrastructure → Settings section). A number and a bool — nothing host-shaped.
+# Save the project task cap or put it back to the default (the task limit
+# on Host → Defaults). A number and a bool — nothing host-shaped.
 HOST_SETTINGS_SET_WEBUI_FIELDS = frozenset({"pids_limit", "reset"})
 
-# The MCP gateway's server list (Sandboxes → MCP). An address and header
+# The MCP gateway's server list (Services → MCP). An address and header
 # NAMES are operator text; header VALUES are secrets that go only into the 0600
 # list on the host — never argv, env or a log (the audit line carries no args).
 MCP_SERVER_ADD_WEBUI_FIELDS = frozenset({"name", "url", "description", "headers"})
@@ -1320,7 +1320,7 @@ MCP_SERVER_NAME_WEBUI_FIELDS = frozenset({"name"})
 # Wiring one consumer (a project's agents, or one of its boxes) to servers.
 MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
-# Put one version pin back to the shipped value (the Sandboxes → Software tab's "Use repo
+# Put one version pin back to the shipped value (the Host → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
 # not a resettable pin of the tracked versions.env.
 PIN_RESET_WEBUI_FIELDS = frozenset({"key"})
@@ -1477,7 +1477,7 @@ def _verb_dev_commits(args: dict, _progress=None) -> dict:
 
 
 def _verb_dev_status(_args: dict, _progress=None) -> dict:
-    # The Development-page read: no fields; NEVER starts gitea (a stopped one
+    # The Services-page read: no fields; NEVER starts gitea (a stopped one
     # reports running:false immediately — dev_gitea_start is the explicit verb).
     req = rscore.DevStatusRequest.from_kwargs()
     return dataclasses.asdict(rscore.dev_status(req))
@@ -1503,7 +1503,7 @@ def _verb_dev_repo_status(args: dict, _progress=None) -> dict:
 
 
 def _verb_dev_gitea_start(_args: dict, progress=None) -> dict:
-    # Deliberate gitea enable/provision (the Management Infrastructure button).
+    # Deliberate gitea enable/provision (the Enable button on Services → Gitea).
     # No fields. A tailed op (PROGRESS_VERBS) — thread `progress` so the one-time
     # image pull streams milestones to the view log.
     req = rscore.DevGiteaStartRequest.from_kwargs()
@@ -1511,7 +1511,7 @@ def _verb_dev_gitea_start(_args: dict, progress=None) -> dict:
 
 
 def _verb_dev_passwd(args: dict, progress=None) -> dict:
-    # Set the sandbox-admin gitea password (the Sandboxes → Infrastructure
+    # Set the sandbox-admin gitea password (the Services → Gitea
     # dialog). Step-up gated (STEP_UP_VERBS): a stolen session cookie must not
     # suffice to mint a gitea-admin credential. The password is the single
     # allow-listed field; a change-password failure raises HarnessError so the
@@ -2982,7 +2982,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if not rscore.dist_present(rscore.DEFAULT_AGENT):
             return _audited(principal, "validation",
                             _err("validation",
-                                 "no cached agent dist — pull it under Sandboxes → Software first"))
+                                 "no cached agent dist — pull it under Host → Software first"))
         if spawn_review is None:            # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
@@ -3040,7 +3040,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
             return _audited(principal, "validation",
                             _err("validation",
                                  "Gitea isn't enabled — enable it under "
-                                 "Sandboxes → Infrastructure first"))
+                                 "Services → Gitea first"))
         # A dev box lands in a running project's container; one that is being
         # started, stopped or recreated right now would lose it mid-way.
         if verb == "dev_image_build":
@@ -3728,7 +3728,7 @@ def passwd() -> None:
     derivation live in broker_auth; this is the thin terminal wrapper."""
     import getpass
     print("This password must match your webui vault (master) password —")
-    print("one password unlocks the vault and logs into Management.")
+    print("one password unlocks the vault and signs in to Host and Services.")
     try:
         pw = getpass.getpass("New broker password: ")
         pw2 = getpass.getpass("Confirm: ")

@@ -318,7 +318,7 @@ BOX_IMAGE = "rs-sandbox-box:latest"
 BOX_IMAGE_MISSING_MSG = ("box {name!r} cannot run: its box image is not in the "
                          "project (the project's last start could not bring it up "
                          "to date); restart the project, and if that fails, "
-                         "Rebuild all on Sandboxes → Software")
+                         "Rebuild all on Host → Software")
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
 # The browser image's baked stdio MCP server name(s). ⚠ MIRROR of
@@ -2422,7 +2422,7 @@ BOX_LINKS = {"dev": ("rs-wt", "rs-land", "rs-board", "rs-docs"), "web": ("rs-web
 # can reach a browser. A MIRROR of rscore.RS_COMMAND_NOT_IN_IMAGE (pinned).
 BOX_COMMAND_NOT_IN_IMAGE = (
     "this image does not carry that command; rebuild RS's images with Rebuild "
-    "all on Sandboxes → Software, then stop the project and start it again")
+    "all on Host → Software, then stop the project and start it again")
 BOX_RS_COMMANDS_OLD = ("this box was started before RS moved its helper "
                        "commands; stop the project and start it again")
 
@@ -3651,7 +3651,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     if editor and not os.path.isfile(
             os.path.join(EDITOR_DIST_MOUNT, ".local/bin/code-server")):
         die("this box requests the editor, but the editor files are not "
-            "staged in this project — install the editor from Sandboxes → "
+            "staged in this project — install the editor from Host → "
             "Software if it is missing on this host, then stop and start the "
             "project to stage it, and retry")
     # A node box copies the project's staged node seed at boot. Refuse before any
@@ -3661,7 +3661,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     node = bool(preset.get("node"))
     if node and not os.path.isfile(NODE_DIST_BIN):
         die("this box type needs node, but node is not staged in this project "
-            "— pull node under Sandboxes → Software, then retry")
+            "— pull node under Host → Software, then retry")
     dev_subnet = ""
     if is_dev:
         # Dev boxes live on their own pinned /24, NOT the rs-inner pool: no

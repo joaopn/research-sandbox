@@ -26,7 +26,7 @@
 # What this chain drops is the final DROP below.
 #
 # One destination exception: TCP 8888 to the shared MCP gateway, from any
-# rs-inner source (analysis workers given an MCP page server reach it there).
+# rs-inner source (analysis workers given a Services → MCP server reach it there).
 # The gateway sits at ONE fixed address per project: the last usable host
 # address of the project's own network (the default-route interface's network),
 # computed here exactly as inner-guard.sh computes it — nothing writes it down.

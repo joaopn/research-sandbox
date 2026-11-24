@@ -734,7 +734,7 @@ def _app_pin_key(name: str) -> str:
 
 
 def cmd_app_check(args: argparse.Namespace) -> None:
-    # The Software page's Apps card, Check: npm's latest beside the version in
+    # Host → Software's Apps card, Check: npm's latest beside the version in
     # effect; changes nothing.
     key = _app_pin_key(args.app)
     try:
@@ -856,8 +856,8 @@ def _print_host_settings(s: dict) -> None:
 
 
 def cmd_settings(args: argparse.Namespace) -> None:
-    """Show or change the host settings (the webui's Sandboxes →
-    Infrastructure → Settings). Projects pick a change up at their next start."""
+    """Show or change the host settings (the webui's Host →
+    Defaults, the task limit). Projects pick a change up at their next start."""
     if args.settings_action is None:
         _print_host_settings(rscore.host_settings())
         return
@@ -2291,8 +2291,8 @@ def cmd_webui(args: argparse.Namespace) -> None:
 
 def cmd_dev_passwd(args: argparse.Namespace) -> None:
     """Set the sandbox-admin gitea password — the human's interactive gitea
-    identity (the webui Development page's Gitea tab sign-in). Bootstrap mints
-    and DISCARDS a random one, so this (or the Sandboxes → Infrastructure
+    identity (the webui Services page's Gitea tab sign-in). Bootstrap mints
+    and DISCARDS a random one, so this (or the Services → Gitea
     dialog) is how the operator makes the gitea web UI passable."""
     import getpass
     pw = sys.stdin.readline().strip() if not sys.stdin.isatty() \
@@ -2304,7 +2304,7 @@ def cmd_dev_passwd(args: argparse.Namespace) -> None:
         die(f"could not set the {gitea.ADMIN_USER} password"
             + (f" ({e.client_detail})" if e.client_detail else ""))
     print(f"password set for {gitea.ADMIN_USER} — sign in on the webui's "
-          f"Development page (Gitea tab)")
+          f"Services page (Gitea tab)")
 
 
 def cmd_dev_board_export(args: argparse.Namespace) -> None:
@@ -2516,7 +2516,7 @@ def cmd_dev_fork_list(_args: argparse.Namespace) -> None:
 
 
 def cmd_dev_fork_set_active(args: argparse.Namespace) -> None:
-    """Set a repo's GLOBAL active fork (the CLI twin of the Development page's
+    """Set a repo's GLOBAL active fork (the CLI twin of the Services page's
     fork dropdown — the multi-fork edge case)."""
     req = _build(rscore.DevSetActiveForkRequest, repo=args.repo, user=args.user)
     res = _call(rscore.dev_set_active_fork, req)
@@ -2526,7 +2526,7 @@ def cmd_dev_fork_set_active(args: argparse.Namespace) -> None:
 def cmd_dev_fork_purge(args: argparse.Namespace) -> None:
     """Delete a RETIRED dev identity — its gitea user and every fork it owns —
     freeing the name for a same-named project or box (the CLI twin of the
-    Development page's retired-identity control).
+    Services page's retired-identity control).
 
     No step-up prompt, matching `dev repo remove`, which likewise deletes forks
     unprompted: the host CLI already runs with the operator's docker access, so
@@ -2536,7 +2536,7 @@ def cmd_dev_fork_purge(args: argparse.Namespace) -> None:
 
     This is also the ONLY surface that reaches an identity with no fork left
     (a create that died before its fork existed, or an owner a mirror Remove
-    had to keep because it owned something else): the Development page lists
+    had to keep because it owned something else): the Services page lists
     retired identities by their forks, so those have no row to click. A plain
     mirror Remove no longer manufactures them — it purges the fully retired
     owners of the forks it deletes."""
@@ -2573,7 +2573,7 @@ def cmd_dev_repo_list(_args: argparse.Namespace) -> None:
 
 def cmd_dev_repo_fetch(args: argparse.Namespace) -> None:
     """Show or hide a repo on the webui's rs-fetch lists — the CLI twin of the
-    Development page's Repos-tab toggle. Display only: a hidden repo is still
+    Services page's Repos-tab toggle. Display only: a hidden repo is still
     fetchable by name with `rs-fetch <repo>`."""
     req = _build(rscore.DevSetFetchEnabledRequest, repo=args.repo,
                  enabled=(args.state == "on"))
@@ -2623,8 +2623,8 @@ def cmd_dev_sync(args: argparse.Namespace) -> None:
 
 
 def cmd_dev_gitea_enable(_args: argparse.Namespace) -> None:
-    """Provision/enable the shared Gitea (the CLI twin of the webui Sandboxes →
-    Infrastructure button). The SOLE stand-up path — gitea is never lazily
+    """Provision/enable the shared Gitea (the CLI twin of the webui Services →
+    Gitea Enable button). The SOLE stand-up path — gitea is never lazily
     created anymore; this or the button creates it, and an enabled-but-stopped
     one auto-resumes at `research start`."""
     _call(rscore.dev_gitea_start, _build(rscore.DevGiteaStartRequest))
@@ -2651,7 +2651,7 @@ def _read_new_passphrase(what: str) -> str:
 
 def cmd_dev_gitea_upgrade(_args: argparse.Namespace) -> None:
     """Upgrade the shared Gitea to the release this software ships (the CLI twin
-    of Sandboxes → Infrastructure's Upgrade). Backs the instance up first, runs
+    of Services → Gitea's Upgrade). Backs the instance up first, runs
     the new release on a copy of the data and keeps the old one until it is
     discarded; a failure puts the old one back."""
     info = rscore.gitea_version_info()
@@ -2706,7 +2706,7 @@ def cmd_dev_gitea_discard_previous(args: argparse.Namespace) -> None:
 
 def cmd_dev_gitea_rollback(args: argparse.Namespace) -> None:
     """Go back from a successful upgrade to the Gitea release kept beside it
-    (the CLI twin of Sandboxes → Infrastructure's Go back). Everything written
+    (the CLI twin of Services → Gitea's Go back). Everything written
     to the new release since the upgrade is deleted, so it asks first."""
     # Asked here, not inside the refusal: the verb re-asks that under its own
     # exclusive lock, where this probe would read its own holder as busy.
@@ -3417,7 +3417,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ----- the MCP gateway's server list ---------------------------------
     msv = mcp_sub.add_parser(
-        "server", help="the shared MCP gateway's servers (the Sandboxes → MCP page's list)")
+        "server", help="the shared MCP gateway's servers (the Services → MCP tab's list)")
     msv_sub = msv.add_subparsers(dest="server_command", required=True)
 
     def _mcp_header_flags(p: argparse.ArgumentParser) -> None:
@@ -3585,7 +3585,7 @@ def build_parser() -> argparse.ArgumentParser:
     dvrf = dvr_sub.add_parser(
         "fetch",
         help="show/hide a repo on the webui's rs-fetch lists — the CLI twin of "
-             "the Development page's Repos tab. Display only: a hidden repo is "
+             "the Services page's Repos tab. Display only: a hidden repo is "
              "still fetchable by name")
     dvrf.add_argument("repo")
     dvrf.add_argument("state", choices=["on", "off"],
@@ -3645,14 +3645,14 @@ def build_parser() -> argparse.ArgumentParser:
     dvfka = dvfk_sub.add_parser(
         "set-active",
         help="set a repo's GLOBAL active fork (steers PR reads, rs-fetch and "
-             "reviews) — the CLI twin of the Development page's dropdown")
+             "reviews) — the CLI twin of the Services page's dropdown")
     dvfka.add_argument("repo")
     dvfka.add_argument("user", help="a live consumer fork's gitea username")
     dvfka.set_defaults(func=cmd_dev_fork_set_active)
     dvfkp = dvfk_sub.add_parser(
         "purge",
         help="delete a RETIRED agent identity (its gitea user + every fork it "
-             "owns) to free its name — the CLI twin of the Development page's "
+             "owns) to free its name — the CLI twin of the Services page's "
              "retired-identity control, and the only way to reach one that no "
              "longer has a fork")
     dvfkp.add_argument("user", help="a retired consumer's gitea username "
@@ -3661,13 +3661,13 @@ def build_parser() -> argparse.ArgumentParser:
     dvge = dv_sub.add_parser(
         "gitea-enable",
         help="enable the shared Gitea backend (create if absent, else resume) — "
-             "the CLI twin of the webui Sandboxes → Infrastructure button")
+             "the CLI twin of the webui Services → Gitea Enable button")
     dvge.set_defaults(func=cmd_dev_gitea_enable)
     dvgu = dv_sub.add_parser(
         "gitea-upgrade",
         help="upgrade the shared Gitea to the release this software ships, "
              "keeping the old one until it is discarded — the CLI twin of the "
-             "webui Sandboxes → Infrastructure Upgrade button")
+             "webui Services → Gitea Upgrade button")
     dvgu.set_defaults(func=cmd_dev_gitea_upgrade)
     dvgd = dv_sub.add_parser(
         "gitea-discard-previous",
@@ -3679,7 +3679,7 @@ def build_parser() -> argparse.ArgumentParser:
         "gitea-rollback",
         help="go back from an upgrade to the Gitea release kept beside it, "
              "deleting everything written since — the CLI twin of the webui "
-             "Sandboxes → Infrastructure Go back button")
+             "Services → Gitea Go back button")
     dvgr.add_argument("--yes", action="store_true", help="do not ask first")
     dvgr.set_defaults(func=cmd_dev_gitea_rollback)
     dvrt = dv_sub.add_parser(
@@ -3691,7 +3691,7 @@ def build_parser() -> argparse.ArgumentParser:
     dvrv = dv_sub.add_parser(
         "review",
         help="review a PR or a single commit in the ephemeral sandboxed "
-             "reviewer (advisory; verdict -> host ledger + the Development "
+             "reviewer (advisory; verdict -> host ledger + the Services "
              "page)")
     dvrv.add_argument("repo", help="dev repo NAME (reviews its ACTIVE consumer fork)")
     dvrv.add_argument("--pr", type=int, help="PR number to review")
@@ -3772,8 +3772,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser(
         "settings",
-        help="show or change host settings (the webui's Sandboxes → "
-             "Infrastructure → Settings)")
+        help="show or change host settings (the webui's Host → "
+             "Defaults)")
     st.set_defaults(func=cmd_settings)
     st_sub = st.add_subparsers(dest="settings_action")
     stp = st_sub.add_parser(

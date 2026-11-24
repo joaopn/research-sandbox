@@ -11,11 +11,11 @@ The dev lane lets an agent work on a GitHub repository without holding any GitHu
 
 ## Parts
 
-The **shared Gitea** is one Gitea server for the whole machine. It is switched on once, under Sandboxes → Infrastructure → Enable Gitea, and the maintainer reads it in the Gitea tab of the Development page.
+The **shared Gitea** is one Gitea server for the whole machine. It is switched on once, from the bar at the top of the Gitea tab on the Services page, and the maintainer reads it in that same tab; the bar also upgrades it and sets its admin password.
 
 The **mirror** is a private, read-only copy of the GitHub repository, refreshed every 10 minutes and on demand. It carries code only: no issues, no pull requests, no wiki. A private GitHub repository needs a GitHub token when it is added; Gitea keeps that token with the mirror, and RS stores none.
 
-A mirror is named after the repository alone, without its GitHub owner. Adding a repository whose name another owner's mirror already holds is refused with an error naming both; the existing mirror has to be removed on the Development page first.
+A mirror is named after the repository alone, without its GitHub owner. Adding a repository whose name another owner's mirror already holds is refused with an error naming both; the existing mirror has to be removed on the Services page first.
 
 A **fork** is one agent's working copy of the mirror. Every agent gets its own Gitea account and its own private fork: a dev project's agent is `agent-<project>`, and each dev box is `agent-<project>.<box>`. The fork holds the agent's branches and pull requests, plus its issues, board and wiki.
 
@@ -60,12 +60,12 @@ The agent's next base sync rebases its fork's `dev` onto the mirror. Collected c
 | Create a dev project | New Project window, dev card (GitHub URL) | Mirror added if needed; the project's agent gets a fork |
 | Add a dev box | Box window, dev preset (GitHub URL) | Mirror added if needed; the box gets its own fork |
 | Destroy a project, remove a box | Project or box controls | Fork archived: kept, read-only |
-| Remove the repository | Development page | Mirror and every fork deleted; refused while any fork is still live |
-| Purge an identity | Development page, archived forks | The Gitea account and its archived fork deleted; the name can be reused |
+| Remove the repository | Services page | Mirror and every fork deleted; refused while any fork is still live |
+| Purge an identity | Services page, archived forks | The Gitea account and its archived fork deleted; the name can be reused |
 
 ## Reviews
 
-An optional reviewer reads a pull request's diff in a locked-down container with no Gitea access and no tools beyond reading files. Its verdict is stored on the host and shown on the Development page next to the pull request. It never writes to Gitea.
+An optional reviewer reads a pull request's diff in a locked-down container with no Gitea access and no tools beyond reading files. Its verdict is stored on the host and shown on the Services page next to the pull request. It never writes to Gitea.
 
 ## Working modes
 
@@ -112,7 +112,7 @@ The switch reaches an existing project at its first start after the RS update th
 
 The shared Gitea's container registry holds at most one built image per repository, under a private organisation (`rs-images`) that no agent account can read or write. `research dev image show <repo>` reports it and `research dev image discard <repo>` removes it. Removing a repository's mirror removes its image first.
 
-`research dev image build <repo> [--ref <branch or tag>] [--dockerfile <path>]` builds the image. The build runs in a throwaway container with its own Docker, which holds no agent and no credential and is not a project: nothing of it appears in the sidebar, Sandboxes or the project list. The image replaces the repository's previous one. Nothing is loaded into the machine's own docker.
+`research dev image build <repo> [--ref <branch or tag>] [--dockerfile <path>]` builds the image. The build runs in a throwaway container with its own Docker, which holds no agent and no credential and is not a project: nothing of it appears in the sidebar, Host → Projects or the project list. The image replaces the repository's previous one. Nothing is loaded into the machine's own docker.
 
 ```mermaid
 flowchart TD
@@ -127,7 +127,7 @@ flowchart TD
 
 The stored image carries its commit, the git tags on that commit and the repository's address as labels. The broker runs the same build as a background job, which is what the webui's build page will call. Several repositories build at once; one repository builds one image at a time. Cancel stops a running build: the job removes its own builder and the image already stored stays. A build and a discard wait while Gitea is upgraded or restored. A builder left behind by a build that died hard is removed by the next build of any repository.
 
-The Development page's Images tab is the normal way to use this. It lists every mirrored repository with its built image (git tags, commit, build time, size) or "none". Build opens a dialog for an optional branch or tag and Dockerfile path, then a log box with a Cancel button. The log box can be sent to the background: the row then shows "building…" and settles by itself with a notice. Discard removes the stored image. The terminal commands above do the same.
+The Services page's Images tab is the normal way to use this. It lists every mirrored repository with its built image (git tags, commit, build time, size) or "none". Build opens a dialog for an optional branch or tag and Dockerfile path, then a log box with a Cancel button. The log box can be sent to the background: the row then shows "building…" and settles by itself with a notice. Discard removes the stored image. The terminal commands above do the same.
 
 A build started from the terminal is not shown as building on the tab. Publishing the image to a registry is `rs-publish`, typed in a fetch-enabled project or box: see [Container commands](Container-commands.md). When a repository has a built image, its row on the Images tab and its card on the Fetch tab each have a 📋 rs-publish button that copies the command.
 

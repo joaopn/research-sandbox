@@ -108,7 +108,7 @@ Each box adds a terminal tab (`<box> (CLI)`). It can also add an editor tab, a `
 | Remove | Asks for the master password; deletes the container and the box's folder unless "preserve artifacts" is ticked; files RS cannot delete (such as ones made as root inside the box) stay behind, and the remove warns where they are |
 | Project destroy | All boxes go; dev forks and history repos are archived |
 
-A fresh restart keeps the box's `/workspace`, its mailbox, its saved settings and its field values. It loses the box's home: the agent's login, anything installed outside `/workspace`, and a model chosen in the session but not saved. The type's setup runs again; OpenKnowledge, for example, takes about a minute to reinstall, at the version set under Sandboxes → Software.
+A fresh restart keeps the box's `/workspace`, its mailbox, its saved settings and its field values. It loses the box's home: the agent's login, anything installed outside `/workspace`, and a model chosen in the session but not saved. The type's setup runs again; OpenKnowledge, for example, takes about a minute to reinstall, at the version set under Host → Software.
 
 Removing a box keeps its mailbox, so a sharing box added later under the same name writes into it again. A dev box's fork is archived; a history box's notes repo is archived and its Gitea account deleted. The box's stored field values and its exported port tabs are deleted.
 

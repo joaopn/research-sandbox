@@ -33,7 +33,7 @@ The New Project window groups them as Research (research, researcher), Base (san
 
 ## Agents
 
-RS ships two agents, **Claude Code** and **pi**. Claude signs in with a Claude account; pi uses an API key from OpenRouter or another provider. The agent software is downloaded once on the host (Sandboxes → Software) and copied into each project at boot, never baked into an image. Editor extensions shipped with an agent or with the editor are installed at each start of a project or box when the shipped version is newer than the installed one; an equal or newer installed version is kept, so a start never downgrades.
+RS ships two agents, **Claude Code** and **pi**. Claude signs in with a Claude account; pi uses an API key from OpenRouter or another provider. The agent software is downloaded once on the host (Host → Software) and copied into each project at boot, never baked into an image. Editor extensions shipped with an agent or with the editor are installed at each start of a project or box when the shipped version is newer than the installed one; an equal or newer installed version is kept, so a start never downgrades.
 
 A research project always runs Claude, because its supervision check is a Claude Code hook; the researcher workflow and the planned research workflows run either agent (see [Research](Research.md)). A dev or researcher project needs at least one agent; a bare sandbox has none unless one is chosen.
 
@@ -47,7 +47,7 @@ A project or box that still holds a file an older RS wrote there (`/workspace/CL
 
 ## Lifecycle
 
-Stop, Start, Update and Destroy are under Sandboxes → Management. Stop and Start are also on each project's row in the sidebar (see [Browser and broker](Browser-and-broker.md)). An inner-Docker project cannot be restarted in place, so every start re-creates its container from the current RS image.
+Stop, Start, Update and Destroy are under Host → Projects. Stop and Start are also on each project's row in the sidebar (see [Browser and broker](Browser-and-broker.md)). An inner-Docker project cannot be restarted in place, so every start re-creates its container from the current RS image.
 
 | Action | Inner-Docker project | Single-container project |
 |---|---|---|
@@ -70,4 +70,4 @@ Destroy asks for the project name and the master password, and cannot be undone.
 
 **RS writes the status bar once and owns it only by name.** RS sets an agent's status line when the project is created, when the switch changes, or at the first start of an older project; after that the agent's own settings are the state. It adds or removes only its own line, never one the user set. The cost is that a status line removed inside the agent stays removed until the switch is used again.
 
-**An app RS installs has one version for the installation.** OpenKnowledge's version is a setting on the Software page (Apps), moved forward to npm's latest and never down. RS fills it into the project and box setups when it installs them; a project records the version it installed and is rebuilt once at its next start when the setting changed. The cost is a one-minute rebuild per OpenKnowledge project after each change, which drops installs outside `/workspace`.
+**An app RS installs has one version for the installation.** OpenKnowledge's version is a setting on Host → Software (Apps), moved forward to npm's latest and never down. RS fills it into the project and box setups when it installs them; a project records the version it installed and is rebuilt once at its next start when the setting changed. The cost is a one-minute rebuild per OpenKnowledge project after each change, which drops installs outside `/workspace`.

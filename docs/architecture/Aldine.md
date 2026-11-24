@@ -7,7 +7,7 @@ nav_order: 8
 
 [Aldine](https://github.com/trahloff/Aldine) is a self-hosted LaTeX editor that several people and agents can edit at once. RS can run one Aldine for the whole installation. The operator writes in it from the browser; agents read and write it through the MCP server `aldine`.
 
-It is off until the operator turns it on, under Sandboxes → Infrastructure → LaTeX editor. Turn on downloads Aldine's two images the first time (a few GB), starts them and lists Aldine on the [MCP gateway](MCP-servers.md). The same row shows its state, offers Update when the installation pins a newer version, Open (Aldine in a new browser tab) and Turn off. `research aldine on | off | status` does the same from the host.
+It is off until the operator turns it on, in the Aldine tab of the Services page. Turn on downloads Aldine's two images the first time (a few GB), starts them and lists Aldine on the [MCP gateway](MCP-servers.md). The same tab shows its state, offers Update when the installation pins a newer version, Open (Aldine in a new browser tab) and Turn off. `research aldine on | off | status` does the same from the host.
 
 ## How it is reached
 
@@ -27,8 +27,8 @@ flowchart LR
 
 | Who | How | Needs |
 |---|---|---|
-| The operator | The Aldine tab of a project, or Open on the Infrastructure row | The webui's Management sign-in |
-| An agent, a box or a research project's workers | The MCP server `aldine`, ticked for them on Sandboxes → MCP | A wiring like any other MCP server |
+| The operator | The Aldine tab of a project, or Open on Services → Aldine | The webui's Management sign-in |
+| An agent, a box or a research project's workers | The MCP server `aldine`, ticked for them on Services → MCP | A wiring like any other MCP server |
 | The LaTeX compiler | Only the Aldine app, on a network with no route out | Nothing; nothing else reaches it |
 
 A project gets an **Aldine** tab when Aldine is on and at least one of its consumers (its agent, a box, its workers) is wired to `aldine`. Unwiring the last one, or turning Aldine off, removes the tab. The tab and Open show the same editor.

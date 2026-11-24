@@ -47,7 +47,7 @@ ENTRY_KEYS = frozenset({"url", "description", "headers"})
 OK, DAMAGED, NEWER = "ok", "damaged", "newer"
 
 DAMAGED_TEXT = ("the MCP server list on the host cannot be used ({why}); "
-                "use Start an empty list in Sandboxes → MCP to replace it "
+                "use Start an empty list in Services → MCP to replace it "
                 "(every server and secret on it is discarded)")
 NEWER_TEXT = ("the MCP server list on the host was written by a newer version "
               "of RS than the one running; update RS to use it (nothing was "
@@ -296,7 +296,7 @@ _NAME_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 
 GRANTS_DAMAGED_TEXT = ("the MCP wiring table on the host cannot be used ({why}); "
-                       "use Start with no wiring in Sandboxes → MCP to replace "
+                       "use Start with no wiring in Services → MCP to replace "
                        "it (every project's wiring is discarded)")
 GRANTS_NEWER_TEXT = ("the MCP wiring table on the host was written by a newer "
                      "version of RS than the one running; update RS to use it "
