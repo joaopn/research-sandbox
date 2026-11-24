@@ -52,6 +52,7 @@ import role_mcp  # noqa: E402
 import extension  # noqa: E402  (per-project box surface)
 import workflow  # noqa: E402  (workflow manifest schema + store catalog; read-only here)
 import gitea  # noqa: E402  (STAGE_DEV_GITEA: dev-lane host state paths for the CLI shims)
+import aldine  # noqa: E402  (the shared Aldine editor: container names for the fleet stop)
 import broker  # noqa: E402  (host-side lifecycle-verb daemon over a unix socket; opt-in)
 
 # --- lifecycle core ---------------------------------------------------------
@@ -198,6 +199,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     # that can wait on a readiness probe, and nothing above depends on it, so an
     # unhealthy gitea must not delay work that never needed it.
     wire_gitea_to_projects()
+    # The shared Aldine editor, only when the operator turned it on: back onto
+    # the installation's pinned images (data kept). Never blocks the fleet: a
+    # failure warns.
+    rscore.resume_aldine_with_fleet()
     # A webui from before the narrowed listen address that _resume_webui could
     # not stop still answers every project: the fleet is otherwise up, but the
     # start must not report success over an open hole (B156). Re-read here
@@ -253,7 +258,8 @@ def cmd_stop(_: argparse.Namespace) -> None:
     failed += _stop_shared_mcps()
     if not _stop_infra_container(rscore.MCP_GATEWAY_CONTAINER):
         failed.append(rscore.MCP_GATEWAY_CONTAINER)
-    for cname in (gitea.GITEA_CONTAINER, REGISTRY_PUSH_CONTAINER, REGISTRY_CONTAINER):
+    for cname in (aldine.APP_CONTAINER, aldine.COMPILER_CONTAINER,
+                  gitea.GITEA_CONTAINER, REGISTRY_PUSH_CONTAINER, REGISTRY_CONTAINER):
         if not _stop_infra_container(cname):
             failed.append(cname)
     # The router leg keeps its return inspected so a compose-level refusal is
@@ -1344,6 +1350,31 @@ def cmd_mcp_server_test(args: argparse.Namespace) -> None:
         failed = failed or res["outcome"] != "mcp"
     if failed:
         sys.exit(1)
+
+
+def cmd_aldine_on(_args: argparse.Namespace) -> None:
+    rscore.aldine_on()
+
+
+def cmd_aldine_off(_args: argparse.Namespace) -> None:
+    _call(rscore.aldine_off)
+    print("Aldine is off (its papers are kept for when it is turned on again)")
+
+
+def cmd_aldine_status(args: argparse.Namespace) -> None:
+    out = rscore.aldine_status()
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    print(f"aldine: {'on' if out['on'] else 'off'}")
+    print(f"  app: {out['app']}   compiler: {out['compiler']}")
+    print(f"  pinned version: {out['version'] or '?'}   running: "
+          f"{out['running_version'] or '-'}   current: {'yes' if out['current'] else 'no'}")
+    if out["healthy"] is not None:
+        print(f"  answering: {'yes' if out['healthy'] else 'no'}")
+    print(f"  MCP gateway entry: {out['mcp_entry']}")
+    if out["error"]:
+        print(f"warning: {out['error']}", file=sys.stderr)
 
 
 def cmd_worker_list(args: argparse.Namespace) -> None:
@@ -3430,6 +3461,19 @@ def build_parser() -> argparse.ArgumentParser:
                      "to introduce itself as an MCP server")
     mst.add_argument("name", nargs="?")
     mst.set_defaults(func=cmd_mcp_server_test)
+
+    ald = sub.add_parser("aldine", help="the shared Aldine LaTeX editor (one for the "
+                                        "whole installation, offered to agents as the "
+                                        "MCP gateway server `aldine`)")
+    ald_sub = ald.add_subparsers(dest="subcommand", required=True)
+    ald_sub.add_parser("on", help="pull, start and list Aldine on the MCP gateway "
+                                  "(also moves it onto the pinned version)"
+                       ).set_defaults(func=cmd_aldine_on)
+    ald_sub.add_parser("off", help="remove Aldine's containers and gateway entry; "
+                                   "its papers are kept").set_defaults(func=cmd_aldine_off)
+    als = ald_sub.add_parser("status", help="on/off, containers, version and health")
+    als.add_argument("--json", action="store_true")
+    als.set_defaults(func=cmd_aldine_status)
 
     mw = mcp_sub.add_parser(
         "wire", help="give a project's agent, one of its boxes, or a research "

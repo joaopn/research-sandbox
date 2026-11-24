@@ -89,6 +89,7 @@ import role_mcp  # noqa: E402
 import extension  # noqa: E402
 import workflow  # noqa: E402  (manifest store catalog; from_kwargs resolves --workflow)
 import gitea  # noqa: E402  (STAGE_DEV_GITEA: shared rs-gitea client + dev-lane host state)
+import aldine  # noqa: E402  (the shared Aldine LaTeX editor: names, pins, pure helpers)
 import orch_files  # noqa: E402  (no-follow access to <workspace>/.orchestrator; host-only)
 from broker_auth import MIN_PASSWORD_LENGTH  # noqa: E402  (single password-length floor: broker passwd + gitea passwd + the app.js mirror)
 
@@ -19609,6 +19610,7 @@ def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
         state = "absent"
     if state == "running":
         _mcp_docker(["docker", "kill", "-s", "HUP", MCP_GATEWAY_CONTAINER], deadline)
+        _mcp_gateway_aldine_front(deadline)
         return True, "the MCP gateway is running"
     if state == "stopped":
         r = _mcp_docker(["docker", "start", MCP_GATEWAY_CONTAINER], deadline)
@@ -19638,7 +19640,15 @@ def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
     # lifecycle flock; no inline verb reaches this branch).
     if state == "absent" and deadline is None:
         mcp_gateway_attach_all()
+    # A created gateway is on rs-sandbox only: back onto Aldine's front
+    # network when Aldine is on (every gateway (re)creation passes here).
+    _mcp_gateway_aldine_front(deadline)
     return True, "the MCP gateway was started"
+
+
+def _mcp_gateway_aldine_front(deadline: float | None) -> None:
+    for problem in aldine_connect_front(deadline):
+        print(f"warning: {problem}", file=sys.stderr)
 
 
 def _mcp_gateway_build() -> bool:
@@ -19894,36 +19904,45 @@ def mcp_server_edit(req: McpServerEditRequest, *, blocking: bool = True,
 
 
 def mcp_server_remove(req: McpServerNameRequest, *, blocking: bool = True,
-                      deadline: float | None = None) -> dict:
+                      deadline: float | None = None,
+                      if_url: str | None = None) -> dict:
     """Take a server off the list and unwire it everywhere — in the table
     only: the gateway refuses it at once, and each agent's leftover entry goes
     at that container's next start or wiring change. A wiring table that
     cannot be used refuses the removal before anything is written; the list is
     saved first, so a failure in between leaves a table naming a server that
     is gone (refused by the gateway), never a listed server that lost its
-    wiring."""
+    wiring. `if_url` (Aldine's Turn off): remove the server only when it is on
+    the list at exactly that address, and otherwise change nothing — an
+    absent one included — instead of refusing."""
+    removed = False
     try:
         with mcp_servers.lock(blocking=blocking):
             data = mcp_servers.load()
-            if req.name not in data["servers"]:
+            entry = data["servers"].get(req.name)
+            if entry is None and if_url is None:
                 raise mcp_servers.ServerListError(
                     f"no server named {req.name} is on the list")
-            grants = mcp_servers.load_grants()
-            del data["servers"][req.name]
-            mcp_servers.save(data)
-            mcp_servers.render(data)
-            touched = False
-            for row in grants["projects"].values():
-                for consumer in row["consumers"].values():
-                    if req.name in consumer["servers"]:
-                        consumer["servers"].remove(req.name)
-                        touched = True
-            if touched:
-                mcp_servers.save_grants(grants)
-                mcp_servers.render_grants(grants)
+            if entry is not None and (if_url is None or entry.get("url") == if_url):
+                grants = mcp_servers.load_grants()
+                del data["servers"][req.name]
+                mcp_servers.save(data)
+                mcp_servers.render(data)
+                touched = False
+                for row in grants["projects"].values():
+                    for consumer in row["consumers"].values():
+                        if req.name in consumer["servers"]:
+                            consumer["servers"].remove(req.name)
+                            touched = True
+                if touched:
+                    mcp_servers.save_grants(grants)
+                    mcp_servers.render_grants(grants)
+                removed = True
     except mcp_servers.ServerListError as e:
         raise _mcp_list_error(e) from None
-    _mcp_gateway_hup(deadline)
+    # Docker calls only after the lock is released.
+    if removed:
+        _mcp_gateway_hup(deadline)
     return mcp_server_list(deadline)
 
 
@@ -20587,6 +20606,381 @@ def mcp_project_has_rows(project: str) -> bool:
     except OSError:
         return False
     return state == mcp_servers.OK and project in data["projects"]
+
+
+# ---------------------------------------------------------------------------
+# The shared Aldine LaTeX editor (rs-aldine + rs-aldine-compiler)
+# ---------------------------------------------------------------------------
+# One Aldine for the whole installation, turned on by the operator (Sandboxes
+# page or `research aldine on`), resumed by `research start` only when it was
+# turned on, and offered to agents as the MCP gateway server `aldine`. Names,
+# the containers' exact shape and the host files are in cli/aldine.py.
+
+# How long Turn on / start waits for the app and the compiler to answer their
+# health checks after (re)creating them (image pulls are before it, unbounded).
+# Measured in a nested RS (2026-11-24, 1.22.1): the whole Turn on onto FRESH
+# volumes — both containers created, the app's datastore and signing secret
+# made, both answering — took 2.4 s; a warm restart answers in 1.2 s. The
+# bound is twenty-five times the first start, room for a slow disk or a host
+# busy with other projects' work; a bound that is too long only delays the
+# report of a container that really cannot come up, one too short fails a
+# healthy Aldine on a loaded host.
+ALDINE_HEALTH_WAIT_S = 60
+# Between two health checks: each is one `docker exec` (~0.1 s), so a second
+# keeps the wait responsive without spinning.
+ALDINE_HEALTH_POLL_S = 1
+# One health request: the app's handler is one datastore check and the
+# compiler's a constant answer (milliseconds); five seconds tolerates a host
+# under load, and a status check (two of them) stays well inside its deadline.
+ALDINE_PROBE_TIMEOUT_S = 5
+
+ALDINE_TURNING_ON = "Aldine is being turned on; try again when that has finished"
+
+
+def _aldine_pins() -> dict[str, str]:
+    """The pinned version and image digests, checked (AldineError)."""
+    try:
+        versions = load_versions()
+    except (OSError, ValueError):
+        raise aldine.AldineError(_VERSIONS_NOT_TEXT) from None
+    return aldine.pins_from(versions)
+
+
+def _aldine_docker(cmd: list[str], deadline: float | None) -> subprocess.CompletedProcess:
+    """One docker call under the verb's deadline, its refusals as AldineError."""
+    try:
+        return _mcp_docker(cmd, deadline)
+    except ValidationError as e:
+        raise aldine.AldineError(str(e)) from None
+
+
+def _aldine_docker_failed(what: str, r: subprocess.CompletedProcess) -> aldine.AldineError:
+    """The refusal for a docker step that failed: its FIRST line is the cause."""
+    err = [l for l in (r.stderr or r.stdout or "").splitlines() if l.strip()]
+    return aldine.AldineError(what + (f" ({err[0].strip()[:200]})" if err else ""))
+
+
+def _aldine_container(name: str, deadline: float | None) -> tuple[str, dict]:
+    """(running | stopped | absent, labels) of one Aldine container."""
+    r = _aldine_docker(["docker", "container", "inspect", "-f",
+                        "{{.State.Running}} {{json .Config.Labels}}", name], deadline)
+    if r.returncode != 0:
+        return "absent", {}
+    running, _, raw = r.stdout.strip().partition(" ")
+    try:
+        labels = json.loads(raw)
+    except (ValueError, RecursionError):
+        labels = {}
+    return ("running" if running == "true" else "stopped"), (
+        labels if isinstance(labels, dict) else {})
+
+
+def _aldine_network(name: str, deadline: float | None) -> str:
+    """internal | routed (a bridge with a route out) | absent."""
+    r = _aldine_docker(["docker", "network", "inspect", "-f", "{{.Internal}}",
+                        name], deadline)
+    if r.returncode != 0:
+        return "absent"
+    return "internal" if r.stdout.strip() == "true" else "routed"
+
+
+# Who shares Aldine's front network with the app: the two RS containers that
+# reach it by name. Nothing else is ever connected to it.
+_ALDINE_FRONT_PEERS = (MCP_GATEWAY_CONTAINER, WEBUI_CONTAINER)
+
+
+def aldine_connect_front(deadline: float | None = None) -> list[str]:
+    """Connect the MCP gateway and the webui to Aldine's front network, each
+    when the network exists, the container exists (running or stopped: the
+    connection is kept across a start) and it is not connected yet.
+    Idempotent and cheap when Aldine is off (one network inspect). Called
+    wherever one of the three is (re)created: Aldine on / start, every
+    gateway (re)creation, every webui (re)start. Never raises; returns the
+    problems as sentences (the callers warn, Turn on refuses)."""
+    problems: list[str] = []
+    try:
+        if _aldine_network(aldine.FRONT_NETWORK, deadline) == "absent":
+            return problems
+        for peer in _ALDINE_FRONT_PEERS:
+            r = _aldine_docker(["docker", "container", "inspect", "-f",
+                                "{{json .NetworkSettings.Networks}}", peer], deadline)
+            if r.returncode != 0:
+                continue                                  # not there: nothing to connect
+            try:
+                nets = json.loads(r.stdout.strip() or "{}")
+            except (ValueError, RecursionError):
+                nets = {}
+            if isinstance(nets, dict) and aldine.FRONT_NETWORK in nets:
+                continue
+            c = _aldine_docker(["docker", "network", "connect", aldine.FRONT_NETWORK,
+                                peer], deadline)
+            if c.returncode != 0:
+                problems.append(str(_aldine_docker_failed(
+                    f"{peer} could not be connected to Aldine's network", c)))
+    except aldine.AldineError as e:
+        problems.append(str(e))
+    return problems
+
+
+def _aldine_remove_container(name: str, state: str, deadline: float | None) -> None:
+    """Stop (the app flushes its open documents on SIGTERM, inside docker's
+    default grace) and remove one container, by its fixed name."""
+    if state == "running":
+        r = _aldine_docker(["docker", "stop", name], deadline)
+        if r.returncode != 0:
+            raise _aldine_docker_failed(f"{name} could not be stopped", r)
+    if state != "absent":
+        r = _aldine_docker(["docker", "rm", "-f", name], deadline)
+        if r.returncode != 0:
+            raise _aldine_docker_failed(f"{name} could not be removed", r)
+
+
+def _aldine_probe(url: str, *, app: bool, deadline: float | None) -> bool:
+    left = ALDINE_PROBE_TIMEOUT_S
+    if deadline is not None:
+        left = min(left, max(1, int(deadline - time.monotonic())))
+    try:
+        r = _aldine_docker(aldine.health_probe_argv(url, left), deadline)
+    except aldine.AldineError:
+        return False
+    return r.returncode == 0 and aldine.health_ok(r.stdout, app=app)
+
+
+def _aldine_healthy(deadline: float | None) -> bool:
+    """The app answers its health check, and reaches the compiler's across the
+    internal network."""
+    return (_aldine_probe(aldine.APP_HEALTH_URL, app=True, deadline=deadline)
+            and _aldine_probe(aldine.COMPILER_HEALTH_URL, app=False, deadline=deadline))
+
+
+def _aldine_wait_healthy() -> bool:
+    end = time.monotonic() + ALDINE_HEALTH_WAIT_S
+    while True:
+        if _aldine_healthy(end):
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(ALDINE_HEALTH_POLL_S)
+
+
+def _aldine_list_ready() -> None:
+    """Refuse before any long step when the server list cannot take RS's
+    entry: unreadable, written by a newer RS, or holding another `aldine`."""
+    try:
+        data = mcp_servers.load()
+    except mcp_servers.ServerListError as e:
+        raise aldine.AldineError(str(e)) from None
+    if aldine.gateway_entry_conflict(data):
+        raise aldine.AldineError(aldine.CONFLICT_TEXT.format(name=aldine.MCP_SERVER_NAME))
+
+
+def _aldine_write_tab_record() -> None:
+    """Refresh the webui's tab record from the wiring table (an unreadable
+    table counts as no wiring: nothing can be wired through it)."""
+    state, grants, _why = mcp_servers.read_grants()
+    if state != mcp_servers.OK:
+        grants = mcp_servers.grants_empty()
+    try:
+        aldine.write_tab_record(grants)
+    except OSError as e:
+        raise aldine.AldineError("cannot write the Aldine tab record on the host "
+                                 f"({e.strerror or 'write failed'})") from None
+
+
+def _aldine_up(progress) -> None:
+    """Make Aldine run what the installation pins, healthy, listed on the
+    gateway. Idempotent: on a running, current Aldine it only re-checks. A
+    container whose labels differ from the pins is replaced (data kept: the
+    volumes are named). Unbounded (the build lane and the host command): the
+    first pull is ~2.4 GB. Every refusal is an AldineError."""
+    pins = _aldine_pins()
+    try:
+        token = aldine.ensure_token()
+    except OSError as e:
+        raise aldine.AldineError("cannot write the Aldine access key on the host "
+                                 f"({e.strerror or 'write failed'})") from None
+    _aldine_list_ready()
+    try:
+        aldine.set_on(True)
+    except OSError as e:
+        raise aldine.AldineError("cannot record on the host that Aldine is on "
+                                 f"({e.strerror or 'write failed'})") from None
+
+    progress.step("pull", "fetching the Aldine images")
+    for image in (aldine.compiler_image(pins), aldine.app_image(pins)):
+        if _aldine_docker(["docker", "image", "inspect", image], None).returncode != 0:
+            print(f"pulling {image} ...", flush=True)
+            try:
+                r = run(["docker", "pull", image])
+            except OSError:
+                raise aldine.AldineError(_MCP_HOST_DOWN) from None
+            if r.returncode != 0:
+                raise aldine.AldineError(
+                    f"the Aldine image {image} could not be downloaded (the "
+                    "operation's log has docker's reason)")
+
+    progress.step("start", "starting Aldine")
+    fresh_network = False
+    for name, want, create, why in (
+            (aldine.INTERNAL_NETWORK, "internal", aldine.network_create_argv(),
+             "has a route out of the host, which the Aldine compiler must never have"),
+            (aldine.FRONT_NETWORK, "routed", aldine.front_network_create_argv(),
+             "has no route out of the host, which the Aldine editor needs")):
+        net = _aldine_network(name, None)
+        if net == "absent":
+            r = _aldine_docker(create, None)
+            if r.returncode != 0:
+                raise _aldine_docker_failed(f"the Aldine network {name} could not be created", r)
+            fresh_network = True
+        elif net != want:
+            raise aldine.AldineError(
+                f"a docker network named {name} exists that {why}; RS did not "
+                "create it that way, so nothing was started")
+    for role, name, argv in (
+            ("compiler", aldine.COMPILER_CONTAINER, aldine.compiler_run_argv(pins)),
+            ("app", aldine.APP_CONTAINER,
+             aldine.app_run_argv(pins, aldine.ENV_FILE_PATH))):
+        state, labels = _aldine_container(name, None)
+        # A container from another pin follows the installation; one made
+        # against an earlier Aldine network (since removed) could not start.
+        if state != "absent" and (fresh_network or not aldine.is_current(labels, pins, role)):
+            print(f"replacing {name} (it runs Aldine "
+                  f"{labels.get(aldine.VERSION_LABEL) or 'of unknown version'}; "
+                  f"this installation pins {pins['version']})", flush=True)
+            _aldine_remove_container(name, state, None)
+            state = "absent"
+        if state == "stopped":
+            r = _aldine_docker(["docker", "start", name], None)
+            if r.returncode != 0:
+                raise _aldine_docker_failed(f"{name} could not be started", r)
+        elif state == "absent":
+            r = _aldine_docker(argv, None)
+            if r.returncode != 0:
+                raise _aldine_docker_failed(f"{name} could not be created", r)
+
+    # The gateway and the webui reach the app only on its front network.
+    problems = aldine_connect_front(None)
+    if problems:
+        raise aldine.AldineError("; ".join(problems))
+
+    progress.step("health", "waiting for Aldine to answer")
+    if not _aldine_wait_healthy():
+        raise aldine.AldineError(
+            f"Aldine did not answer its health check within {ALDINE_HEALTH_WAIT_S} "
+            "seconds of starting")
+
+    progress.step("mcp", "listing Aldine on the MCP gateway")
+
+    def change(data: dict) -> None:
+        try:
+            aldine.apply_gateway_entry(data, token)
+        except aldine.AldineError as e:
+            raise mcp_servers.ServerListError(str(e)) from None
+    try:
+        _mcp_change(change, blocking=True, deadline=None)
+    except ValidationError as e:
+        raise aldine.AldineError(str(e)) from None
+    _aldine_write_tab_record()
+
+
+def aldine_on(progress=None) -> dict:
+    """Turn the shared Aldine on (a build-lane verb: the first pull is
+    multi-minute). Every refusal is a die(): the build lane shows its line,
+    where a ValidationError would end as a bare "invalid request"."""
+    progress = progress or _NULL_PROGRESS
+    try:
+        _aldine_up(progress)
+    except aldine.AldineError as e:
+        die(str(e))
+    print(f"Aldine is on ({aldine.APP_CONTAINER} and {aldine.COMPILER_CONTAINER} "
+          "are running and answering)")
+    return {"aldine": "on"}
+
+
+def aldine_off(*, blocking: bool = True, deadline: float | None = None) -> dict:
+    """Turn the shared Aldine off: its gateway entry (only when it is RS's —
+    which also unwires it everywhere), both containers and the internal
+    network go; the volumes (the papers) and the access key stay, so turning
+    it on again finds everything. Bounded by `deadline` on the broker;
+    idempotent, so a refusal half-way is finished by running it again."""
+    try:
+        mcp_server_remove(McpServerNameRequest(name=aldine.MCP_SERVER_NAME),
+                          blocking=blocking, deadline=deadline, if_url=aldine.MCP_URL)
+        try:
+            aldine.set_on(False)
+        except OSError as e:
+            raise aldine.AldineError("cannot record on the host that Aldine is off "
+                                     f"({e.strerror or 'write failed'})") from None
+        for name in (aldine.APP_CONTAINER, aldine.COMPILER_CONTAINER):
+            state, _labels = _aldine_container(name, deadline)
+            _aldine_remove_container(name, state, deadline)
+        if _aldine_network(aldine.FRONT_NETWORK, deadline) != "absent":
+            # The gateway and the webui leave it first (a network with
+            # endpoints cannot be removed); not connected is no error.
+            for peer in _ALDINE_FRONT_PEERS:
+                _aldine_docker(["docker", "network", "disconnect", aldine.FRONT_NETWORK,
+                                peer], deadline)
+        for net in (aldine.FRONT_NETWORK, aldine.INTERNAL_NETWORK):
+            if _aldine_network(net, deadline) != "absent":
+                r = _aldine_docker(["docker", "network", "rm", net], deadline)
+                if r.returncode != 0:
+                    raise _aldine_docker_failed(f"the Aldine network {net} could not be removed", r)
+        _aldine_write_tab_record()
+    except aldine.AldineError as e:
+        raise ValidationError(str(e)) from None
+    return {"aldine": "off"}
+
+
+def aldine_status(deadline: float | None = None) -> dict:
+    """On or off, each container's state, the pinned and running version, and
+    whether it answers. Cheap and bounded: ONE deadline, taken first, shared by
+    every docker call. Never raises for a state it can name."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    out: dict[str, Any] = {"on": aldine.is_on(), "app": "absent", "compiler": "absent",
+                           "version": None, "running_version": None,
+                           "current": False, "healthy": None, "mcp_entry": "absent",
+                           "error": None}
+    try:
+        pins = _aldine_pins()
+        out["version"] = pins["version"]
+    except aldine.AldineError as e:
+        pins = None
+        out["error"] = str(e)
+    state, data, _why = mcp_servers.read()
+    if state != mcp_servers.OK:
+        out["mcp_entry"] = "unreadable"
+    elif aldine.MCP_SERVER_NAME in data["servers"]:
+        out["mcp_entry"] = "conflict" if aldine.gateway_entry_conflict(data) else "listed"
+    try:
+        app_state, app_labels = _aldine_container(aldine.APP_CONTAINER, deadline)
+        comp_state, comp_labels = _aldine_container(aldine.COMPILER_CONTAINER, deadline)
+        out["app"], out["compiler"] = app_state, comp_state
+        out["running_version"] = app_labels.get(aldine.VERSION_LABEL)
+        out["current"] = bool(pins and app_state != "absent" and comp_state != "absent"
+                              and aldine.is_current(app_labels, pins, "app")
+                              and aldine.is_current(comp_labels, pins, "compiler"))
+        if app_state == "running" and comp_state == "running":
+            out["healthy"] = _aldine_healthy(deadline)
+    except aldine.AldineError as e:
+        out["error"] = out["error"] or str(e)
+    return out
+
+
+def resume_aldine_with_fleet() -> None:
+    """`research start`'s step: bring a turned-on Aldine back onto the pinned
+    images (replacing containers from another pin, data kept), or WARN and
+    carry on — nothing else in the fleet depends on it. Never creates Aldine
+    when it was never turned on. The tab record is refreshed either way."""
+    if aldine.is_on():
+        try:
+            _aldine_up(_NULL_PROGRESS)
+            print(f"{aldine.APP_CONTAINER} is running")
+        except aldine.AldineError as e:
+            print(f"warning: Aldine could not be resumed: {e}", file=sys.stderr)
+    try:
+        _aldine_write_tab_record()
+    except aldine.AldineError as e:
+        print(f"warning: {e}", file=sys.stderr)
 
 
 def _supervisor_mcp_reload(container_name: str) -> None:
@@ -28276,7 +28670,9 @@ def pin_shared_gateway(container: str) -> bool:
 def shared_gateway_containers() -> list[str]:
     """Every shared container RS connects to project networks — the set whose
     default route must stay on rs-sandbox. The kept-aside previous gitea is
-    included so a rollback starts pinned."""
+    included so a rollback starts pinned. (Aldine's app is not here: it is
+    not on rs-sandbox at all, and its only network with a gateway is its own
+    front network — see cli/aldine.py.)"""
     return [ROUTER_CONTAINER, WEBUI_CONTAINER, REGISTRY_CONTAINER,
             REGISTRY_PUSH_CONTAINER, gitea.GITEA_CONTAINER, GITEA_PREVIOUS_CONTAINER,
             MCP_GATEWAY_CONTAINER]
@@ -28341,6 +28737,10 @@ def wire_webui_to_projects() -> None:
         if net:
             run(["docker", "network", "connect", net, WEBUI_CONTAINER],
                 capture_output=True)
+    # Every path that (re)creates the webui ends here: put it back on
+    # Aldine's front network when Aldine is on (a no-op otherwise).
+    for problem in aldine_connect_front():
+        print(f"warning: {problem}", file=sys.stderr)
 
 
 def wire_router_to_projects() -> None:

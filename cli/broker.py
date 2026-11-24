@@ -501,6 +501,30 @@ def _verb_mcp_gateway_start(_args: dict, progress=None) -> dict:
     return rscore.mcp_gateway_start(progress=progress)
 
 
+# --- the shared Aldine editor (Sandboxes page) ---------------------------------
+# Turn on pulls ~2.4 GB the first time, so it is a build-lane verb
+# (BUILD_DISPATCH, target "aldine"). Turn off and the status are inline and
+# take ONE deadline (rscore.MCP_INLINE_DEADLINE_S) shared by every docker call;
+# the list lock is taken without waiting. None takes a field.
+
+def _verb_aldine_on(_args: dict, progress=None) -> dict:
+    """Build-lane only: pulls the pinned images when missing, (re)creates the
+    containers, waits for them to answer, lists Aldine on the gateway."""
+    return rscore.aldine_on(progress=progress)
+
+
+def _verb_aldine_off(_args: dict, _progress=None) -> dict:
+    # Taken FIRST: every step below shares it.
+    deadline = rscore._mcp_deadline()
+    if any(op.get("target") == "aldine" for op in _live_build_ops()):
+        raise rscore.ValidationError(rscore.ALDINE_TURNING_ON)
+    return rscore.aldine_off(blocking=False, deadline=deadline)
+
+
+def _verb_aldine_status(_args: dict, _progress=None) -> dict:
+    return rscore.aldine_status(rscore._mcp_deadline())
+
+
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
@@ -1559,6 +1583,8 @@ VERBS = {
     "host_settings": _verb_host_settings,
     "host_settings_set": _verb_host_settings_set,
     "mcp_server_list": _verb_mcp_server_list,
+    "aldine_off": _verb_aldine_off,
+    "aldine_status": _verb_aldine_status,
     "mcp_server_add": _verb_mcp_server_add,
     "mcp_server_edit": _verb_mcp_server_edit,
     "mcp_server_remove": _verb_mcp_server_remove,
@@ -1730,6 +1756,7 @@ BUILD_DISPATCH = {
     "reader_refresh": _verb_reader_refresh,
     "rebuild": _verb_rebuild,
     "mcp_gateway_start": _verb_mcp_gateway_start,
+    "aldine_on": _verb_aldine_on,
 }
 
 
@@ -1785,11 +1812,12 @@ _BUILD_TARGETS = {
     "node_pull": "node",
     "rebuild": "fleet",
     "mcp_gateway_start": "mcp-gateway",
+    "aldine_on": "aldine",
 }
 # Browser-facing names for the refusal text.
 _BUILD_TARGET_NAMES = {"editor": "the editor download", "reader": "the reader download",
                        "node": "the node runtime", "fleet": "the image fleet",
-                       "mcp-gateway": "the MCP gateway"}
+                       "mcp-gateway": "the MCP gateway", "aldine": "Aldine"}
 
 
 def _build_target(verb: str, args: dict) -> str:

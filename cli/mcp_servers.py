@@ -27,6 +27,8 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Iterator
 
+import aldine
+
 STATE_DIR = Path.home() / ".research-sandbox"
 LIST_PATH = STATE_DIR / "mcp-servers.json"
 LOCK_PATH = STATE_DIR / "mcp-servers.lock"
@@ -431,6 +433,13 @@ def render_grants(data: dict[str, Any]) -> None:
     except OSError as e:
         raise ServerListError("cannot write the MCP gateway's wiring table on "
                               f"the host ({e.strerror or 'write failed'})") from e
+    # Every wiring change passes through here, so the webui's Aldine tab record
+    # (which projects have a consumer wired to `aldine`) follows it.
+    try:
+        aldine.write_tab_record(data)
+    except OSError as e:
+        raise ServerListError("cannot write the Aldine tab record on the host "
+                              f"({e.strerror or 'write failed'})") from e
 
 
 def gateway_address(subnet: str) -> str:
