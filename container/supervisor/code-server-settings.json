@@ -19,6 +19,10 @@
   "workbench.editorAssociations": {
     "*.md": "vscode.markdown.preview.editor"
   },
+  // Claude Code's view lives in the right-hand (secondary) side bar and starts a
+  // session as soon as it loads; hidden by default so no session starts until
+  // the operator opens Claude.
+  "workbench.secondarySideBar.defaultVisibility": "hidden",
 
   "git.enabled": true,
   "git.autoRepositoryDetection": true,
