@@ -37,7 +37,7 @@ flowchart TD
 | [Projects](Projects.md) | What a project is, project types, agents, lifecycle |
 | [Research](Research.md) | The research workflows compared: three built, one planned |
 | ↳ [Research workflow](Research-workflow.md) | Built: how a supervisor plans, runs and reviews workers |
-| ↳ [Researcher workflow](Researcher-workflow.md) | Built: one long-lived agent with a memory the user reads |
+| ↳ [Researcher workflow](Researcher-workflow.md) | Built: one long-lived agent with a memory, the pages it writes for the user, and a logbook |
 | ↳ [Researcher with subagents](Researcher-with-subagents.md) | Built: a researcher that hands analyses to parallel helpers and has each finding re-run and refereed |
 | ↳ [Lab workflow](Lab-workflow.md) | Planned: several researchers, a board, a lab meeting, budgets |
 | [Boxes](Boxes.md) | Box types; what a box can see of its project |
@@ -80,6 +80,8 @@ Each page ends with its full list of design decisions and their costs; these are
 - The record is immutable; a finding enters it only when the user accepts it.
 - One command carries the memory's rules; the front page reaches both agents through their own hooks.
 - Consolidation runs in the background at session end, on the user's model quota.
+- The user reads pages written from the memory (a front page, what waits, what was accepted), not the memory itself; a page never overwrites the user's own file.
+- The logbook is the story and the record is the truth: where they disagree, the record's standing holds.
 
 ### [Researcher with subagents](Researcher-with-subagents.md)
 
