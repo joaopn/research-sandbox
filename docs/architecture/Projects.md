@@ -37,7 +37,7 @@ RS ships two agents, **Claude Code** and **pi**. Claude signs in with a Claude a
 
 A research project always runs Claude, because its supervision check is a Claude Code hook; the researcher workflow and the planned research workflows run either agent (see [Research](Research.md)). A dev or researcher project needs at least one agent; a bare sandbox has none unless one is chosen.
 
-Each interactive agent shows RS's **status bar** under its prompt: the model, how long the prompt cache stays warm, the session's cost split into cache reads, writes and output, and how full the context is. It is on by default and switched per container in the Extensions boxes (New Project, Add box, the project's ⚙ window). Workers and role services never show it.
+Each interactive agent shows RS's **status bar** under its prompt. Claude Code's bar shows the session's name, the model, how long the prompt cache stays warm, the session's cost and how full the context is; pi's bar also splits the cost into cache reads, writes and output, and shows a session's name on its folder line. It is on by default and switched per container in the Extensions boxes (New Project, Add box, the project's ⚙ window). Workers and role services never show it.
 
 Each container's command search path holds only the RS commands a person types there: `rs-worker` and `rs-role-mcp` in a research project, `rs-sandbox` where there is inner Docker, `rs-wt`, `rs-land` and `rs-board` in a dev project or dev box, `rs-web-restart` where a web app runs, `rs-fetch` and `rs-sync` where fetch was chosen. A plain sandbox has none. RS's own helpers (the network guard, the web-app loop, the port forwarder, the stop hook) live in `/usr/local/lib/rs`.
 

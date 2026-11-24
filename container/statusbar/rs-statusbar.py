@@ -3,22 +3,23 @@
 interactive agent's user settings; staged root-owned at
 /usr/local/lib/rs/rs-statusbar.py in every project container and agent box).
 
-  Opus 5.5 · high │ ● cache: 56m (94% cached) · $307 (R: 67%, W: 21%, O: 12%) │ ctx 161k/1M (7 compactions)
+  Footer cost breakdown removal │ Opus 5.5 · high │ ● cache: 56m (94% cached) · $307 │ ctx 161k/1M (7 compactions)
 
+- the session's name: the name set with /rename, else the one Claude Code
+  generates; absent until the first exchange has produced one.
 - model, then its effort level (and "fast" when fast mode is on).
 - cache: time left on the prompt cache (amber in the last fifth of its life), or
   "cold" once it has expired, then the session's cache hit rate: the share of
   all input tokens (main + subagents) that were read from the cache rather than
   written to it or sent uncached.
-- $: session cost as Claude Code computes it, with the share of it spent on
-  cache reads (R), cache writes (W) and output (O), from the token counts in the
-  session's transcripts (main conversation + subagents).
+- $: session cost as Claude Code computes it.
 - ctx: current context, grey / yellow from 50% / red from 80% of the window,
   followed by "(N compactions)" once the main conversation has been compacted.
 
 A field Claude Code does not send drops only its own segment. Reads the status
 line JSON on stdin; keeps a small per-session state file so each refresh parses
-only the new part of the transcripts. Its twin for pi is rs-statusbar.ts.
+only the new part of the transcripts. Its twin for pi is rs-statusbar.ts, whose
+bar also splits the cost and shows the session name on its folder line instead.
 """
 import glob
 import json
@@ -30,11 +31,6 @@ import time
 R, DIM, BOLD = "\033[0m", "\033[2m", "\033[1m"
 CYAN, GREEN, YELLOW, RED, MAG = "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[35m"
 SEP = f" {DIM}│{R} "
-
-# Anthropic's price multipliers relative to a base input token (the same for every current
-# model): cache read 0.1x, 5-minute cache write 1.25x, 1-hour cache write 2x, output 5x.
-# Only the RATIOS are used, to split the cost into shares; dollar amounts come from Claude Code.
-W_READ, W_WRITE_5M, W_WRITE_1H, W_OUT, W_IN = 0.1, 1.25, 2.0, 5.0, 1.0
 
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "rs-statusbar")
 KEYS = ("read", "w5m", "w1h", "out", "in")
@@ -119,18 +115,6 @@ def cached_pct(s):
     return f"{DIM}({round(s['read'] * 100 / total)}% cached){R}" if total > 0 else ""
 
 
-def shares(s):
-    parts = {
-        "R": s["read"] * W_READ,
-        "W": s["w5m"] * W_WRITE_5M + s["w1h"] * W_WRITE_1H + s["in"] * W_IN,
-        "O": s["out"] * W_OUT,
-    }
-    tot = sum(parts.values())
-    if tot <= 0:
-        return ""
-    return f"{DIM}({', '.join(f'{k}: {round(v * 100 / tot)}%' for k, v in parts.items())}){R}"
-
-
 def load_state(sid):
     try:
         with open(os.path.join(STATE_DIR, sid + ".json")) as fh:
@@ -159,6 +143,13 @@ def main():
     get = lambda *ks: _dig(d, ks)
     out = []
 
+    # --- session name (/rename, else the generated one) ------------------------
+    name = get("session_name")
+    if isinstance(name, str):
+        name = " ".join("".join(ch for ch in name if ch.isprintable()).split())
+        if name:
+            out.append(name)
+
     # --- model ---------------------------------------------------------------
     model = get("model", "display_name") or get("model", "id") or "?"
     seg = f"{BOLD}{CYAN}{model}{R}"
@@ -168,7 +159,7 @@ def main():
         seg += f" {MAG}⚡fast{R}"
     out.append(seg)
 
-    # --- session usage split (running sums kept in a per-session state file) ----
+    # --- session usage sums (kept in a per-session state file) -----------------
     sid = get("session_id") or ""
     cost = get("cost", "total_cost_usd")
     transcript = get("transcript_path")
@@ -201,7 +192,7 @@ def main():
         hit = cached_pct(sums) if sums else ""
         seg.append(s + (" " + hit if hit else ""))
     if cost is not None:
-        seg.append(f"{DIM}{money(cost)}{R}" + (" " + shares(sums) if sums else ""))
+        seg.append(f"{DIM}{money(cost)}{R}")
     if seg:
         out.append(f" {DIM}·{R} ".join(seg))
 
