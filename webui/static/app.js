@@ -12050,6 +12050,8 @@ async function mgmtBoxAddDialog(project) {
         syncBoxHarness();
         // So does the status bar: no agent, no status bar.
         boxStatusBarCard.style.display = agentS.value && agentS.value !== "none" ? "" : "none";
+        // And the block on links to the Anthropic account: Claude boxes only.
+        boxLinksGroup.style.display = boxLinksOn() ? "" : "none";
     }
 
     const editorCb = el("input", { type: "checkbox" });   // box-level toggle, default off
@@ -12074,6 +12076,26 @@ async function mgmtBoxAddDialog(project) {
         boxStatusBarCb.checked = !boxStatusBarCb.checked;
         boxStatusBarCard.classList.toggle("selected", boxStatusBarCb.checked);
     };
+    // Claude's links to the operator's Anthropic account (claude.ai connectors,
+    // Remote Control, Claude in Chrome), blocked by default; shown and sent
+    // only while the box's agent is Claude (markAgent keeps it in step).
+    // Changed later in the project's ⚙ window.
+    const boxLinksOn = () => agentS.value === "claude";
+    const boxLinksCb = el("input", { type: "checkbox" });
+    boxLinksCb.checked = true;
+    const boxLinksCard = el("div", { class: "box-opt-card selected" },
+        [el("span", { class: "box-opt-name" }, ["Block links to the Anthropic account"])]);
+    boxLinksCard.onclick = () => {
+        boxLinksCb.checked = !boxLinksCb.checked;
+        boxLinksCard.classList.toggle("selected", boxLinksCb.checked);
+    };
+    const boxLinksGroup = el("div", { class: "box-opt-group" }, [
+        el("div", { class: "box-opt-cards" }, [boxLinksCard]),
+        el("div", { class: "hint" }, [
+            "Claude sessions in this box get no claude.ai connectors, no Remote " +
+            "Control and no Claude in Chrome. Switch it off to allow all three.",
+        ]),
+    ]);
 
     // rs-fetch (opt-in fetch surface, default off). The card's `title` is the
     // toggle's explainer; fetchCb stays the detached value-holder (the editor
@@ -12419,6 +12441,7 @@ async function mgmtBoxAddDialog(project) {
                         boxModelRow,
                     ]),
                 ]),
+                boxLinksGroup,
                 boxHarnessGroup,
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
@@ -12509,6 +12532,9 @@ async function mgmtBoxAddDialog(project) {
                 };
                 if (agentS.value) payload.agent = agentS.value;
                 if (agentS.value && agentS.value !== "none") payload.status_bar = boxStatusBarCb.checked;
+                // The block on links to the Anthropic account, for a Claude box
+                // only (lockstep: DEV_BOX_WEBUI_FIELDS).
+                if (boxLinksOn()) payload.block_account_links = boxLinksCb.checked;
                 // The dev preset posts to a DIFFERENT route (the detached
                 // provision lane), so the model must be threaded here too — it is
                 // the box type where the choice matters most, and a field missing
@@ -12563,6 +12589,9 @@ async function mgmtBoxAddDialog(project) {
             if (agentS.value) payload.agent = agentS.value;
             // RS's status bar, only for an agent box (where its card shows).
             if (agentS.value && agentS.value !== "none") payload.status_bar = boxStatusBarCb.checked;
+            // The block on links to the Anthropic account, for a Claude box only
+            // (lockstep: BOX_ADD_WEBUI_FIELDS).
+            if (boxLinksOn()) payload.block_account_links = boxLinksCb.checked;
             // Gated on the agent, exactly like the control's visibility — a blank
             // box (agent "none") runs no agent, so it sends no model.
             if (agentModelOn()) {
@@ -14911,8 +14940,12 @@ function accountLinksRow(name, al, running) {
         wrap.appendChild(el("div", { class: "config-box-warn" }, [
             now === "partial"
                 ? "⚠ Claude's settings in the project now block only some of these links."
-                : `⚠ Claude's settings in the project now ${now === "blocked" ? "block" : "allow"} ` +
-                  "these links; switching writes the choice again.",
+                : now === "allowed"
+                    // A saved block is written again at every start.
+                    ? "⚠ Claude's settings in the project now allow these links; the block " +
+                      "is written again at the project's next start."
+                    : "⚠ Claude's settings in the project now block these links; switching " +
+                      "writes the choice again.",
         ]));
     } else if (now === "absent" || now === "failed") {
         wrap.appendChild(el("div", { class: "config-box-warn" }, [
@@ -15025,8 +15058,101 @@ function boxAgentsSection(name, d, cat) {
             "A box starts from a fresh home whenever it is restarted fresh — at every " +
             "project start, and when a working-mode, test-policy, folder or port change restarts it — " +
             "so a model picked inside the box with /model lasts until then — unless " +
-            "you save it here, which keeps what this section shows."]));
+            "you save it here, which keeps what this section shows."]),
+        // One row per Claude box (the read carries it only there).
+        ...boxes.filter((b) => b.agent === "claude" && b.account_links)
+            .map((b) => boxAccountLinksRow(name, b)));
     return section;
+}
+
+// A Claude box's block on its links to the operator's Anthropic account
+// (claude.ai connectors, Remote Control, Claude in Chrome): the saved choice,
+// whether it is still to be written, a note when Claude's own settings in the
+// box say something else now, and the switch, which repaints the row in place
+// like a box's status-bar switch.
+function boxAccountLinksRow(name, b) {
+    const al = b.account_links;
+    let blocked = al.blocked !== false;
+    let pending = Array.isArray(al.pending) && al.pending.length > 0;
+    let now = b.running && !pending ? (al.state || "") : "";
+    const metaEl = el("span", { class: "config-box-meta" });
+    const btn = el("button", { class: "btn btn-secondary" });
+    const warnEl = el("div", {});
+    const status = el("div", { class: "config-box-status" });
+    const paint = () => {
+        const meta = [blocked ? "blocked" : "allowed"];
+        if (pending) meta.push("applied at its next start");
+        metaEl.textContent = meta.join(" · ");
+        btn.textContent = blocked ? "Allow" : "Block";
+        // What Claude's own settings in the box say now, when it is not the
+        // saved choice.
+        const differs = now === "partial" || (now === "blocked" && !blocked)
+            || (now === "allowed" && blocked);
+        let warn = "";
+        if (differs) {
+            warn = now === "partial"
+                ? "⚠ Claude's settings in the box now block only some of these links."
+                : now === "allowed"
+                    // A saved block is written again at every start.
+                    ? "⚠ Claude's settings in the box now allow these links; the block " +
+                      "is written again at the box's next start."
+                    : "⚠ Claude's settings in the box now block these links; switching " +
+                      "writes the choice again.";
+        } else if (now === "absent" || now === "failed") {
+            warn = "⚠ Claude's settings in the box could not be read.";
+        }
+        warnEl.replaceChildren(...(warn ? [el("div", { class: "config-box-warn" }, [warn])] : []));
+    };
+    paint();
+    btn.onclick = async () => {
+        const want = !blocked;
+        btn.disabled = true;
+        status.replaceChildren(el("div", {}, ["Saving…"]));
+        try {
+            const r = await fetch(`/broker/project/${encodeURIComponent(name)}/box-settings`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: b.name, block_account_links: want }),
+            });
+            let rb; try { rb = await r.json(); } catch (e) { rb = {}; }
+            if (!r.ok || !rb.ok || !rb.result) {
+                status.replaceChildren(el("div", { class: "config-box-warn" },
+                    ["Couldn't change it: " + (mgmtErrText(rb) || r.status)]));
+                return;
+            }
+            const out = rb.result;
+            const live = out.account_links && typeof out.account_links === "object";
+            blocked = want;
+            pending = !live && !out.restarted;
+            now = live ? (out.account_links.state || "") : "";
+            paint();
+            const lines = [el("div", {}, [live
+                ? `Links to the Anthropic account ${want ? "blocked" : "allowed"} — Claude ` +
+                  "sessions started in the box from now on follow it."
+                : "Saved — the box takes it when it next starts."])];
+            for (const w of (Array.isArray(out.warnings) ? out.warnings : [])) {
+                lines.push(el("div", { class: "config-box-warn" }, ["⚠ " + w]));
+            }
+            status.replaceChildren(...lines);
+        } catch (e) {
+            status.replaceChildren(el("div", { class: "config-box-warn" },
+                                      ["Couldn't change it: the request failed."]));
+        } finally {
+            btn.disabled = false;
+        }
+    };
+    return el("div", {}, [
+        el("div", { class: "config-box-row" }, [
+            el("span", { class: "config-box-name" }, [`Links to the Anthropic account — box ${b.name}`]),
+            metaEl,
+            btn,
+        ]),
+        el("div", { class: "config-hint" }, [
+            "Blocked: Claude in the box gets no claude.ai connectors, no Remote Control and " +
+            "no Claude in Chrome. A change applies to Claude sessions started afterwards.",
+        ]),
+        warnEl,
+        status,
+    ]);
 }
 
 // One box's controls: Claude's model + effort (a Claude box), the working-mode

@@ -24,7 +24,7 @@ A `researcher` or `researcher-subagents` project needs its image to carry the me
 
 ## Once: the update that blocks links to the Anthropic account
 
-Each project now has a switch, **Block links to the Anthropic account**, on by default. A project created before this update is blocked from its next start: Claude there loses your claude.ai connectors, Remote Control and Claude in Chrome. To keep them, open the project's ⚙ window, Agents section, and choose **Allow**. Claude sessions started afterwards have them again.
+Each project and each Claude box now has a switch, **Block links to the Anthropic account**, on by default. A project or box created before this update is blocked from its next start: Claude there loses your claude.ai connectors, Remote Control and Claude in Chrome. To keep them, open the project's ⚙ window, Agents section, and choose **Allow** on the project's row or the box's row. Claude sessions started afterwards have them again.
 
 ## Once: the update that stops tracking `.env`
 

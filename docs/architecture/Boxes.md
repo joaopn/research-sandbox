@@ -58,6 +58,7 @@ The box window takes a name (default `box-N`), a type, and the options below. Th
 | Option | Effect | Limits |
 |---|---|---|
 | Agent | None, or an agent the project carries (Claude, pi); model and effort for a Claude box | MCP tools need an agent |
+| Block links to the Anthropic account | On by default: Claude in the box gets no claude.ai connectors, no Remote Control and no Claude in Chrome | Claude boxes; changeable later in ⚙ |
 | Working mode | The dev box agent's working mode and Doer/Checker models | Dev boxes with an agent, outside research projects |
 | Test policy | Light (default) or Full, see [Dev lane](Dev-lane.md) | Same as the working mode |
 | MCP tools | The project's allowed MCP servers, through the project's MCP proxy | Not on dev boxes |
@@ -74,7 +75,7 @@ The box window takes a name (default `box-N`), a type, and the options below. Th
 
 Field values are stored in a private file on the host and copied into the box's home before it first starts. The box gets them as environment variables; they never appear in the workspace, a command line or a log. A dev box's PAT is kept by Gitea with the mirror; RS stores none.
 
-A box agent's model can be changed later in the project's ⚙ panel under Box agents. A web app in a box that listens on its loopback address (`127.0.0.1` or `::1`) gets a tab through ⚙ → Ports, with that box as the target.
+A box agent's model can be changed later in the project's ⚙ panel under Box agents, and so can a Claude box's block on links to the Anthropic account. Claude sessions started in the box afterwards follow it; a stopped box takes it when it next starts. A box added before this switch existed is blocked from its next start. A box whose agent is pi carries Claude Code too, and Claude there is always blocked, with no switch. A web app in a box that listens on its loopback address (`127.0.0.1` or `::1`) gets a tab through ⚙ → Ports, with that box as the target.
 
 ## What a box sees
 
@@ -102,6 +103,7 @@ Each box adds a terminal tab (`<box> (CLI)`). It can also add an editor tab, a `
 |---|---|
 | Add | Waits until the box has finished booting (clone, setup); a failed boot stops the box and shows its log |
 | Model change in ⚙ | Written into the running box at once |
+| Links to the Anthropic account changed in ⚙ | Written into the running box at once; a stopped box takes it at its next start. While the box is blocked, every start writes the block again |
 | Folders, working mode, test policy or ports changed in ⚙ | The box restarts fresh |
 | Project stop | The boxes stop with it |
 | Project start | Every box runs again from its saved settings (a fresh restart), on the box image Rebuild all last built |

@@ -441,6 +441,15 @@ _BOX_STATUS_BAR_REASONS = {
     "added": ("the agent just added shows no status bar yet; it gets it at the "
               "project's next start"),
 }
+# The box tool's account-links warnings, by reason; texts reach the browser.
+_BOX_ACCOUNT_LINKS_REASONS = {
+    "failed": ("the block on links to the Anthropic account could not be written yet; "
+               "it is applied at the box's next start"),
+    "booting": ("the box is still starting; the block on links to the Anthropic "
+                "account is saved and applied at its next start"),
+    "absent": ("Claude has no settings file in the box yet; the block on links to the "
+               "Anthropic account is applied at its next start"),
+}
 
 
 def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
@@ -488,6 +497,11 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
                 if w.get("agent") == "pi" else "an agent"
             out.append(f"{who}: " + _BOX_STATUS_BAR_REASONS.get(
                 reason, _BOX_STATUS_BAR_REASONS["failed"]).format(agent=agent))
+            continue
+        if w.get("kind") == "account-links":
+            reason = w.get("reason") if isinstance(w.get("reason"), str) else ""
+            out.append(f"{who}: " + _BOX_ACCOUNT_LINKS_REASONS.get(
+                reason, _BOX_ACCOUNT_LINKS_REASONS["failed"]))
             continue
         if w.get("kind") == "mailbox" and w.get("reason") == "agent":
             out.append(f"{who} {_BOX_MAILBOX_AGENT_LINE}")
@@ -663,6 +677,12 @@ _OLD_BOX_TOOL_FILES_MSG = ("this project's box tool predates RS keeping its file
                            "then retry")
 _OLD_BOX_TOOL_TRUSTED_MSG = ("this project's box tool predates trusted browsers — "
                              "restart the project, then retry")
+# A box tool from before the switch on Claude's links to the Anthropic account
+# adds a box with the default (the flag is passed only when allowed); allowing
+# them, at add or later, is refused with this line.
+_OLD_BOX_TOOL_ACCOUNT_LINKS_MSG = ("this project's box tool predates the switch for links "
+                                   "to the Anthropic account — restart the project, then "
+                                   "retry")
 # The browser image, not the tool: a project's box images move to the host's
 # current ones at its next start (_bring_box_images_at_start), so a restart helps.
 _TRUSTED_BROWSER_TOO_OLD_MSG = ("this project's browser box image predates trusted "
@@ -704,6 +724,7 @@ def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
          and any(o in err for o in ("--folders", "--set", "--history-user",
                                     "--history-repo", "--share", "--no-share",
                                     "--trusted-browser", "--status-bar", "--no-status-bar",
+                                    "--block-account-links", "--no-block-account-links",
                                     *(f"--{f.replace('_', '-')}" for f in HARNESS_FIELDS))))
         or ("invalid choice" in err
             and any(c in err for c in ("'folders'", "'history-heal'", "'settings'",
@@ -2740,6 +2761,10 @@ class BoxAddRequest:
     test_policy: str = ""
     # RS's status bar in the box's agents (#524): on by default.
     status_bar: bool = True
+    # Claude's links to the operator's Anthropic account (claude.ai connectors,
+    # Remote Control, Claude in Chrome) blocked in a Claude box: on by default,
+    # the Add box window's switch. In-box.
+    block_account_links: bool = True
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -2856,6 +2881,11 @@ class BoxAddRequest:
             raise ValidationError("the Doer and Checker models for pi apply to a pi box")
         if any(harness.values()) and agent == "none":
             raise ValidationError("a box without an agent has no working mode or test policy")
+        # Allowing the links is Claude's alone: refused on an explicitly
+        # non-Claude box (a defaulted agent is re-checked in box_add).
+        block_account_links = _account_links_arg(kw.get("block_account_links"), default=True)
+        if not block_account_links and agent not in (None, DEFAULT_AGENT):
+            raise ValidationError(BOX_ACCOUNT_LINKS_NOT_CLAUDE)
         return cls(
             project=_require_name(kw.get("project")), name=name, preset=preset,
             agent=agent, editor=bool(kw.get("editor", False)), browser=browser,
@@ -2867,7 +2897,8 @@ class BoxAddRequest:
             folders=_coerce_box_folders(kw.get("folders")),
             history=_coerce_history_flag(kw.get("history")),
             share=share, trusted_browser=trusted_browser,
-            status_bar=_status_bar_arg(kw.get("status_bar"), default=True), **harness)
+            status_bar=_status_bar_arg(kw.get("status_bar"), default=True),
+            block_account_links=block_account_links, **harness)
 
 
 @dataclass(frozen=True)
@@ -2913,6 +2944,10 @@ class BoxSettingsRequest:
     reset: tuple[str, ...] = ()
     # RS's status bar in the box's agents (#524): None = unchanged.
     status_bar: bool | None = None
+    # The block on a Claude box's links to the Anthropic account: None =
+    # unchanged. Written live into a running box, owed to a stopped one's next
+    # start.
+    block_account_links: bool | None = None
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxSettingsRequest":
@@ -2952,7 +2987,9 @@ class BoxSettingsRequest:
         if both:
             raise ValidationError(f"{', '.join(both)} cannot be both set and reset in one change")
         return cls(project=_require_name(kw.get("project")), name=name, reset=tuple(reset),
-                   status_bar=_status_bar_arg(kw.get("status_bar")), **vals, **harness)
+                   status_bar=_status_bar_arg(kw.get("status_bar")),
+                   block_account_links=_account_links_arg(kw.get("block_account_links")),
+                   **vals, **harness)
 
 
 @dataclass(frozen=True)
@@ -4437,6 +4474,8 @@ class DevBoxProvisionRequest:
     effort: str = ""
     share: bool | None = None                   # share files with the project (None ⇒ the dev type's default: off)
     status_bar: bool = True                     # RS's status bar in the box's agents (#524)
+    # The block on Claude's links to the Anthropic account (BoxAddRequest's).
+    block_account_links: bool = True
     # The box's working mode and doer/checker models (HARNESS_FIELDS),
     # validated by the same BoxAddRequest delegation.
     harness_mode: str = ""
@@ -4485,12 +4524,14 @@ class DevBoxProvisionRequest:
             branch=kw.get("branch"),
             model=kw.get("model"), effort=kw.get("effort"),
             share=kw.get("share"), status_bar=kw.get("status_bar"),
+            block_account_links=kw.get("block_account_links"),
             **{f: kw.get(f) for f in HARNESS_FIELDS})
         return cls(project=box.project, url=url, repo=repo,
                    pat=(pat or "").strip(), name=box.name, agent=box.agent,
                    editor=box.editor, branch=box.branch,
                    model=box.model, effort=box.effort, share=box.share,
                    status_bar=box.status_bar,
+                   block_account_links=box.block_account_links,
                    **{f: getattr(box, f) for f in HARNESS_FIELDS})
 
 
@@ -4836,6 +4877,9 @@ class BoxSettingsResult:
     # A status-bar switch (#524): the box's agents as they now read
     # (_status_bar_view), None when not written live (a stopped box).
     status_bar: "dict | None" = None
+    # A switch of the block on links to the Anthropic account: {state, blocked}
+    # as Claude's file in the box now reads, None when not written live.
+    account_links: "dict | None" = None
 
 
 @dataclass
@@ -18586,11 +18630,20 @@ def _status_bar_view(states: "dict[str, str]") -> dict:
 # in the project container: the two booleans below plus one entry in
 # `deniedMcpServers`. Living in that file, the three reach the research
 # workers and role services, which copy those settings at their start. A
-# default, not a wall: the agent is root in its container. Written once per
-# agent like the status bar (the record's `pending` lists the agents still
-# owed); after that what Claude's own file says is the state. A record without
-# the block (a project from before the switch) reads as blocked, owed.
+# default, not a wall: the agent is root in its container. While the switch
+# says blocked, the block is written at create, at every start and when the
+# switch changes (a file that already blocks is left byte for byte), so an
+# entry removed inside the container comes back at the next start. Allowing
+# is written once per agent like the status bar (the record's `pending` lists
+# the agents still owed); after that the file is the operator's. A record
+# without the block (a project from before the switch) reads as blocked.
 # Claude only: pi has none of these links, and nothing is ever written for it.
+# ACCOUNT_LINKS_DENIED_SERVER, ACCOUNT_LINKS_JQ, ACCOUNT_LINKS_STATE_JQ and
+# ACCOUNT_LINKS_SCRIPT are a MIRROR PAIR with rs_sandbox's BOX_ACCOUNT_LINKS_*
+# (the box tool runs standalone and cannot import this file): the two sides
+# must be kept equal, byte for byte. Each Claude box has its own switch, held
+# in its box record and written by the box tool; any other agent box that
+# carries Claude Code has Claude blocked there always, with no switch.
 # ---------------------------------------------------------------------------
 ACCOUNT_LINKS_KEY = "account_links"
 ACCOUNT_LINKS_AGENTS = ("claude",)
@@ -18661,6 +18714,7 @@ ACCOUNT_LINKS_HOME_NOT_READY = (
 ACCOUNT_LINKS_NO_CLAUDE = (
     "Claude is not an agent of the project's own container, so it has no links "
     "to the Anthropic account to block")
+BOX_ACCOUNT_LINKS_NOT_CLAUDE = "only a Claude box has links to the Anthropic account"
 
 
 def _account_links_exec(container: str, op: str, agents: "Sequence[str]",
@@ -18717,8 +18771,9 @@ def _apply_account_links(container: str, workspace_path: "Path", local: "Sequenc
                          *, owe: "Sequence[str]" = (), home: str = _AGENT_HOME,
                          progress=None) -> None:
     """At every deploy of a RUNNING project container's agents (create, every
-    start, a live agent add): write the recorded choice into Claude where it
-    is still owed, and record what landed. `owe`: agents just added to the
+    start, a live agent add): write the recorded choice into Claude — a block
+    into every Claude, an allow only where it is still owed — and record what
+    landed. `owe`: agents just added to the
     container, which take the recorded choice too. A write that does not land
     stays owed for the next start and is reported as a warning. Never raises
     — it runs in the middle of a start."""
@@ -18730,15 +18785,18 @@ def _apply_account_links(container: str, workspace_path: "Path", local: "Sequenc
         data = _read_marker_dict(workspace_path)
         if not data:
             return
-        fresh = not isinstance(data.get(ACCOUNT_LINKS_KEY), dict)
         blocked, pending = _account_links_record(data)
         pending = list(dict.fromkeys([*pending, *owe]))
-        owed = [a for a in local if a in pending]
+        # A block is written again at every deploy (a no-op on a file that
+        # already blocks); an allow only where it is still owed.
+        owed = list(local) if blocked else [a for a in local if a in pending]
         states = (_account_links_exec(container, "on" if blocked else "off", owed, home)
                   if owed else {})
         done = {a for a in owed if states.get(a) in ACCOUNT_LINKS_WRITTEN}
         _report_warnings(_account_links_warnings(states, owed), progress)
-        if not fresh and not done and not owe:
+        # The record is rewritten only when what it says changes.
+        if data.get(ACCOUNT_LINKS_KEY) == _account_links_block(
+                blocked, [a for a in pending if a not in done]):
             return
 
         def mutate(d: dict) -> None:
@@ -19293,6 +19351,16 @@ def _project_agent_boxes(container: str, running: bool, research: bool,
                else {"on": recorded, "own": [], "agents": {}}),
             "recorded": recorded, "pending": b.get("status_bar_pending") is True,
             "source": "settings" if states is not None and row["running"] else "saved"}
+        # The block on Claude's links to the Anthropic account, for a Claude
+        # box: the recorded choice (what the switch shows), whether it is owed
+        # to the box's next start and, when it runs, what Claude's file says.
+        # A box tool from before the switch sends none: no row.
+        if agent == "claude" and isinstance(b.get("account_links_blocked"), bool):
+            st = b.get("account_links_state")
+            row["account_links"] = {
+                "blocked": b["account_links_blocked"],
+                "pending": ["claude"] if b.get("account_links_pending") is True else [],
+                "state": st if row["running"] and st in ACCOUNT_LINKS_STATES else ""}
         if agent == "claude":
             env = b.get("env") if isinstance(b.get("env"), dict) else {}
             env = {k: v for k, v in env.items() if isinstance(v, str)}
@@ -23504,6 +23572,14 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                            agents=[harness_agent])
         _require_harness_aware_box_tool(container, harness.get("harness_mode", ""),
                                         harness.get("test_policy", ""))
+    # Allowing the links to the Anthropic account is a Claude box's choice
+    # alone (the effective agent: a preset default may be no agent). A pure
+    # check, before any Gitea work.
+    if not req.block_account_links and (
+            req.agent if req.agent is not None else
+            (DEFAULT_AGENT if catalog.get(req.preset, {}).get("agent_default") else "none")
+    ) != DEFAULT_AGENT:
+        raise ValidationError(BOX_ACCOUNT_LINKS_NOT_CLAUDE)
     # Dev preset (STAGE_DEV_GITEA S2): mirror the in-supervisor rs-sandbox gates
     # host-side for a clean pre-exec ValidationError (the two-gate lockstep).
     # `repo` carries NAME semantics here (an attached gitea repo), not the byo
@@ -23835,6 +23911,10 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # it still adds a box with the default (its next run brings the bar).
     if not req.status_bar:
         argv.append("--no-status-bar")
+    # The block on Claude's links to the Anthropic account: passed only when
+    # allowed, so a box tool from before it still adds a box with the default.
+    if not req.block_account_links:
+        argv.append("--no-block-account-links")
     argv += history_args
     # Only the set ones: a box without them keeps today's exact argv. One argv
     # word each (`--x=value`): a pi model may start with "-" (the --folders case).
@@ -23878,6 +23958,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                 die(_OLD_BOX_TOOL_HARNESS_MSG)
             if req.trusted_browser and "--trusted-browser" in err:
                 die(_OLD_BOX_TOOL_TRUSTED_MSG)
+            if not req.block_account_links and "--no-block-account-links" in err:
+                die(_OLD_BOX_TOOL_ACCOUNT_LINKS_MSG)
             die(_OLD_BOX_TOOL_SHARE_MSG)
         die(f"failed to add box: {(r.stderr or r.stdout).strip()}")
     try:
@@ -24265,10 +24347,13 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
     model_asked = bool(req.model or req.effort or reset & {"model", "effort"})
     harness_asked = any(getattr(req, f) for f in HARNESS_FIELDS) or bool(reset & set(HARNESS_FIELDS))
     bar_asked = req.status_bar is not None
-    if not (model_asked or harness_asked or bar_asked):
+    links_asked = req.block_account_links is not None
+    if not (model_asked or harness_asked or bar_asked or links_asked):
         raise ValidationError("nothing to change")
     if bar_asked and agent == "none":
         raise ValidationError("a box without an agent has no status bar")
+    if links_asked and agent != DEFAULT_AGENT:
+        raise ValidationError(BOX_ACCOUNT_LINKS_NOT_CLAUDE)
     if model_asked and agent != "claude":
         raise ValidationError("only a box running Claude takes a model here; "
                               "pi picks its model inside pi")
@@ -24321,7 +24406,8 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
     write = [g for g, asked in (
         ("model", req.model or "model" in reset),
         ("effort", req.effort or "effort" in reset or dropped),
-        ("harness", harness_asked), ("status-bar", bar_asked)) if asked]
+        ("harness", harness_asked), ("status-bar", bar_asked),
+        ("account-links", links_asked)) if asked]
     argv = ["docker", "exec", container, "rs-sandbox", "settings", req.name,
             f"--write={','.join(write)}",
             f"--model={model if agent == 'claude' else ''}",
@@ -24332,11 +24418,16 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
             *((f"--{f.replace('_', '-')}={harness.get(f, '')}" for f in HARNESS_FIELDS
                if f != "test_policy" or harness.get(f))
               if harness_asked else ()),
-            *((("--status-bar" if req.status_bar else "--no-status-bar"),) if bar_asked else ())]
+            *((("--status-bar" if req.status_bar else "--no-status-bar"),) if bar_asked else ()),
+            *((("--block-account-links" if req.block_account_links
+                else "--no-block-account-links"),) if links_asked else ())]
     r = run(argv, capture_output=True)
     if r.returncode != 0:
         _die_on_box_app_pins(r, req.name)
         if _is_old_box_tool(r):
+            err = (r.stderr or "") + (r.stdout or "")
+            if links_asked and "block-account-links" in err:
+                die(_OLD_BOX_TOOL_ACCOUNT_LINKS_MSG)
             die(_OLD_BOX_TOOL_SETTINGS_MSG)
         die(f"failed to change the box's settings: {(r.stderr or r.stdout).strip()}")
     info = _parse_box_tool_json(r.stdout)
@@ -24365,11 +24456,16 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
     raw = info.get("status_bar")
     states = ({a: v for a, v in raw.items() if a in STATUS_BAR_AGENTS and v in STATUS_BAR_STATES}
               if isinstance(raw, dict) else None)
+    links_state = info.get("account_links")
     return BoxSettingsResult(project=req.project, name=req.name,
                              changed=info.get("changed") is not False,
                              restarted=info.get("restarted") is True,
                              effort_dropped=dropped, warnings=warnings,
-                             status_bar=_status_bar_view(states) if states is not None else None)
+                             status_bar=_status_bar_view(states) if states is not None else None,
+                             account_links=(
+                                 {"state": links_state, "blocked": bool(req.block_account_links)}
+                                 if links_asked and links_state in ACCOUNT_LINKS_STATES
+                                 else None))
 
 
 def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  # type: ignore[name-defined]
@@ -28355,7 +28451,7 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
         project=req.project, name=req.name, preset="dev", agent=req.agent,
         editor=req.editor, repo=req.repo, branch=req.branch,
         model=req.model, effort=req.effort, share=req.share,
-        status_bar=req.status_bar,
+        status_bar=req.status_bar, block_account_links=req.block_account_links,
         **{f: getattr(req, f) for f in HARNESS_FIELDS}), progress)
     return {"project": req.project, "repo": req.repo, "box": box.name,
             "container": box.container}

@@ -2102,6 +2102,9 @@ def _warning_text(name: str, w: dict) -> str:
         return f"warning: box {name!r}: " + _STATUS_BAR_REASON_TEXT.get(
             w.get("reason"), _STATUS_BAR_REASON_TEXT["failed"]).format(
             agent="Claude" if w.get("agent") == "claude" else "pi")
+    if w.get("kind") == "account-links":
+        return f"warning: box {name!r}: " + _ACCOUNT_LINKS_REASON_TEXT.get(
+            w.get("reason"), _ACCOUNT_LINKS_REASON_TEXT["failed"])
     if w.get("kind") == "mailbox":
         why = _MAILBOX_REASON_TEXT.get(w.get("reason"), "its mailbox could not be mounted")
         if w.get("reason") == "agent":
@@ -2591,13 +2594,15 @@ def _box_model_ops(new: dict, old: "dict | None" = None,
 
 
 def _write_box_model_detached(cname: str, ops: list[str], status_bar: bool = False,
-                              activity: bool = False) -> None:
+                              activity: bool = False, account_links: bool = False) -> None:
     """After the box's boot (its role marker AND its settings file — the
     entrypoint's fallback settings write comes after the marker), merge the pair
     (`ops`; none: no model write) into the box agent's settings and, with
     `status_bar`, turn RS's status bar on in its agents — as the box user, in
     ONE exec, so the two never merge into Claude's file at once; with
-    `activity`, the activity recorder's hooks too (#560), in the same exec. Detached like
+    `activity`, the activity recorder's hooks too (#560), and with
+    `account_links`, the block on Claude's links to the Anthropic account, in
+    the same exec. Detached like
     the working-mode installer (the boot copies files while this waits); a
     pending exec dies with the box. Never fatal."""
     model = f"( {BOX_AGENT_SETTINGS_SCRIPT} ); " if ops else ""
@@ -2605,11 +2610,13 @@ def _write_box_model_detached(cname: str, ops: list[str], status_bar: bool = Fal
            f" ) >/dev/null; " if status_bar else "")
     act = (f"( set -- on {' '.join(BOX_STATUS_BAR_AGENTS)}; {BOX_ACTIVITY_SCRIPT}"
            f" ) >/dev/null 2>&1; " if activity else "")
+    links = (f"( set -- on claude; {BOX_ACCOUNT_LINKS_SCRIPT} ) >/dev/null 2>&1; "
+             if account_links else "")
     r = _docker("exec", "-d", "-u", "1000", "-e", "HOME=/home/worker", cname, "sh", "-c",
                 f"touch {BOX_MODEL_PENDING}; "
                 # one-second poll, as the installer's
                 "until [ -e /home/worker/.rs-role ] && [ -f \"$1\" ]; do sleep 1; done; "
-                f"{model}{bar}{act}rm -f {BOX_MODEL_PENDING}",
+                f"{model}{bar}{act}{links}rm -f {BOX_MODEL_PENDING}",
                 "sh", BOX_CLAUDE_SETTINGS, *ops)
     if r.returncode != 0:
         print(f"warning: the agent settings could not be written into box {cname!r}; "
@@ -2799,6 +2806,131 @@ def _status_bar_warnings(states: "dict | str", on: bool) -> list[dict]:
             out.append({"kind": "status-bar", "reason": "failed", "agent": a})
     return out
 
+
+# ---------------------------------------------------------------------------
+# Claude's links to the operator's Anthropic account in a Claude box: claude.ai
+# connectors, Remote Control and Claude in Chrome. One switch per box, blocked
+# by default, held in the box record (`account_links_blocked`; a record without
+# the key — a box from before the switch — reads as blocked) and written into
+# the box's own Claude settings: two booleans and one `deniedMcpServers` entry.
+# While the record says blocked, every run (a fresh home) and every plain start
+# writes the block, so an entry removed inside the box comes back at its next
+# start; allowing is written once (`account_links_pending` marks it owed for a
+# stopped box). Only a Claude box has the switch. Any other agent box (a pi
+# box) carries Claude Code too when the project's agent copy holds it, and
+# Claude there is blocked always — at every run and every plain start, with no
+# record key and no way to allow. A box without an agent gets nothing; a box
+# with no Claude settings file gets none created. MIRROR PAIR with rscore's ACCOUNT_LINKS_DENIED_SERVER,
+# ACCOUNT_LINKS_JQ, ACCOUNT_LINKS_STATE_JQ and ACCOUNT_LINKS_SCRIPT (this file
+# runs standalone in the project container and cannot import rscore): the two
+# sides must be kept equal, byte for byte.
+# ---------------------------------------------------------------------------
+BOX_ACCOUNT_LINKS_KEY = "account_links_blocked"
+BOX_ACCOUNT_LINKS_PENDING = "account_links_pending"
+BOX_ACCOUNT_LINKS_DENIED_SERVER = "claude-in-chrome"
+BOX_ACCOUNT_LINKS_JQ = (
+    '{"serverName": $srv} as $e'
+    ' | if $op == "on" then .disableClaudeAiConnectors = true | .disableRemoteControl = true'
+    ' | if (has("deniedMcpServers") | not) then .deniedMcpServers = [$e]'
+    ' elif (.deniedMcpServers | type) != "array" then error("deniedMcpServers is not a list")'
+    ' elif any(.deniedMcpServers[]; . == $e) then .'
+    ' else .deniedMcpServers += [$e] end'
+    ' elif $op == "off" then del(.disableClaudeAiConnectors, .disableRemoteControl)'
+    ' | if (.deniedMcpServers | type) == "array" and any(.deniedMcpServers[]; . == $e)'
+    ' then .deniedMcpServers |= map(select(. != $e))'
+    ' | if .deniedMcpServers == [] then del(.deniedMcpServers) else . end'
+    ' else . end'
+    ' else . end')
+BOX_ACCOUNT_LINKS_STATE_JQ = (
+    '{"serverName": $srv} as $e'
+    ' | [.disableClaudeAiConnectors == true, .disableRemoteControl == true,'
+    ' ((.deniedMcpServers | type) == "array" and any(.deniedMcpServers[]; . == $e))]'
+    ' | if all then "blocked" elif any then "partial" else "allowed" end')
+# $1 the operation ("on", "off", "read"), then the agents; prints
+# `claude=<state>` (blocked, allowed, partial, absent, failed). An existing
+# file only, merged by temp + rename, left byte for byte when it already says
+# what was asked.
+_BOX_ACCOUNT_LINKS_READ = (
+    f's=$(head -c {BOX_AGENT_SETTINGS_MAX_BYTES} "$cs" | jq -r --arg srv '
+    f'{BOX_ACCOUNT_LINKS_DENIED_SERVER} '
+    f"'{BOX_ACCOUNT_LINKS_STATE_JQ}' 2>/dev/null) || s=failed\n")
+BOX_ACCOUNT_LINKS_SCRIPT = (
+    'op="$1"; shift\n'
+    'cs="$HOME/.claude/settings.json"\n'
+    'for a in "$@"; do\n'
+    '[ "$a" = claude ] || continue\n'
+    '[ -f "$cs" ] || { echo claude=absent; continue; }\n'
+    + _BOX_ACCOUNT_LINKS_READ +
+    'if { [ "$op" = on ] && [ "$s" != blocked ]; } || { [ "$op" = off ] && [ "$s" != allowed ]; }; then\n'
+    f'  if [ "$(wc -c < "$cs")" -le {BOX_AGENT_SETTINGS_MAX_BYTES} ] && jq --arg op "$op" '
+    f'--arg srv {BOX_ACCOUNT_LINKS_DENIED_SERVER} '
+    f"'{BOX_ACCOUNT_LINKS_JQ}' \"$cs\" > \"$cs.rs-tmp\" && [ -s \"$cs.rs-tmp\" ] "
+    '&& mv "$cs.rs-tmp" "$cs"; then :; else rm -f "$cs.rs-tmp"; echo claude=failed; continue; fi\n'
+    '  ' + _BOX_ACCOUNT_LINKS_READ +
+    'fi\n'
+    'echo "claude=${s:-failed}"\n'
+    'done\n')
+BOX_ACCOUNT_LINKS_STATES = ("blocked", "allowed", "partial", "absent", "failed")
+# The states after which the recorded choice counts as written.
+BOX_ACCOUNT_LINKS_WRITTEN = ("blocked", "allowed", "partial")
+_ACCOUNT_LINKS_REASON_TEXT = {
+    "failed": ("the block on links to the Anthropic account could not be written "
+               "into its settings; it is applied at its next start"),
+    "booting": ("the box is still starting; the block on links to the Anthropic "
+                "account is saved and applied at its next start"),
+    "absent": ("Claude has no settings file in the box yet; the block on links to "
+               "the Anthropic account is applied at its next start"),
+}
+
+
+def _entry_account_links_blocked(entry: dict) -> bool:
+    """The box's recorded switch: blocked unless the record says allowed (a
+    box created before the switch is blocked)."""
+    return entry.get(BOX_ACCOUNT_LINKS_KEY) is not False
+
+
+def _box_claude_blocked(agent: str, recorded_blocked: bool) -> bool:
+    """Whether Claude in an agent box is to be blocked: a Claude box as its
+    record says, any other agent box always (it has no switch)."""
+    return agent != "claude" or recorded_blocked
+
+
+def _parse_box_account_links(out: str) -> str:
+    """Claude's state from the script's output; "failed" when it gave none."""
+    for line in (out or "").splitlines():
+        a, sep, v = line.strip().partition("=")
+        if sep and a == "claude" and v in BOX_ACCOUNT_LINKS_STATES:
+            return v
+    return "failed"
+
+
+def _box_account_links_now(cname: str, op: str) -> str:
+    """Run the account-links script for Claude in a box whose boot is done:
+    its state, or "booting" (as _write_box_model_now)."""
+    gate = ('[ -e /home/worker/.rs-role ] || { echo RS_BOX_BOOTING; exit 0; }\n'
+            f'[ ! -e {BOX_MODEL_PENDING} ] || {{ echo RS_BOX_BOOTING; exit 0; }}\n')
+    try:
+        r = subprocess.run(["docker", "exec", "-u", "1000", "-e", "HOME=/home/worker", cname,
+                            "sh", "-c", gate + BOX_ACCOUNT_LINKS_SCRIPT, "sh", op, "claude"],
+                           capture_output=True, text=True,
+                           timeout=BOX_AGENT_SETTINGS_EXEC_TIMEOUT_S)
+        out = r.stdout or ""
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        out = ""
+    if "RS_BOX_BOOTING" in out:
+        return "booting"
+    return _parse_box_account_links(out)
+
+
+def _account_links_warnings(state: str) -> list[dict]:
+    """The box's account-links outcome as data for the host: a write that did
+    not land (it is applied at the box's next start)."""
+    if state in BOX_ACCOUNT_LINKS_WRITTEN:
+        return []
+    reason = state if state in _ACCOUNT_LINKS_REASON_TEXT else "failed"
+    return [{"kind": "account-links", "reason": reason}]
+
+
 def _harness_env_pairs(harness: "dict | None", agent: str) -> list[tuple[str, str]]:
     """The RS_HARNESS_* variables a box runs with, from its entry: set values
     only, `none` and the default test policy read as unset, nothing for an
@@ -2975,7 +3107,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              web: dict | None = None, share: bool = False,
              harness: dict | None = None,
              trusted_browser: bool = False, status_bar: bool = True,
-             pinned_setup: bool = False) -> list[dict]:
+             pinned_setup: bool = False,
+             account_links_blocked: bool = True) -> list[dict]:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -3288,10 +3421,16 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # (no installer gate). The home is fresh: "off" has nothing to remove.
     model_ops = (_box_model_ops({"model": model, "effort": effort})
                  if agent == "claude" and (model or effort) else [])
+    # The block on Claude's links to the Anthropic account, at every run, into
+    # a Claude box whose record says blocked and into every other agent box
+    # (Claude rides there too; it has no switch). The home is fresh: an
+    # allowed box has nothing to remove.
+    links = bool(agent_mount) and _box_claude_blocked(agent, account_links_blocked)
     # The activity recorder's hooks (#560) into every agent box whose files are
     # staged, at every run (the home is fresh).
-    if agent_mount and (model_ops or status_bar or staged):
-        _write_box_model_detached(cname, model_ops, status_bar=status_bar, activity=staged)
+    if agent_mount and (model_ops or status_bar or staged or links):
+        _write_box_model_detached(cname, model_ops, status_bar=status_bar, activity=staged,
+                                  account_links=links)
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
     # The box's home is fresh: give its agents their wired MCP servers back.
@@ -3388,17 +3527,20 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
     if entry.get("pinned_setup") is True:
         _fill_pinned_setup(name, entry.get("preset_setup") or "")
     is_dev = bool(entry.get("dev"))
-    if entry.get("model_pending") or entry.get("status_bar_pending"):
-        # This run lays the entry's pair and status bar into the fresh home:
-        # nothing is owed.
+    if entry.get("model_pending") or entry.get("status_bar_pending") \
+            or entry.get(BOX_ACCOUNT_LINKS_PENDING):
+        # This run lays the entry's pair, status bar and account-links choice
+        # into the fresh home: nothing is owed.
         entries = load()
         if isinstance(entries.get(name), dict):
             entries[name].pop("model_pending", None)
             entries[name].pop("status_bar_pending", None)
+            entries[name].pop(BOX_ACCOUNT_LINKS_PENDING, None)
             save(entries)
         entry = dict(entry)
         entry.pop("model_pending", None)
         entry.pop("status_bar_pending", None)
+        entry.pop(BOX_ACCOUNT_LINKS_PENDING, None)
     return _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
              agent=entry.get("agent", "none"), editor=bool(entry.get("editor")),
              editor_port=int(entry.get("editor_port") or 0),
@@ -3444,6 +3586,9 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
              # (the env and the policy mount are fixed at docker run).
              trusted_browser=_entry_browser_trusted(entry),
              status_bar=_entry_status_bar(entry),
+             # Blocked unless the record says allowed (a box from before the
+             # switch is blocked from this run on).
+             account_links_blocked=_entry_account_links_blocked(entry),
              # From the STORED entry: True only when its create recorded it
              # (an entry from before sharing was a choice does not share).
              share=_entry_share(entry))
@@ -3588,6 +3733,10 @@ def cmd_create(args: argparse.Namespace) -> None:
     # runs). LOCKSTEP with rscore.BoxAddRequest.from_kwargs's predicate.
     if agent not in ("claude", "none") and ((args.model or "").strip() or (args.effort or "").strip()):
         die(f"a model applies to a claude box; agent {agent!r} picks its model in-app")
+    # The block on links to the Anthropic account is Claude's: allowing them on
+    # any other box is refused rather than recorded for nothing.
+    if getattr(args, "block_account_links", True) is False and agent != "claude":
+        die("only a Claude box has links to the Anthropic account")
     # The working mode and doer/checker models: refused here, before any side
     # effect, like the model pair above.
     harness = _box_harness(args, agent)
@@ -3749,6 +3898,10 @@ def cmd_create(args: argparse.Namespace) -> None:
     # RS's status bar (#524); a box without an agent has none.
     status_bar = bool(getattr(args, "status_bar", True)) and agent != "none"
     entry["status_bar"] = status_bar
+    # The block on Claude's links to the Anthropic account: a Claude box only.
+    account_links_blocked = getattr(args, "block_account_links", True) is not False
+    if agent == "claude":
+        entry[BOX_ACCOUNT_LINKS_KEY] = account_links_blocked
     if history:
         # Names only — the token is re-read from the staged file at every run.
         entry["history"] = history
@@ -3786,7 +3939,8 @@ def cmd_create(args: argparse.Namespace) -> None:
                         history=history, loopback_ports=loopback_ports,
                         web=web, share=share, harness=harness or None,
                         status_bar=status_bar, trusted_browser=trusted_browser,
-                        pinned_setup=pinned_setup)
+                        pinned_setup=pinned_setup,
+                        account_links_blocked=account_links_blocked)
     out = {"name": name, "ip": ip, "preset": args.preset,
            "browser": browser, "browser_trusted": trusted_browser,
            "agent": agent, "editor": editor,
@@ -4017,6 +4171,26 @@ def cmd_start(args: argparse.Namespace) -> None:
                 # counts reset for this run.
                 _box_activity_refresh(cname)
             _print_warnings(args.name, bar_w)
+        # The block on Claude's links to the Anthropic account: a blocked
+        # box's settings are written again at every start (a file that already
+        # blocks is left as it is); an allow saved while it was parked is
+        # written once, and cleared only once written. Any other agent box has
+        # Claude blocked always, and no word when it has no Claude settings
+        # file (nothing for the operator to do).
+        box_agent = entry.get("agent", "none")
+        if box_agent != "none":
+            claude_box = box_agent == "claude"
+            blocked = _box_claude_blocked(box_agent, _entry_account_links_blocked(entry))
+            owed = claude_box and bool(entry.get(BOX_ACCOUNT_LINKS_PENDING))
+            if blocked or owed:
+                st = _box_account_links_now(cname, "on" if blocked else "off")
+                if claude_box or st != "absent":
+                    _print_warnings(args.name, _account_links_warnings(st))
+                if owed and st in BOX_ACCOUNT_LINKS_WRITTEN:
+                    entries = load()
+                    if isinstance(entries.get(args.name), dict):
+                        entries[args.name].pop(BOX_ACCOUNT_LINKS_PENDING, None)
+                        save(entries)
         # A model changed while parked: the home was kept, so write it now —
         # only the halves that changed, and cleared only once written.
         pend = entry.get("model_pending")
@@ -4307,8 +4481,10 @@ def cmd_settings(args: argparse.Namespace) -> None:
     environment is fixed at run); a
     model/effort-only change is written into the running box's settings file
     (no restart); a box that is not running is only saved (its next start
-    re-runs it for a mode change, or writes the model). JSON out; warnings are
-    data the host turns into text."""
+    re-runs it for a mode change, or writes the model). The status bar and the
+    block on Claude's links to the Anthropic account are written live into a
+    running box, or saved as owed for a stopped one's next start. JSON out;
+    warnings are data the host turns into text."""
     _require_dind_project()
     if not _NAME_RE.match(args.name):
         die("invalid box name")
@@ -4349,13 +4525,19 @@ def cmd_settings(args: argparse.Namespace) -> None:
         die("invalid --status-bar-agents value")
     if bar is not None and agent == "none":
         die("a box without an agent has no status bar")
-    if not harness_changed and not halves and bar is None:
+    asked_links = getattr(args, "block_account_links", None)   # an older caller's namespace has none
+    links = None if asked_links is None or not named("account-links") else asked_links
+    if links is not None and agent != "claude":
+        die("only a Claude box has links to the Anthropic account")
+    if not harness_changed and not halves and bar is None and links is None:
         print(json.dumps({"name": args.name, "changed": False, "restarted": False,
                           "warnings": []}))
         return
     entry["model"], entry["effort"] = model, effort
     if bar is not None:
         entry["status_bar"] = bar       # a re-run below lays it into the fresh home
+    if links is not None:
+        entry[BOX_ACCOUNT_LINKS_KEY] = links    # likewise
     if new_h:
         entry["harness"] = new_h
     else:
@@ -4421,9 +4603,30 @@ def cmd_settings(args: argparse.Namespace) -> None:
                 entry["status_bar_pending"] = True
             entries[args.name] = entry
             save(entries)
+    links_state = None
+    if links is not None:
+        # The block on Claude's links to the Anthropic account: live into a
+        # running box (a re-run above laid the record into its fresh home
+        # already), else owed at its next start.
+        if running and not restarted:
+            links_state = _box_account_links_now(cname, "on" if links else "off")
+            warnings += _account_links_warnings(links_state)
+            if links_state in BOX_ACCOUNT_LINKS_WRITTEN:
+                entry.pop(BOX_ACCOUNT_LINKS_PENDING, None)
+            else:
+                entry[BOX_ACCOUNT_LINKS_PENDING] = True
+                links_state = None
+        elif not running:
+            entry[BOX_ACCOUNT_LINKS_PENDING] = True
+        entries[args.name] = entry
+        save(entries)
     out = {"name": args.name, "changed": True, "restarted": restarted, "warnings": warnings}
     if bar is not None:
         out["status_bar"] = states
+    if links is not None:
+        # Claude's state as the box's file now reads; None when not written
+        # live (a stopped box, or a write that did not land).
+        out["account_links"] = links_state
     print(json.dumps(out))
 
 
@@ -4461,11 +4664,15 @@ def cmd_agents(args: argparse.Namespace) -> None:
             pass
         text = None
         bar = None
+        links_state = None
         if running:
             # ONE exec per running box (the host bounds this call at two per
             # box): the status bar's state in each agent, then — for a Claude
-            # box — its settings file after a marker line.
-            read = ('[ "$3" = claude ] || exit 0; echo RS_SETTINGS_TEXT; '
+            # box — the account-links state after a marker line and its
+            # settings file after another.
+            read = ('[ "$3" = claude ] || exit 0; echo RS_ACCOUNT_LINKS; '
+                    f'( set -- read claude; {BOX_ACCOUNT_LINKS_SCRIPT} ); '
+                    'echo RS_SETTINGS_TEXT; '
                     '[ -f "$1" ] && head -c "$2" "$1" 2>/dev/null')
             try:
                 r = subprocess.run(["docker", "exec", "-u", "1000", "-e", "HOME=/home/worker",
@@ -4477,7 +4684,10 @@ def cmd_agents(args: argparse.Namespace) -> None:
                                    capture_output=True, text=True,
                                    timeout=BOX_AGENT_SETTINGS_EXEC_TIMEOUT_S)
                 head, sep, body = (r.stdout or "").partition("RS_SETTINGS_TEXT\n")
+                head, lsep, links_out = head.partition("RS_ACCOUNT_LINKS\n")
                 bar = _parse_box_status_bar(head, list(BOX_STATUS_BAR_AGENTS))
+                if lsep:
+                    links_state = _parse_box_account_links(links_out)
                 if sep and r.returncode == 0 and len(body) <= BOX_AGENT_SETTINGS_MAX_BYTES:
                     text = body
             except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
@@ -4490,7 +4700,14 @@ def cmd_agents(args: argparse.Namespace) -> None:
                      # RS's status bar: the record, and each agent's state when running
                      "status_bar": _entry_status_bar(e),
                      "status_bar_pending": bool(e.get("status_bar_pending")),
-                     "status_bar_agents": bar})
+                     "status_bar_agents": bar,
+                     # The block on Claude's links to the Anthropic account (a
+                     # Claude box only): the record, whether it is owed, and
+                     # what Claude's file says when the box runs.
+                     **({"account_links_blocked": _entry_account_links_blocked(e),
+                         "account_links_pending": bool(e.get(BOX_ACCOUNT_LINKS_PENDING)),
+                         "account_links_state": links_state}
+                        if agent == "claude" else {})})
     print(json.dumps(rows))
 
 
@@ -4772,6 +4989,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--status-bar", action=argparse.BooleanOptionalAction, default=True,
                    help="RS's status bar in the box's agents (default on); changed "
                         "later with `settings --status-bar`")
+    c.add_argument("--block-account-links", dest="block_account_links",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="block a Claude box's links to the operator's Anthropic "
+                        "account: claude.ai connectors, Remote Control and Claude in "
+                        "Chrome (default on); changed later with `settings "
+                        "--block-account-links`")
     c.set_defaults(func=cmd_create)
 
     fo = sub.add_parser("folders",
@@ -4849,8 +5072,13 @@ def build_parser() -> argparse.ArgumentParser:
     st_.add_argument("--model", default="", help="the Claude model (empty: Claude's own default)")
     st_.add_argument("--effort", default="", help="the Claude effort (empty: Claude's default)")
     st_.add_argument("--write", default=None,
-                     help="the groups written (model,effort,harness,status-bar); the "
-                          "others keep the box's record (default: all)")
+                     help="the groups written (model,effort,harness,status-bar,"
+                          "account-links); the others keep the box's record "
+                          "(default: all)")
+    st_.add_argument("--block-account-links", dest="block_account_links",
+                     action=argparse.BooleanOptionalAction, default=None,
+                     help="block or allow a Claude box's links to the operator's "
+                          "Anthropic account (absent: unchanged)")
     st_.add_argument("--status-bar", dest="status_bar",
                      action=argparse.BooleanOptionalAction, default=None,
                      help="RS's status bar in the box's agents (absent: unchanged)")

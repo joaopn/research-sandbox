@@ -28,7 +28,7 @@ The left rail lists your projects, with four entries at its bottom:
   |---|---|
   | Tabs | Which of the project's tabs show |
   | Extensions | The editor and the Reader on or off; the agents' status bar |
-  | Agents | Which agents the project carries, their models, Update (deploys the downloaded agent versions live); a box's agent model; whether Claude's links to the Anthropic account are blocked (Claude sessions started afterwards follow a change) |
+  | Agents | Which agents the project carries, their models, Update (deploys the downloaded agent versions live); a box's agent model; whether Claude's links to the Anthropic account are blocked, for the project and for each Claude box (Claude sessions started afterwards follow a change) |
   | Sharing | The project's read-only folders (applied at its next start) and each box's folders (saving restarts that box fresh, which signs its agent out) |
   | Ports | Ports a project or box serves, as tabs |
   | Alerts | Arm a notification when one of the project's agent sessions hands back |

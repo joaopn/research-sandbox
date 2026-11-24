@@ -58,7 +58,7 @@ The agent's next base sync rebases its fork's `dev` onto the mirror. Collected c
 | Action | Where | What happens to the fork |
 |---|---|---|
 | Create a dev project | New Project window, dev card (GitHub URL) | Mirror added if needed; the project's agent gets a fork |
-| Add a dev box | Box window, dev preset (GitHub URL) | Mirror added if needed; the box gets its own fork |
+| Add a dev box | Box window, dev preset (GitHub URL); a Claude dev box has the same switch for links to the Anthropic account as any Claude box | Mirror added if needed; the box gets its own fork |
 | Destroy a project, remove a box | Project or box controls | Fork archived: kept, read-only |
 | Remove the repository | Services page | Mirror and every fork deleted; refused while any fork is still live |
 | Purge an identity | Services page, archived forks | The Gitea account and its archived fork deleted; the name can be reused |

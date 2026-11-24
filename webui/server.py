@@ -1434,6 +1434,10 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             # RS's status bar in the box's agents (#524) — RAW: absent means
             # the default (on); the broker request refuses a non-bool.
             "status_bar": body.get("status_bar"),
+            # The block on a Claude box's links to the Anthropic account — RAW:
+            # absent means the default (blocked); the broker request refuses a
+            # non-bool.
+            "block_account_links": body.get("block_account_links"),
             # Keep the notes' history on Gitea — RAW like `browser`: the broker
             # request refuses anything but a bool.
             "history": body.get("history")}
@@ -1503,7 +1507,9 @@ async def broker_box_settings_handler(request: web.Request) -> web.Response:
     args = {"project": project}
     for k in ("name", "model", "effort", "reset", "harness_mode", "doer_model",
               "checker_model", "pi_doer_model", "pi_doer_thinking",
-              "pi_checker_model", "pi_checker_thinking", "test_policy", "status_bar"):
+              "pi_checker_model", "pi_checker_thinking", "test_policy", "status_bar",
+              # the box's switch for Claude's links to the Anthropic account
+              "block_account_links"):
         if body.get(k) is not None:
             args[k] = body[k]
     status, reply = await _relay(request, "box_settings", args)
@@ -2243,7 +2249,10 @@ async def broker_dev_box_handler(request: web.Request) -> web.Response:
             # broker request refuses anything but a bool or absent).
             "share": body.get("share"),
             # RS's status bar (#524) — RAW, absent ⇒ on.
-            "status_bar": body.get("status_bar")}
+            "status_bar": body.get("status_bar"),
+            # The block on Claude's links to the Anthropic account — RAW,
+            # absent ⇒ blocked.
+            "block_account_links": body.get("block_account_links")}
     op_id = _mint_op_id(project, "dev-box")
     try:
         reply = await broker_call("dev_box_provision", args,

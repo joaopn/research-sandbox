@@ -1041,7 +1041,11 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   "share",
                                   # RS's status bar in the box's agents (a bool;
                                   # in-box: the agents' own settings).
-                                  "status_bar"})
+                                  "status_bar",
+                                  # The block on a Claude box's links to the
+                                  # Anthropic account (a bool; in-box: Claude's
+                                  # own settings).
+                                  "block_account_links"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
 # The ⚙ Box folders change: the whole new set for one box (same boundary
 # argument as `folders` above). Inline like port_add's box arm — it re-runs one
@@ -1060,7 +1064,10 @@ BOX_SETTINGS_WEBUI_FIELDS = frozenset({
     "harness_mode", "doer_model", "checker_model", "pi_doer_model", "pi_doer_thinking",
     "pi_checker_model", "pi_checker_thinking", "test_policy",
     # The box's status-bar switch (#524; a bool, in-box).
-    "status_bar"})
+    "status_bar",
+    # The box's switch for Claude's links to the Anthropic account (a bool,
+    # in-box).
+    "block_account_links"})
 # box_remove additionally accepts keep_workspace (a bool, not host-shaped): when
 # set the box is removed but its artifacts stay on disk. The step-up `proof`
 # stays OUT of the set (verified + consumed in dispatch, never forwarded).
@@ -1258,7 +1265,10 @@ DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   # plain box window's field.
                                   "share",
                                   # RS's status bar (#524; a bool, in-box).
-                                  "status_bar"})
+                                  "status_bar",
+                                  # The block on Claude's links to the
+                                  # Anthropic account (a bool, in-box).
+                                  "block_account_links"})
 # The dev-project provision boundary (the New Project box's dev card): minimal
 # and deliberate. Adding a field here is a boundary edit — never open a
 # path/host-shaped one. `workflow` threads the manifest the dialog was opened
