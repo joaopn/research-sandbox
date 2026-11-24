@@ -18192,11 +18192,19 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # PI accepts without the finding checks and the front page lists). Version 6:
 # the instructions name `rs-memory claim --title` (required: the pages the PI
 # reads, which rs-memory writes beside the memory folder, list claims by it).
-MEMORY_KIT_VERSION = "6"
+# Version 7: the instructions name `rs-memory log` (a logbook entry, filed
+# from the agent's draft by the /log command the kit writes).
+MEMORY_KIT_VERSION = "7"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")
 MEMORY_PI_EXT_SRC = SCRIPT_DIR / "container" / "researcher" / "rs-memory.ts"
+# The /log command, one text for both agents (each reads a markdown file with a
+# `description:` frontmatter): Claude Code's user commands folder and pi's
+# prompt templates folder in its agent folder. It travels as an argument, since
+# the exec's one stdin carries the pi extension; a few kilobytes, far inside
+# the kernel's limit on one argument (128 KiB).
+MEMORY_LOG_CMD_SRC = SCRIPT_DIR / "container" / "researcher" / "log.md"
 # Claude's hook entries the kit merges: the event, the command and, for an
 # entry that applies to one kind of subagent, its matcher (matched by exact
 # command, never touching other entries).
@@ -18235,12 +18243,16 @@ MEMORY_KIT_LABELS_UNREADABLE = (
     "not set up; stop the project and start it again")
 MEMORY_KIT_AGENT_FAILED = (
     "the research memory could not be set up for {who} in this project (its settings "
-    "could not be written); stop the project and start it again")
+    "or its /log command could not be written); stop the project and start it again")
 # One script for both agents, run as the agent user with HOME set: $1 is the
-# Claude hook entries as a JSON list, then the agents. Claude: built-in memory off and the
-# hooks merged into settings.json (a `hooks` that is not an object, or an event
-# that is not a list, fails the write, never replaced); pi: the extension from
-# stdin into its extensions/ folder. Prints `<agent>=<on|absent|failed>`.
+# Claude hook entries as a JSON list, $2 the /log command's text, then the
+# agents. Claude: built-in memory off and the hooks merged into settings.json
+# (a `hooks` that is not an object, or an event that is not a list, fails the
+# write, never replaced), then the /log command into commands/; pi: the
+# extension from stdin into its extensions/ folder, then the /log command into
+# prompts/. Each file is written through a temp name not ending in `.md` and a
+# rename that never moves it into a folder at the name (`mv -T`). Prints
+# `<agent>=<on|absent|failed>`.
 MEMORY_CLAUDE_JQ = (
     'def has_cmd($c): any(.[]?; (.hooks // []) | any(.[]?; .command == $c));'
     ' .autoMemoryEnabled = false'
@@ -18253,19 +18265,24 @@ MEMORY_CLAUDE_JQ = (
     ' else .hooks[$h.event] += [(if $h.matcher == null then {} else {"matcher": $h.matcher} end)'
     ' + {"hooks": [{"type": "command", "command": $h.command}]}] end)')
 MEMORY_KIT_SCRIPT = (
-    'hooks="$1"; shift\n'
+    'hooks="$1"; logcmd="$2"; shift 2\n'
     'cs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\n'
     'pf="$pd/extensions/rs-memory.ts"\n'
+    'putlog() { f="$1/log.md"; rm -f "$f.rs-tmp" && mkdir -p "$1" '
+    '&& printf %s "$logcmd" > "$f.rs-tmp" && [ -s "$f.rs-tmp" ] && mv -fT "$f.rs-tmp" "$f" '
+    '|| { rm -f "$f.rs-tmp"; return 1; }; }\n'
     'for a in "$@"; do\n'
     'if [ "$a" = claude ]; then\n'
     '  [ -f "$cs" ] || { echo claude=absent; continue; }\n'
     f'  if [ "$(wc -c < "$cs")" -le {AGENT_SETTINGS_MAX_BYTES} ] && jq --argjson hooks "$hooks" '
     f"'{MEMORY_CLAUDE_JQ}' \"$cs\" > \"$cs.rs-tmp\" && [ -s \"$cs.rs-tmp\" ] "
-    '&& mv "$cs.rs-tmp" "$cs"; then echo claude=on; else rm -f "$cs.rs-tmp"; echo claude=failed; fi\n'
+    '&& mv "$cs.rs-tmp" "$cs"; then putlog "$HOME/.claude/commands" && echo claude=on '
+    '|| echo claude=failed; else rm -f "$cs.rs-tmp"; echo claude=failed; fi\n'
     'elif [ "$a" = pi ]; then\n'
     '  [ -f "$pd/settings.json" ] || { echo pi=absent; continue; }\n'
     '  if rm -f "$pf.rs-tmp" && mkdir -p "$pd/extensions" && cat > "$pf.rs-tmp" '
-    '&& [ -s "$pf.rs-tmp" ] && mv -f "$pf.rs-tmp" "$pf"; then echo pi=on; '
+    '&& [ -s "$pf.rs-tmp" ] && mv -f "$pf.rs-tmp" "$pf"; then putlog "$pd/prompts" '
+    '&& echo pi=on || echo pi=failed; '
     'else rm -f "$pf.rs-tmp"; echo pi=failed; fi\n'
     'fi\n'
     'done\n'
@@ -18300,9 +18317,10 @@ def _memory_kit_exec(container: str, agents: "Sequence[str]",
         return {}
     try:
         ext = MEMORY_PI_EXT_SRC.read_text(encoding="utf-8") if "pi" in agents else ""
+        log_cmd = MEMORY_LOG_CMD_SRC.read_text(encoding="utf-8")
         r = run(["docker", "exec", "-i", "-u", "1000", "-e", f"HOME={home}", container,
                  "sh", "-c", MEMORY_KIT_SCRIPT, "sh", json.dumps(_memory_claude_hooks(subagents)),
-                 *agents],
+                 log_cmd, *agents],
                 input=ext, capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
         out = r.stdout or ""
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError):

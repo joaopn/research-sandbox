@@ -42,11 +42,17 @@ source of truth):
   results/<id>/evidence/        a read-only copy of its evidence, made at accept
                                 and never rewritten
   results/index.md              everything accepted, by topic, with its standing
+  logbook/<date>-<topic>.md     the logbook: the story of the work, one entry
+                                per topic, filed by `log` from the agent's
+                                draft, read-only, never rewritten or removed
 
 Every page is rebuilt after each verb that changes what it shows, and at open
 (how an existing project gets its pages). Each starts with rs-memory's marker
 line; a file without it is never overwritten or removed, and is reported until
-the PI moves it. A page that cannot be written never fails the verb.
+the PI moves it. A page that cannot be written never fails the verb. The
+logbook's entries are not pages: each is written once, when it is filed. The
+logbook tells the story; the record holds the truth: where they disagree, an
+entry's standing in the record is what holds.
 
 Verbs:
   open [--hook]                 what to read at the start of a session
@@ -61,7 +67,8 @@ Verbs:
   rerun ID  /  referee ID [--agent claude|pi]
   accept ID... [--over-objection]  /  strike ID... --reason R
   view [ID | --topic T]         the state of knowledge, computed at every call
-  recall WORD... [--body]
+  recall WORD... [--body]       the journal, the claims and the logbook
+  log --topic SLUG --file DRAFT file a logbook entry from the agent's draft
   skill propose|used|promote|retire|sync|list
   consolidate --prompt [--out FILE]  /  consolidate --apply DELTA
   close [--hook] [--agent claude|pi]
@@ -166,9 +173,11 @@ WRITEUP_REMINDER = (
 
 NOTE_KINDS = ("did", "dead-end", "decision", "surprise", "correction")
 # Entries that never call for a consolidation on their own: a consolidation's
-# own entry (else every run would owe another), and a session's end (a second
-# close, or one written while a run works, would otherwise owe a run for it).
-QUIET_KINDS = ("consolidation", "session-end")
+# own entry (else every run would owe another), a session's end (a second
+# close, or one written while a run works, would otherwise owe a run for it),
+# and a logbook entry's filing (it tells the story of work the journal already
+# holds, so it is nothing new to consolidate, nor anything new to log).
+QUIET_KINDS = ("consolidation", "session-end", "logbook")
 NOTHING_NEW = "nothing new since the last consolidation"
 DELTA_KEYS = ("page", "through", "add", "edit", "retire", "claims", "skills")
 DELTA_ITEM_KEYS = {"add": ("part", "text"), "edit": ("id", "text"),
@@ -398,15 +407,17 @@ def session_label() -> str:
     return f"{agent} {sid}".strip()
 
 
-def add_journal(headline: str, kind: str, body: str = "") -> str:
-    """Append one entry; the caller holds the lock. Returns its id."""
+def add_journal(headline: str, kind: str, body: str = "",
+                fields: "list[tuple[str, str]] | None" = None) -> str:
+    """Append one entry; the caller holds the lock. Returns its id. `fields`
+    are written after the standard ones."""
     files = journal_files()
     n = (files[-1][0] + 1) if files else 1
     ident = f"J-{n}"
     month = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m")
     path = mem_dir() / "journal" / month / f"{ident}.md"
     write_text(path, render_entry(ident, headline, [
-        ("kind", kind), ("session", session_label()), ("time", now())], body))
+        ("kind", kind), ("session", session_label()), ("time", now()), *(fields or [])], body))
     return ident
 
 
@@ -620,6 +631,7 @@ def cmd_note(a) -> None:
         raise Refused(f"unknown kind {a.kind!r}; use one of: {', '.join(NOTE_KINDS)}")
     with Lock():
         ident = add_journal(a.headline, a.kind, a.body or "")
+        refresh_pages()                 # the front page counts what came after the logbook
     print(f"{ident} journalled ({a.kind}).")
 
 
@@ -1702,6 +1714,14 @@ def cmd_recall(a) -> None:
                                                    if isinstance(v, list)) if a.body else "")
         if all(w in text.lower() for w in words):
             hits.append(f"{ident} [{where}] {e['headline']}")
+    for e in logbook_state()[0]:
+        rel = one(e, "entry")
+        text = e["headline"]
+        if a.body:
+            full = read_logbook_entry(rel)
+            text = full if full is not None else text
+        if all(w in text.lower() for w in words):
+            hits.append(f"{rel} [logbook] {one(e, 'time')[:10]} {e['headline']}")
     print("\n".join(hits) if hits else "nothing matches")
 
 
@@ -2418,8 +2438,9 @@ def front_page(ctx: PageContext, w: PageWriter) -> str:
     lines = ["# The research, for the PI", "",
              "What the researcher has for you: the claims waiting for your decision (each "
              "with its page in staging/), what is running, where the work stands, and what is "
-             "known (each accepted entry with its page in results/). The agent keeps its own "
-             "memory in memory/, and every page here is written from it.", "",
+             "known (each accepted entry with its page in results/), and the logbook, the "
+             "story of the work (logbook/). The agent keeps its own memory in memory/, and "
+             "every page here is written from it.", "",
              "## Waiting for you", ""]
     staged = sorted(ctx.staged, key=lambda i: (i[0], int(i[2:])))
     if not staged:
@@ -2457,6 +2478,7 @@ def front_page(ctx: PageContext, w: PageWriter) -> str:
                 lines += [f"### {heading}", ""]
                 lines += [f"- {ctx.linkify(page, text)}" for _i, text in items]
                 lines.append("")
+    lines += [""] + logbook_front_lines(page)
     lines += ["", "## What is known", ""]
     g = knowledge_groups(ctx.rec, ctx.st)
     known = g["findings"] + g["facts"]
@@ -2576,6 +2598,7 @@ def open_text() -> str:
     cps = [e for e in cps if one(e, "kind") == "checkpoint"]
     if cps:
         parts.append(f"Last checkpoint: {cps[-1]['id']} at {one(cps[-1], 'time')}")
+    parts.append(logbook_open_line())
     active = sorted(p.name for p in (d / "skills" / "active").glob(SKILL_PREFIX + "*")
                     if p.is_dir()) if (d / "skills" / "active").is_dir() else []
     if active:
@@ -2618,6 +2641,309 @@ def cmd_open(a) -> None:
                 cut += 1
             text = text[:cut] + tail
     sys.stdout.write(text)
+
+
+# ------------------------------------------------------------------ logbook
+# The logbook is the story of the work, for the PI and for a later session:
+# what was asked, what came out, what is open, where to pick up. One entry per
+# topic, drafted by the agent and filed with `log`, which adds a header it
+# computes itself (the date, the journal entries the entry covers) and writes
+# it read-only into <workspace>/logbook/. rs-memory never rewrites or removes
+# an entry afterwards: a correction is a later entry. Each filing is journalled
+# (kind "logbook", one of QUIET_KINDS), and the journal is where the front
+# page, open and recall find the entries. The logbook tells the story; the
+# record holds the truth: an entry is never read back into the record, and
+# where the two disagree, the record's standing holds.
+LOGBOOK_DIR = "logbook"
+LOGBOOK_KIND = "logbook"
+LOGBOOK_SECTIONS = ("The question", "Results", "Open threads", "Where to pick up")
+# A topic's slug follows the skill-name rule (SKILL_NAME_RE, SKILL_NAME_MAX), so
+# every name the agent makes up obeys one rule; with the date in front and a
+# counter behind, the entry's file name stays far inside a file name's 255 bytes.
+LOGBOOK_SLUG_MAX = SKILL_NAME_MAX
+# An entry is filed read-only: nothing, rs-memory included, edits it after.
+LOGBOOK_MODE = 0o444
+# How many entries the PI's front page lists, newest first; the folder holds
+# the rest, a link away. A /log files one entry per topic, usually one to
+# three, so five keeps the last session's entries and the one before it in
+# view, while the front page stays a page of what waits and what stands, not
+# an archive that grows with every session.
+LOGBOOK_FRONT_ENTRIES = 5
+_COVERS_RE = re.compile(r"\A(J-[1-9][0-9]*) to (J-[1-9][0-9]*)\Z")
+_FENCE_RE = re.compile(r"\A {0,3}(`{3,}|~{3,})")
+_CODE_SPAN_RE = re.compile(r"(`+).*?\1")
+# A link's target in the draft: inline ([text](target), images too), a
+# reference definition ([ref]: target), and HTML's href and src.
+_LINK_RES = (re.compile(r"(!?\[[^\]]*\]\(\s*<?([^)\s>]*)[^)]*\))"),
+             re.compile(r"\A {0,3}(\[[^\]]+\]:\s*<?([^\s>]+)>?)"),
+             re.compile(r"""((?:href|src)\s*=\s*["']?([^"'\s>]+))""", re.I))
+
+
+def logbook_dir() -> Path:
+    return workspace() / LOGBOOK_DIR
+
+
+def logbook_state() -> "tuple[list[dict], list[int]]":
+    """The filed entries, oldest first (each its journal entry: the title is
+    its headline, `entry` its path in the workspace, `covers` the journal
+    entries it covers), and the journal entries since the last of them that
+    are new work (not QUIET_KINDS)."""
+    entries: "list[dict]" = []
+    after: "list[int]" = []
+    for n, f in journal_files():
+        e = parse_entry(f)
+        kind = one(e, "kind")
+        if kind == LOGBOOK_KIND and one(e, "entry"):
+            entries.append(e)
+            after = []
+        elif kind not in QUIET_KINDS:
+            after.append(n)
+    return entries, after
+
+
+def entries_words(n: int) -> str:
+    return f"{n} journal entr{'y' if n == 1 else 'ies'}"
+
+
+def logbook_covers(entries: "list[dict]", after: "list[int]") -> "tuple[int, int] | None":
+    """The journal entries a new logbook entry covers: those since the last
+    entry; when there are none, the same as the last entry (another topic of
+    the same /log); None when there is no work in the journal at all."""
+    if after:
+        return after[0], after[-1]
+    if entries:
+        m = _COVERS_RE.match(one(entries[-1], "covers"))
+        if m:
+            return int(m.group(1)[2:]), int(m.group(2)[2:])
+    return None
+
+
+def logbook_slug(raw: str) -> str:
+    if not SKILL_NAME_RE.match(raw) or len(raw) > LOGBOOK_SLUG_MAX:
+        raise Refused(f"--topic {raw!r} is not a topic slug: a few words naming the topic in "
+                      f"lowercase letters, digits and single hyphens, at most {LOGBOOK_SLUG_MAX} "
+                      "characters, e.g. --topic station-gaps")
+    return raw
+
+
+def read_draft(path: str) -> str:
+    p = Path(path)
+    try:
+        if not stat.S_ISREG(os.stat(p).st_mode):
+            raise Refused(f"the draft {path} is not a plain file")
+        return p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise Refused(f"the draft {path} does not exist")
+    except OSError as e:
+        raise Refused(f"the draft {path} cannot be read ({e.strerror or e})")
+    except UnicodeDecodeError:
+        raise Refused(f"the draft {path} is not UTF-8 text")
+
+
+def parse_draft(path: str, text: str) -> "tuple[str, str]":
+    """The draft's title and the text below its title line, checked: a title
+    line, the four sections in order and none of them empty, and no link to an
+    absolute path. A refusal names what is wrong."""
+    shape = ("An entry is a first line `# <title>`, then the sections "
+             + ", ".join(f"`## {h}`" for h in LOGBOOK_SECTIONS) + ", in this order")
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i == len(lines) or not lines[i].startswith("# ") or not lines[i][2:].strip():
+        raise Refused(f"the draft {path} has no title line. {shape}; its title is a natural "
+                      "sentence reflecting the question")
+    title = single_line(lines[i][2:])
+    heads: "list[tuple[str, int]]" = []            # (heading, line index)
+    links: "list[str]" = []
+    fence = None
+    for j in range(i, len(lines)):
+        line = lines[j]
+        m = _FENCE_RE.match(line)
+        if fence is not None:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+                fence = None
+            continue
+        if m:
+            fence = m.group(1)
+            continue
+        if j > i and line.startswith("## "):
+            heads.append((line[3:].strip(), j))
+        bare = _CODE_SPAN_RE.sub("", line)
+        for rx in _LINK_RES:
+            for lm in rx.finditer(bare):
+                if lm.group(2).startswith("/"):
+                    links.append(f"{lm.group(1)} (line {j + 1})")
+    names = [h for h, _j in heads]
+    missing = [h for h in LOGBOOK_SECTIONS if h not in names]
+    other = [h for h in names if h not in LOGBOOK_SECTIONS]
+    if missing or other:
+        what = []
+        if missing:
+            what.append("it lacks " + ", ".join(f"`## {h}`" for h in missing))
+        if other:
+            what.append("it has a section an entry does not: "
+                        + ", ".join(f"`## {h}`" for h in other))
+        raise Refused(f"the draft {path}: {'; '.join(what)}. {shape}")
+    twice = sorted({h for h in names if names.count(h) > 1}, key=LOGBOOK_SECTIONS.index)
+    if twice:
+        raise Refused(f"the draft {path} has " + ", ".join(f"`## {h}`" for h in twice)
+                      + f" more than once. {shape}")
+    if names != list(LOGBOOK_SECTIONS):
+        raise Refused(f"the draft {path} has its sections in the order "
+                      + ", ".join(f"`## {h}`" for h in names) + f". {shape}")
+    ends = [j for _h, j in heads[1:]] + [len(lines)]
+    empty = [h for (h, j), end in zip(heads, ends) if not any(l.strip() for l in lines[j + 1:end])]
+    if empty:
+        raise Refused(f"the draft {path} leaves " + ", ".join(f"`## {h}`" for h in empty)
+                      + " empty: write it (say so in a sentence when there is nothing to tell)")
+    if links:
+        raise Refused(f"the draft {path} links to an absolute path: {'; '.join(links)}. A link "
+                      "in an entry is relative to the entry, which is filed in "
+                      f"{logbook_dir()}/ (e.g. ../results/F-3/F-3.md), so the folder reads the "
+                      "same wherever it is")
+    return title, "\n".join(lines[i + 1:]).strip("\n")
+
+
+def logbook_header(page: Path, date: str, covers: "tuple[int, int] | None") -> str:
+    """The line rs-memory puts below an entry's title: the date and the
+    journal entries it covers, each linked to its file."""
+    if covers is None:
+        return f"**Date:** {date} · **Journal:** no entries yet"
+    paths = dict(journal_files())
+
+    def ref(n: int) -> str:
+        return rel_link(page, paths[n], f"J-{n}") if n in paths else f"J-{n}"
+    span = ref(covers[0]) if covers[0] == covers[1] else f"{ref(covers[0])} to {ref(covers[1])}"
+    return f"**Date:** {date} · **Journal:** {span}"
+
+
+def file_logbook_entry(slug: str, title: str, body: str,
+                       covers: "tuple[int, int] | None") -> Path:
+    """Write the entry, read-only, under the first free name of
+    <date>-<slug>.md, <date>-<slug>-2.md, …: written whole to a temp file,
+    then linked to its name (which fails rather than replaces), so a reader
+    never sees half an entry and no file is ever overwritten."""
+    d = logbook_dir()
+    date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    fd, tmp = tempfile.mkstemp(prefix=".entry.", dir=str(d))
+    try:
+        k = 1
+        name = f"{date}-{slug}.md"
+        text = f"# {title}\n\n{logbook_header(d / name, date, covers)}\n\n{body}\n"
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, LOGBOOK_MODE)
+        while True:
+            try:
+                os.link(tmp, d / name)
+                return d / name
+            except FileExistsError:
+                k += 1
+                name = f"{date}-{slug}-{k}.md"
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def cmd_log(a) -> None:
+    refuse_under_guard("file logbook entries")
+    slug = logbook_slug(a.topic)
+    title, body = parse_draft(a.file, read_draft(a.file))
+    with Lock():
+        d = logbook_dir()
+        try:
+            st = os.lstat(d)
+        except FileNotFoundError:
+            st = None
+        if st is not None and not stat.S_ISDIR(st.st_mode):
+            raise Refused(f"{d} is there and is not a folder (a file or a link), so no logbook "
+                          "entry can be filed in it; rs-memory moves nothing and wrote nothing. "
+                          "Tell the PI: once they move or rename it, file the entry again")
+        if st is None:
+            os.mkdir(d)
+        entries, after = logbook_state()
+        covers = logbook_covers(entries, after)
+        try:
+            path = file_logbook_entry(slug, title, body, covers)
+        except OSError as e:
+            raise Refused(f"the logbook entry could not be written into {d} "
+                          f"({e.strerror or e}); nothing was filed")
+        rel = path.relative_to(workspace()).as_posix()
+        span = ("none" if covers is None else
+                f"J-{covers[0]}" if covers[0] == covers[1] else f"J-{covers[0]} to J-{covers[1]}")
+        j = add_journal(title, LOGBOOK_KIND, "",
+                        [("entry", rel)] + ([("covers", f"J-{covers[0]} to J-{covers[1]}")]
+                                            if covers else []))
+        refresh_pages()
+    print(f"Filed {path} (journal: {span}); {j} journalled. It is never edited: a correction "
+          "goes into a later entry.")
+
+
+def read_logbook_entry(rel: str) -> "str | None":
+    """A filed entry's text, by its path in the workspace; None when it is not
+    there as a plain file (never followed or blocked on)."""
+    p = workspace() / rel
+    try:
+        fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            chunks.append(b)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def logbook_front_lines(page: Path) -> "list[str]":
+    """The front page's Logbook section."""
+    entries, after = logbook_state()
+    lines = ["## Logbook", "",
+             "The story of the work, one entry per topic, written by the agent when you ask "
+             "for it; an entry is never changed after it is written.", ""]
+    for e in reversed(entries[-LOGBOOK_FRONT_ENTRIES:]):
+        lines.append(f"- {file_ref(page, str(workspace() / one(e, 'entry')), e['headline'])}"
+                     f" — {md(one(e, 'time')[:10])}")
+    if len(entries) > LOGBOOK_FRONT_ENTRIES:
+        lines += ["", f"All {len(entries)} entries: " + rel_link(page, logbook_dir(), "logbook/")]
+    if entries:
+        lines.append("")
+    n = len(after)
+    ask = "type `/log` in the agent's session."
+    if not entries:
+        lines.append("Nothing has been logged yet"
+                     + (f" ({entries_words(n)} so far)" if n else "")
+                     + ". To have the agent write the logbook, " + ask)
+    elif n:
+        lines.append(f"{entries_words(n)} came after the last logbook entry. To have the "
+                     "agent write them up, " + ask)
+    else:
+        lines.append("No journal entry came after the last logbook entry.")
+    return lines
+
+
+def logbook_open_line() -> str:
+    """open's one line on the logbook: the latest entry's path, to read when
+    the story is needed, and how much came after it."""
+    entries, after = logbook_state()
+    if not entries:
+        return (f"Logbook: no entry yet ({entries_words(len(after))} so far); the PI "
+                "asks for it with /log.")
+    last = entries[-1]
+    return (f"Latest logbook entry: {workspace() / one(last, 'entry')} "
+            f"({one(last, 'time')[:10]}; {entries_words(len(after))} since); read it when you "
+            "need the story of the work.")
 
 
 # ------------------------------------------------------------------ skills
@@ -3515,10 +3841,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--topic")
     p.set_defaults(fn=cmd_view)
 
-    p = sub.add_parser("recall", help="plain-text search of the journal and the claims")
+    p = sub.add_parser("recall", help="plain-text search of the journal, the claims and the "
+                       "logbook (--body: their whole text)")
     p.add_argument("words", nargs="+")
     p.add_argument("--body", action="store_true")
     p.set_defaults(fn=cmd_recall)
+
+    p = sub.add_parser("log", help="file a logbook entry, the story of one topic, from a draft")
+    p.add_argument("--topic", required=True, help="the topic's slug, a few kebab-case words")
+    p.add_argument("--file", required=True, metavar="DRAFT",
+                   help="the draft: `# <title>`, then the sections "
+                   + ", ".join(f"`## {h}`" for h in LOGBOOK_SECTIONS))
+    p.set_defaults(fn=cmd_log)
 
     sk = sub.add_parser("skill", help="earned skills").add_subparsers(dest="skill_verb", required=True)
     p = sk.add_parser("propose")

@@ -49,16 +49,19 @@ The memory is written for the agent: records with every field, checksums and ses
 
 | Path | For |
 |---|---|
-| `README.md` | The front page: each claim waiting for the user (its title, its kind, its checks in plain words, the words to decide it), what is running (jobs and checks in flight), where things stand (the agent's own front page), and what is known (current findings and facts by topic, contested pairs, open questions) |
+| `README.md` | The front page: each claim waiting for the user (its title, its kind, its checks in plain words, the words to decide it), what is running (jobs and checks in flight), where things stand (the agent's own front page), the logbook (its latest entries, and how many journal entries came after the last one, with the words to ask for more: `/log`), and what is known (current findings and facts by topic, contested pairs, open questions) |
 | `staging/<id>.md` | One page per staged claim: statement, scope, hedge, topics, checks, relations as links, evidence as links, earlier versions, and the words to accept or strike it |
 | `results/<id>/<id>.md` | One page per accepted entry, in the same shape, with how it stands now (current, superseded and by which entry, withdrawn and by which, contested and with which, or resting on entries that no longer stand) and an objection it was accepted over |
 | `results/<id>/evidence/` | A read-only copy of the entry's evidence files, made at accept and checked against the hashes pinned when it was staged; never rewritten |
 | `results/index.md` | Every accepted entry by topic, each with its standing |
+| `logbook/<date>-<topic>.md` | The logbook: one entry per topic, the question, the results, the open threads and where to pick up, in the agent's words; below its title, the date and the journal entries it covers. Written once, read-only, never rewritten or removed |
 | `analyses/<name>/` | The agent's analyses, one folder each (the pages link their evidence there) |
 
-The pages are views: the memory stays the one source of truth, and the memory command rewrites every page from it after each change a page shows (a claim, an amend, an accept, a strike, a checkpoint, a job, a check that ends, a consolidation, a session's end) and at every session start, which is how a project made before the pages gets them. A page is rewritten only when its text changed. A staging page goes when its claim is accepted or struck.
+The pages are views: the memory stays the one source of truth, and the memory command rewrites every page from it after each change a page shows (a note, a claim, an amend, an accept, a strike, a checkpoint, a job, a logbook entry, a check that ends, a consolidation, a session's end) and at every session start, which is how a project made before the pages gets them. A page is rewritten only when its text changed. A staging page goes when its claim is accepted or struck.
 
 Every page starts with a marker line and ends with a line saying it is rebuilt from the record. A file without the marker, such as the user's own `README.md`, is never overwritten, moved or removed: that page is not written, and the agent is told, at every session start, which file is in the way, until the user moves or renames it. Every link in a page is relative to the page, so a researcher's folder reads the same wherever it sits; a file outside the workspace is named, not linked.
+
+The logbook is not a view. The user asks for it with `/log`, the same command under Claude Code and pi: the agent drafts one entry per topic it worked on since the last entry (several analyses feeding one question are one topic) and files each with `log`, which refuses a draft without its title and four sections (the question, the results, the open threads, where to pick up), with an empty section, or with a link to an absolute path. It adds the date and the journal entries the entry covers, those since the previous entry, each linked, and writes the entry under the first free name for that day and topic. The filing is journalled but does not by itself start a consolidation. At every session start the agent is given the latest entry's path, to read when it needs the story; `recall` searches the entries too.
 
 The evidence copy is what makes a result page last: a finding's notebook output may be rewritten next week, while the copy stays as it was accepted. An accept whose copy cannot be made is refused before anything moves. An entry accepted before the copies existed gets one at the next session start when its file still has the hash it was accepted with; otherwise its page says that the file had changed and no copy was kept.
 
@@ -71,7 +74,8 @@ The agent keeps its memory through one command, `rs-memory`. Its refusals name t
 | `note`, `checkpoint` | add to the journal; a checkpoint before long work lets an interruption resume |
 | `claim`, `amend` | stage a finding or a fact about the data with its title and evidence; correct a staged one in place |
 | `accept`, `strike` | enter a staged finding or fact in the record, or drop it, after the user says so |
-| `view`, `recall` | show the state of knowledge or one entry with its chain; search the journal and claims as text |
+| `view`, `recall` | show the state of knowledge or one entry with its chain; search the journal, the claims and the logbook as text |
+| `log` | file a logbook entry from the agent's draft |
 | `skill propose`, `used`, `promote`, `retire` | turn a working procedure into a skill for both agents |
 | `open`, `close`, `consolidate` | start a session; end one and rewrite the front page |
 | `job add`, `list`, `done` | register a long run left going, show its state, mark it handled |
@@ -119,5 +123,7 @@ The user accepts a finding by saying so in the chat, for example "accept F-3". T
 **The user reads pages, the agent keeps records.** A record is written to be checked and searched, which makes it hard to read; the user's pages are written from it, in plain words, and say what waits for a decision. Both are files in the workspace, so the user needs nothing but the Reader tab. The cost is a second set of files, kept current by the memory command at every change.
 
 **A page never overwrites the user's file.** The pages sit where the user also keeps files, so a file without the memory command's marker is left alone and reported, never renamed or moved. The cost is a page that is missing until the user moves their file.
+
+**The logbook is the story, the record is the truth.** An entry says what was asked and what came out, in words a reader who missed the conversation can follow, and it is never edited, so it keeps what was said at the time. The record is where a result's standing lives: where an entry and the record disagree, as when a result the entry tells of was later superseded or withdrawn, the record's standing holds, and the result's page says so. The cost is an entry that can read out of date; a correction goes into a later entry.
 
 **Discipline, not security.** The agent can write the memory files by hand. The command is the easy path, and the user's accept is a chat message the agent acts on.
