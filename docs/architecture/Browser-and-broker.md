@@ -42,7 +42,7 @@ The left rail lists the projects, with four entries at its bottom.
 |---|---|---|
 | Projects rail | Always shown | Lists projects and opens their tabs; host CPU and memory, which open Host when clicked |
 | New Project | Floating window | Workflow cards to create a project; import an existing one |
-| Services | Tabs: Gitea, Repos, Fetch, Reviews, MCP, Aldine | The [Dev lane](Dev-lane.md): Gitea with its Enable, upgrade, admin password and Backup controls (backups in a dialog from its bar), repositories with the image builds of each, fetch commands, reviews and the reviewer's model; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring; the shared [Aldine](Aldine.md) editor. While Gitea is not running, only Gitea, MCP and Aldine show |
+| Services | Tabs: Gitea, Repos, Fetch, Reviews, MCP, Aldine | The [Dev lane](Dev-lane.md): Gitea with its Enable, upgrade, admin password and Backup controls (backups in a dialog from its bar), repositories with the image builds of each, fetch commands, reviews and the reviewer's model; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring; the shared [Aldine](Aldine.md) editor. While Gitea is not running, Repos and Fetch are hidden and Reviews says Gitea is off (its history still shows) |
 | Host | Tabs: Projects, Software, Ports, Defaults | Project table; agent, editor and image builds; pass-through ports; the default models of a new researcher-subagents project's referee, analyst and surveyor, and the task limit of each project container |
 | Settings | Floating window | Interface settings kept in the browser: themes, layout, zoom, terminal font |
 
@@ -170,6 +170,8 @@ Every normal operation is done in the browser. These host steps are not:
 The browser names these commands only where they apply: when the broker is unreachable, when the passwords do not match, in the reviewer warning, and in the backup dialog (the Backup button on Services → Gitea). Broker error messages follow the same rule, since they reach the browser unchanged.
 
 ## Design decisions
+
+**Pages are grouped by what they hold.** Services holds what runs once on the host and every project shares: Gitea and what flows through it, the MCP gateway, Aldine. Host holds the machine itself: the projects on it, the software, the ports and the defaults new projects start with. Anything done to one project sits on its sidebar row or in its ⚙ window, and Host → Projects acts only on a project the sidebar cannot show. The cost is that the project table is no longer a control panel: a stopped project is started from the sidebar's Stopped fold.
 
 **The sidebar never drops a project because of the project list.** A start or an update re-creates a project's container, so for a moment the list reports it missing or half-made. A running row therefore leaves the sidebar only when the page sees its own stop finish, and the list only fills the Stopped fold with cleanly stopped projects. The cost is that a project stopped from another tab or the host shell keeps a grey row until the next page load.
 
