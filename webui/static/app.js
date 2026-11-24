@@ -432,7 +432,7 @@ const state = {
                              // unlock, cleared on lock, NEVER persisted)
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
-    hostPage: null,          // "development" | "sandboxes" | null
+    hostPage: null,          // "services" | "host" | null
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
     workingModes: null,      // [{id, label, description, subagents}] from /broker/working-modes; null = unfetched or failed (workingModesError says why)
     workingModesError: "",
@@ -644,7 +644,7 @@ function readFetchAutoCommit() {
 
 // The ONE writer. Persists at once (best-effort, like the destroy prune) and
 // flips every OTHER card's box for the same repo that is on screen right now:
-// a repo can be on screen twice (the Development page and a project's Fetch
+// a repo can be on screen twice (the Services page and a project's Fetch
 // pane), each card copies from its own box, and two visible boxes must never
 // disagree about one saved preference. JS string compare over the stamped
 // attribute, never a CSS attribute-value selector (the data-rkey precedent).
@@ -662,7 +662,7 @@ async function setFetchAutoCommit(repo, on) {
 
 // ---- rs-fetch "Hide synced" tick (vault settings.fetch_hide_synced) ---------
 // One boolean for the whole browser, not per repo: it hides the in-sync cards
-// from both rs-fetch LISTS (the Development page's Fetch tab and a project's
+// from both rs-fetch LISTS (the Services page's Fetch tab and a project's
 // project-wide pane). Stored only when ON, so "absent" and "off" are the same
 // state. Same read/write split as the auto-commit list above: the read is a
 // tolerant NON-creating probe (it runs on every list render, and a render must
@@ -900,10 +900,10 @@ function renderSetup() {
     const card = el("div", { class: "card" }, [
         el("h2", {}, ["Set master password"]),
         el("p", {}, [
-            "One password for everything: it encrypts your saved supervisor credentials and logs you into Management. There is no recovery — if you forget it, you'll need to re-add each project.",
+            "One password for everything: it encrypts your saved supervisor credentials and signs you in to Host and Services. There is no recovery — if you forget it, you'll need to re-add each project.",
         ]),
         el("p", { class: "hint" }, [
-            "For Management, set the same password on the host with ",
+            "For Host and Services, set the same password on the host with ",
             el("code", {}, ["research broker passwd"]),
             " (at least 8 characters).",
         ]),
@@ -1076,7 +1076,7 @@ async function renderDashboard(opts = {}) {
     // proof, AWAITED before the sidebar sync — fired non-blocking, the sync
     // would race the session mint and silently no-op on first unlock. A down
     // broker or a password mismatch is tolerated (Management stays opt-in;
-    // the Sandboxes page surfaces the mismatch card when opened).
+    // the Host page surfaces the mismatch card when opened).
     // skipBrokerLogin: shell re-renders (mobile/desktop mode flip, Settings
     // Layout change) reuse the existing session cookie — re-firing the login
     // per flip would break the once-per-unlock contract below and, on a
@@ -1482,7 +1482,7 @@ async function syncSidebarFromBroker(prefetched, seq) {
 // ---- the rail's "Stopped" fold ------------------------------------------------
 // Projects whose container is cleanly stopped (`exited`, what Stop produces) sit
 // in a fold below the list, each with Start and its ⚙. Unusual container
-// states (paused, restarting, half-created) are not listed: Sandboxes shows and
+// states (paused, restarting, half-created) are not listed: Host → Projects shows and
 // handles those. The fold list is broker-derived and in memory only.
 let sidebarSyncSeq = 0;
 let sidebarSyncApplied = 0;
@@ -1737,13 +1737,13 @@ function openRailConfirm(holder, name, verb) {
     no.focus();
 }
 
-const RAIL_UNREACHABLE = "Sandboxes is not reachable right now.";
-const RAIL_SIGNED_OUT = "sign in again under Sandboxes, then retry.";
-const RAIL_REFUSED = "Sandboxes refused this page.";
+const RAIL_UNREACHABLE = "Host is not reachable right now.";
+const RAIL_SIGNED_OUT = "sign in again under Host, then retry.";
+const RAIL_REFUSED = "Host refused this page.";
 
 // Post the verb and hand the op to the lifecycle lane's watcher. Transport and
 // verb failures are told apart (a 200 {ok:false} is the broker's refusal,
-// anything else is Sandboxes being unreachable or refusing this page); each
+// anything else is Host being unreachable or refusing this page); each
 // posts one failed notice. The pending mark is cleared and the rail repainted
 // whatever happens, so no spinner outlives its request.
 async function railLifecycle(name, verb) {
@@ -1847,7 +1847,7 @@ function makeProjectRail() {
     const hostStats = makeHostStats();
     paintHostStats(hostStats);
     rail.appendChild(hostStats);
-    // New Project + Development + Sandboxes + Settings sit together at the BOTTOM of the rail —
+    // New Project + Services + Host + Settings sit together at the BOTTOM of the rail —
     // the host-side create + lifecycle + UI surfaces, distinct from the vault
     // bookmarks above.
     rail.appendChild(makeBottomNav());
@@ -1867,7 +1867,7 @@ function makeProjectRail() {
 // lives server-side. start/stop are confirm-gated (they recreate / interrupt
 // a supervisor — costly, deliberate).
 
-// The bottom rail nav: New Project / Development / Sandboxes / Settings, each
+// The bottom rail nav: New Project / Services / Host / Settings, each
 // on its OWN line (the .rail-nav-group stacks them vertically). The entry of
 // the open host page carries .active, derived HERE from state.hostPage: every
 // rail rebuild (create, destroy, a drag) re-creates this group, so a highlight
@@ -1885,10 +1885,10 @@ function makeBottomNav() {
     return el("div", { class: "rail-nav-group" }, [
         mk("workflows-entry", "newProject", "New Project",
            "New Project — pick a workflow, or import an existing project", openWorkflows),
-        mk("development-entry", "development", "Development",
-           "Development — dev repos, PRs, fetch commands (shared Gitea)", openDevelopment),
-        mk("sandboxes-entry", "management", "Sandboxes",
-           "Sandboxes — projects, infrastructure, software (broker)", openSandboxes),
+        mk("services-entry", "services", "Services",
+           "Services — Gitea, repos, fetch, reviews, MCP, Aldine", () => openServices()),
+        mk("host-entry", "host", "Host",
+           "Host — projects, software, ports, defaults", openHost),
         mk("settings-entry", "settings", "Settings", "Interface settings", openSettings),
     ]);
 }
@@ -1898,7 +1898,7 @@ function makeBottomNav() {
 // states (style.css .nav-icon). Settings is sliders, not a gear, so it cannot
 // be mistaken for a project row's ⚙.
 //
-// Icon geometry from Lucide (https://lucide.dev): folder-plus, git-branch,
+// Icon geometry from Lucide (https://lucide.dev): folder-plus, layers,
 // server, sliders-horizontal, lock.
 //   ISC License. Copyright (c) for portions of Lucide are held by Cole Bemis
 //   2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are
@@ -1938,10 +1938,10 @@ const NAV_ICON_SVG = (() => {
         newProject: svg(
             '<path d="M12 10v6"/><path d="M9 13h6"/>' +
             '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
-        development: svg(
-            '<line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/>' +
-            '<circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>'),
-        management: svg(
+        services: svg(
+            '<polygon points="12 2 2 7 12 12 22 7 12 2"/>' +
+            '<polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>'),
+        host: svg(
             '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/>' +
             '<rect width="20" height="8" x="2" y="14" rx="2" ry="2"/>' +
             '<line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>'),
@@ -1990,7 +1990,7 @@ function setMobileProjectsView(on) {
     if (!on) {
         const t = activeTerminal();
         if (t && t.fitAddon) {
-            // Sync-then-fit: the chip's leave-Settings route (closeSandboxes →
+            // Sync-then-fit: the chip's leave-Settings route (closeManagement →
             // drawer → close-without-switching) restores the area through
             // NEITHER applyColumnLayout NOR activateService, so this is the
             // third font-size application site — without it a font changed in
@@ -2220,7 +2220,7 @@ function mobileLandingService(name, visible, enabled) {
 // A host page hides the terminal area and reuses the single #management-view
 // pane; closeManagement (called by activateProject) reverses it. Two kinds:
 //
-//  * TABBED pages (HOST_PAGES: Development, Sandboxes) own the top strip while
+//  * TABBED pages (HOST_PAGES: Services, Host) own the top strip while
 //    open: #service-tabs gets .host-mode, which hides every project-strip child
 //    except the Projects toggle (CSS), and mountHostStrip appends a .host-strip
 //    — a chip naming the page plus one .host-tab per section. The project's
@@ -2239,30 +2239,119 @@ function mobileLandingService(name, visible, enabled) {
 // writes into a detached body instead of over what is on screen now. The body
 // carries __rsRender = renderHostPage, which is how a dialog's Done or a
 // sign-in landing re-renders "the page I am on" (rerenderView, renderMgmtLogin).
-let sandboxesActiveTab = "management";
+//
+// A page's `tabs` list holds [key, label] pairs and, between groups,
+// HOST_TAB_DIVIDER (a thin rule in the strip, never a tab). `shown(key)`
+// (optional) drops a tab from the strip; `landing` is the tab a page opens on
+// when nothing valid is remembered for it (hostTabRemembered).
+let servicesActiveTab = "gitea";
+let hostActiveTab = "projects";
+const HOST_TAB_DIVIDER = "divider";
+
+// The Services tabs that act on Gitea: the strip hides them while Gitea is not
+// running. Gitea itself (its bar enables it), MCP and Aldine always show.
+const SERVICES_GITEA_TABS = ["fetch", "repos", "images", "reviews", "backup"];
+// Whether Gitea runs, from the newest /broker/dev answer the Services page
+// read (noteServicesGitea): null until the first one, and then every tab shows,
+// so nothing disappears from the strip before anything is known.
+let servicesGiteaRunning = null;
 
 const HOST_PAGES = {
-    development: {
-        title: "Development",
+    services: {
+        title: "Services",
+        landing: "gitea",
         tabs: [["gitea", "Gitea"], ["fetch", "Fetch"], ["repos", "Repos"],
                ["images", "Images"], ["reviews", "Reviews"],
-               ["backup", "Backup"]],
-        get: () => devActiveTab,
-        set: (k) => { devActiveTab = k; },
+               ["backup", "Backup"], HOST_TAB_DIVIDER,
+               ["mcp", "MCP"], ["aldine", "Aldine"]],
+        shown: (k) => servicesGiteaRunning !== false || !SERVICES_GITEA_TABS.includes(k),
+        get: () => servicesActiveTab,
+        set: (k) => { servicesActiveTab = k; },
     },
-    sandboxes: {
-        title: "Sandboxes",
-        tabs: [["management", "Management"], ["infrastructure", "Infrastructure"],
-               ["software", "Software"], ["mcp", "MCP"]],
-        get: () => sandboxesActiveTab,
-        set: (k) => { sandboxesActiveTab = k; },
+    host: {
+        title: "Host",
+        landing: "projects",
+        tabs: [["projects", "Projects"], ["software", "Software"],
+               ["ports", "Ports"], ["defaults", "Defaults"]],
+        get: () => hostActiveTab,
+        set: (k) => { hostActiveTab = k; },
     },
 };
 
 function hostPageRenderer(page) {
-    if (page === "development") return renderDevelopmentInto;
-    if (page === "sandboxes") return renderSandboxesInto;
+    if (page === "services") return renderServicesInto;
+    if (page === "host") return renderHostInto;
     return null;
+}
+
+// The tab keys a page's strip shows now, in order (dividers left out).
+function hostTabKeys(pageKey) {
+    const page = HOST_PAGES[pageKey];
+    if (!page) return [];
+    return page.tabs.filter((t) => t !== HOST_TAB_DIVIDER).map(([k]) => k)
+        .filter((k) => !page.shown || page.shown(k));
+}
+
+// The last tab the operator picked on each page, kept in this browser
+// (localStorage, one key per page) so a page reopens where it was left. Every
+// access is guarded: storage can be missing or refuse (a private window,
+// blocked site data), and then a page simply opens on its landing tab.
+const HOST_TAB_STORAGE_PREFIX = "rs.hostTab.";
+
+function hostTabRemembered(pageKey) {
+    const page = HOST_PAGES[pageKey];
+    let saved = null;
+    try { saved = localStorage.getItem(HOST_TAB_STORAGE_PREFIX + pageKey); } catch (e) { saved = null; }
+    return saved && hostTabKeys(pageKey).includes(saved) ? saved : page.landing;
+}
+
+function hostTabRemember(pageKey, key) {
+    try { localStorage.setItem(HOST_TAB_STORAGE_PREFIX + pageKey, key); } catch (e) { /* not kept */ }
+}
+
+// Switch the open page to one of its tabs the way a strip click does: the
+// choice is remembered and the page renders afresh. In-page jumps (the Fetch
+// list's "N repos hidden" → Repos) go through here too.
+function selectHostTab(pageKey, key) {
+    const page = HOST_PAGES[pageKey];
+    if (!page) return undefined;
+    page.set(key);
+    hostTabRemember(pageKey, key);
+    if (state.hostPage !== pageKey) return undefined;
+    return renderHostPage();
+}
+
+// Record what a Services read learned about Gitea (`gitea` = the /broker/dev
+// result's gitea object). When that changes which tabs show, the strip is
+// rebuilt; when the tab on screen is one that no longer shows, the page moves
+// to Gitea and re-renders — the caller must then stop drawing (returns true).
+function noteServicesGitea(gitea) {
+    const running = !!(gitea && gitea.running);
+    const was = servicesGiteaRunning;
+    servicesGiteaRunning = running;
+    if (was === running || state.hostPage !== "services") return false;
+    if (!hostTabKeys("services").includes(servicesActiveTab)) {
+        servicesActiveTab = "gitea";
+        renderHostPage();
+        return true;
+    }
+    mountHostStrip();
+    return false;
+}
+
+// The one /broker/dev read Services makes for itself, when it opens on a tab
+// that does not read it (MCP, Aldine): it only settles which tabs the strip
+// shows. A failure changes nothing — the tabs on screen say what is wrong.
+async function servicesGiteaProbe() {
+    let gitea = null;
+    try {
+        const res = await fetch("/broker/dev");
+        if (res.ok) {
+            const b = await res.json();
+            if (b && b.ok && b.result) gitea = b.result.gitea || {};
+        }
+    } catch (e) { gitea = null; }
+    if (gitea) noteServicesGitea(gitea);
 }
 
 // The project-strip members the LEGACY pages hide inline (the divider is
@@ -2302,7 +2391,25 @@ function mountHostStrip() {
         if (!mobileModeActive()) return;
         mobileToggleProjects();
     };
-    const tabs = page.tabs.map(([key, label]) => {
+    const pageKey = state.hostPage;
+    const shown = hostTabKeys(pageKey);
+    // A divider is drawn only between two shown groups: never first, last or
+    // twice in a row once tabs are dropped. It is a plain rule, not a
+    // .host-tab or .tab, so nothing that walks the tabs ever counts it.
+    const items = [];
+    for (const t of page.tabs) {
+        if (t === HOST_TAB_DIVIDER) {
+            if (items.length && items[items.length - 1] !== HOST_TAB_DIVIDER) items.push(t);
+            continue;
+        }
+        if (shown.includes(t[0])) items.push(t);
+    }
+    while (items.length && items[items.length - 1] === HOST_TAB_DIVIDER) items.pop();
+    const tabs = items.map((t) => {
+        if (t === HOST_TAB_DIVIDER) {
+            return el("div", { class: "host-tab-divider", "aria-hidden": "true" });
+        }
+        const [key, label] = t;
         const tab = el("div", {
             class: "host-tab" + (page.get() === key ? " active" : ""),
             "data-host-tab": key,
@@ -2310,8 +2417,7 @@ function mountHostStrip() {
         tab.onclick = (ev) => {
             ev.stopPropagation();
             if (page.get() === key) return;
-            page.set(key);
-            renderHostPage();
+            selectHostTab(pageKey, key);
         };
         return tab;
     });
@@ -2380,16 +2486,26 @@ function rerenderView(view) {
 }
 
 // Clicking the already-open page's rail entry leaves it (temporary-tab feel).
-function openHostPage(page) {
+// The page opens on the tab it was left on in this browser (hostTabRemembered),
+// or on `tab` when a link elsewhere names one.
+function openHostPage(page, tab) {
     if (state.hostPage === page) return leaveHostView();
+    const cfg = HOST_PAGES[page];
+    if (cfg) cfg.set(tab && hostTabKeys(page).includes(tab) ? tab : hostTabRemembered(page));
     state.hostPage = page;
     const view = enterHostView();
     if (!view) return;
     setActiveNavEntry(page + "-entry");
     renderHostPage();
+    // MCP and Aldine do not read Gitea's state; one read settles which tabs
+    // the strip shows (the other tabs learn it from their own read).
+    if (page === "services" && !SERVICES_GITEA_TABS.includes(servicesActiveTab)
+            && servicesActiveTab !== "gitea") {
+        servicesGiteaProbe();
+    }
 }
 
-function openSandboxes() { openHostPage("sandboxes"); }
+function openHost(tab) { openHostPage("host", tab); }
 
 // ---- floating boxes: New Project, Settings and a project's ⚙ window ----------
 // A panel centred over whatever is open, on a dimmed backdrop; opening one
@@ -2478,28 +2594,31 @@ function leaveHostView() {
     }
 }
 
-// Sandboxes: the projects table (Management), the shared host state that is
-// not a project (Infrastructure: pass-through ports, Gitea, the reviewer), and
-// the software fleet (Software: dists, images, pins). The Management table's
-// read also syncs the rail and re-seeds the background-action watchers; the
-// other two tabs do not read the project list for themselves, so they run the
-// same session hooks here — once per entry, tab switch or sign-in landing.
-function renderSandboxesInto(view) {
-    if (state.hostPage === "sandboxes") mountHostStrip();
-    const tab = sandboxesActiveTab;
-    if (tab === "infrastructure" || tab === "software") {
-        // Infrastructure syncs the rail from the list it reads anyway.
-        if (tab === "software") syncSidebarFromBroker();
-        seedLifecycleFromBroker();
-        if (tab === "infrastructure") seedSoftwareFromBroker();   // Software seeds itself
-        return tab === "infrastructure" ? renderInfraInto(view) : renderSoftwareInto(view);
+// Host: the projects table (Projects), the software fleet (Software: dists,
+// images, pins), the pass-through ports (Ports) and the installation-wide
+// defaults new projects start with (Defaults). The Projects table's read also
+// syncs the rail and re-seeds the background-action watchers; the other tabs
+// do not read the project list for that, so they run the same session hooks
+// here — once per entry, tab switch or sign-in landing.
+function renderHostInto(view) {
+    if (state.hostPage === "host") mountHostStrip();
+    const tab = hostActiveTab;
+    if (tab === "software") {
+        syncSidebarFromBroker();
+        seedLifecycleFromBroker();   // Software seeds its own builds
+        return renderSoftwareInto(view);
     }
-    if (tab === "mcp") {
-        // Reads no project list for itself: the same session hooks as above.
+    if (tab === "ports") {
+        // Ports syncs the rail from the project list it reads anyway.
+        seedLifecycleFromBroker();
+        seedSoftwareFromBroker();
+        return renderPortsInto(view);
+    }
+    if (tab === "defaults") {
         syncSidebarFromBroker();
         seedLifecycleFromBroker();
         seedSoftwareFromBroker();
-        return renderMcpInto(view);
+        return renderDefaultsInto(view);
     }
     return renderManagementInto(view);
 }
@@ -2538,7 +2657,7 @@ function renderSettingsInto(view) {
     ]));
 }
 
-// Sandboxes → MCP: the shared MCP gateway and its server list. A server is an
+// Services → MCP: the shared MCP gateway and its server list. A server is an
 // address plus optional secret request headers; the page shows a secret's
 // NAME only and never receives its value back. Wiring a server to a project
 // or a box is not on this page yet. Every read is this page's own render or
@@ -2952,11 +3071,11 @@ function mcpWiringSection(view, servers, wiring) {
         if (t.workers && !t.workers_wirable) {
             lines.push("This project was made before its analysis workers could use "
                        + "the MCP gateway: Stop and Start it (after Rebuild all under "
-                       + "Sandboxes → Software) before wiring its workers.");
+                       + "Host → Software) before wiring its workers.");
         }
         if (t.boxes.length && !t.boxes_wirable) {
             lines.push("This project was made before boxes could reach the MCP gateway: "
-                       + "Stop and Start it (after Rebuild all under Sandboxes → Software) "
+                       + "Stop and Start it (after Rebuild all under Host → Software) "
                        + "before wiring its boxes.");
         }
         if (!options.length) lines.push("Nothing in this project can be wired.");
@@ -3113,7 +3232,7 @@ function renderMcpScreen(view, result, wiring) {
     view.appendChild(mcpWiringSection(view, servers, wiring));
 }
 
-// Sandboxes → Software — the host's agent/editor/reader/node dists, the built
+// Host → Software — the host's agent/editor/reader/node dists, the built
 // image fleet and the effective version pins (base + local override), via the
 // login-gated broker `software_status` read, with the pull/refresh/rebuild
 // lane. A 401 lands on the sign-in card, which comes back to this tab.
@@ -3157,7 +3276,7 @@ function renderSoftwareScreen(view, result) {
         payload: { verb: "rebuild" },
         body: [el("p", {}, ["Rebuild every image at the current effective pins — a long operation (often 10–15 min), one image at a time on the host. You can send it to the background and keep working; a notice reports when it ends."])],
     });
-    // The tab's name (Sandboxes → Software) is the strip; only the toolbar here.
+    // The tab's name (Host → Software) is the strip; only the toolbar here.
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("div", { class: "mgmt-toolbar" }, [refresh, rebuildBtn]),
     ]));
@@ -3569,11 +3688,21 @@ async function renderManagementInto(view) {
     seedSoftwareFromBroker();
 }
 
-// Sandboxes → Infrastructure: pass-through ports, then the shared services
-// (Gitea, the reviewer). The pass-through section names the projects a claim
-// can go to, so this tab reads the project list too — with the same
-// transport-vs-verb split as every host page.
-async function renderInfraInto(view) {
+// A host tab's toolbar row holding only a Refresh, which re-renders the page
+// the view belongs to (rerenderView — never this tab's renderer on a captured
+// element).
+function hostRefreshHeader(view) {
+    const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
+    refresh.onclick = () => rerenderView(view);
+    return el("div", { class: "mgmt-header" }, [
+        el("div", { class: "mgmt-toolbar" }, [refresh]),
+    ]);
+}
+
+// Host → Ports: the pass-through ports. The section names the projects a
+// claim can go to, so this tab reads the project list — with the same
+// transport-vs-verb split as every host page — and syncs the rail from it.
+async function renderPortsInto(view) {
     view.innerHTML = "";
     view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading…"]));
     // Numbered before the fetch, so a sidebar sync started later wins.
@@ -3584,27 +3713,81 @@ async function renderInfraInto(view) {
     } catch (e) {
         return renderMgmtUnavailable(view);
     }
-    if (res.status === 401) return renderMgmtLogin(view, view.__rsRender || renderInfraInto);
+    if (res.status === 401) return renderMgmtLogin(view, view.__rsRender || renderPortsInto);
     if (res.status === 403) return renderMgmtRejected(view);
     if (res.status === 503) return renderMgmtUnavailable(view);
     let body;
     try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
     if (!res.ok || !body.ok) {
-        return renderMgmtVerbError(view, body, renderInfraInto);
+        return renderMgmtVerbError(view, body, renderPortsInto);
     }
     view.innerHTML = "";
-    const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
-    refresh.onclick = () => renderInfraInto(view);
-    view.appendChild(el("div", { class: "mgmt-header" }, [
-        el("div", { class: "mgmt-toolbar" }, [refresh]),
-    ]));
-    // Pass-through ports ABOVE the shared services (PI decision). Both are
-    // async fire-and-forget with their static DOM appended synchronously, so
-    // the section order is deterministic regardless of fetch timing.
+    view.appendChild(hostRefreshHeader(view));
     appendPassthroughSection(view, body.result || []);
-    appendInfraSection(view);
-    appendSettingsSection(view);
     syncSidebarFromBroker(body.result || [], syncSeq);
+}
+
+// Host → Defaults: the installation-wide choices a project picks up when it is
+// created or next starts — the researcher-subagents models (referee, analyst,
+// surveyor) and the task limit. Every row is built synchronously before any
+// fetch, so the order never depends on fetch timing; each fills through its
+// own read, and a failed read is a quiet badge in its row (Refresh retries).
+function renderDefaultsInto(view) {
+    view.innerHTML = "";
+    view.appendChild(hostRefreshHeader(view));
+    view.appendChild(el("div", { class: "hint" }, [
+        "Defaults for this whole installation. Nothing running changes when you "
+        + "save one: new projects start with them, and the task limit reaches "
+        + "each project at its next start."]));
+    const rowFor = () => el("div", { class: "mgmt-row mgmt-infra-row" }, [
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
+    const refereeRow = rowFor();
+    const analystRow = rowFor();
+    const surveyorRow = rowFor();
+    view.appendChild(el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Researcher-subagents models"]),
+        el("div", { class: "mgmt-infra-sub" }, ["Referee"]),
+        refereeRow,
+        el("div", { class: "hint" }, [
+            "The referee checks a finding in a researcher-subagents project before you " +
+            "accept it. A new project of that type starts with this model; change an " +
+            "existing one in its ⚙ Agents box."]),
+        el("div", { class: "mgmt-infra-sub" }, ["Analyst"]),
+        analystRow,
+        el("div", { class: "hint" }, [
+            "The analyst carries out one analysis for the agent of a researcher-subagents " +
+            "project, in parallel with others. The default for new projects of that type; " +
+            "change an existing one in its ⚙ Agents box."]),
+        el("div", { class: "mgmt-infra-sub" }, ["Surveyor"]),
+        surveyorRow,
+        el("div", { class: "hint" }, [
+            "The surveyor answers one question from the web for the agent of a " +
+            "researcher-subagents project. The default for new projects of that type; " +
+            "change an existing one in its ⚙ Agents box."]),
+    ]));
+    appendDefaultModelRow(view, refereeRow, "referee", "Referee model");   // async, own fetch path
+    appendDefaultModelRow(view, analystRow, "analyst", "Analyst model");
+    appendDefaultModelRow(view, surveyorRow, "surveyor", "Surveyor model");
+    appendSettingsSection(view);
+}
+
+// Services → Aldine: the shared LaTeX editor's row (stamped with its
+// build-lane target, so paintSoftwareLabels shows a Turn on in flight —
+// started here, elsewhere or before a reload — in its status cell and keeps
+// its buttons off meanwhile) and what it is for.
+function renderAldineInto(view) {
+    view.innerHTML = "";
+    view.appendChild(hostRefreshHeader(view));
+    const aldineRow = el("div", { class: "mgmt-row mgmt-infra-row", "data-swtarget": "aldine" }, [
+        el("span", {}, ["Aldine"]),
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
+    view.appendChild(el("div", { class: "mgmt-infra" }, [
+        aldineRow,
+        el("div", { class: "hint" }, [ALDINE_HINT]),
+    ]));
+    fillAldineRow(view, aldineRow);   // async, own fetch path
 }
 
 function mgmtCard(view, children) {
@@ -3626,7 +3809,7 @@ async function renderMgmtLogin(view, onSuccess) {
     // No explicit landing: re-render the page this view belongs to (a host-page
     // body is stamped with its renderer), else the historical Management table.
     const route = onSuccess || (view && view.__rsRender) || renderManagementInto;
-    mgmtCard(view, [el("div", { class: "mgmt-loading" }, ["Connecting to Management…"])]);
+    mgmtCard(view, [el("div", { class: "mgmt-loading" }, ["Connecting to Host…"])]);
     let res = null;
     if (state.loginProof) {
         try {
@@ -3657,7 +3840,7 @@ async function renderMgmtLogin(view, onSuccess) {
         ]);
     }
     mgmtCard(view, [
-        el("h2", {}, ["Management login failed"]),
+        el("h2", {}, ["Host sign-in failed"]),
         msg,
         el("div", { class: "btn-row" }, [retry]),
     ]);
@@ -3665,11 +3848,11 @@ async function renderMgmtLogin(view, onSuccess) {
 
 function renderMgmtUnavailable(view) {
     mgmtCard(view, [
-        el("h2", {}, ["Management unavailable"]),
+        el("h2", {}, ["Host unavailable"]),
         el("p", {}, ["The broker isn’t reachable. Start it on the host:"]),
         el("pre", {}, ["research broker start"]),
         el("div", { class: "hint" }, [
-            "Management is opt-in; the rest of the webui is unaffected.",
+            "Host and Services are opt-in; the rest of the webui is unaffected.",
         ]),
     ]);
 }
@@ -3773,7 +3956,7 @@ function renderMgmtTable(view, projects) {
     // No Log-out control: under unified login the session model is "locked
     // vault = logged out" — Lock vault (rail footer) revokes the broker
     // session; a separate Management logout would just auto-re-login.
-    // The page's name is the strip chip (Sandboxes) and this tab's (Management),
+    // The page's name is the strip chip (Host) and this tab's (Projects),
     // so the header row carries only the toolbar.
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("div", { class: "mgmt-toolbar" }, [create, refresh, measure]),
@@ -3961,8 +4144,9 @@ function setTypeBadge(elm, label) {
     elm.textContent = label || "";
 }
 
-// ---- Development host page (STAGE_DEV_GITEA S3) ----------------------------
-// Three sub-tabs: "Gitea" (the gitea web UI on its own origin port, session
+// ---- Services host page (STAGE_DEV_GITEA S3) -------------------------------
+// The Gitea-backed sub-tabs: "Gitea" (Gitea's own controls in a bar, above the
+// gitea web UI on its own origin port, session
 // minted via the Management-anchored /broker/dev/gitea-session), "Fetch" (the
 // RS-rendered open-PR/branch list with click-to-copy rs-fetch commands, fed by
 // one /broker/dev read per open — Q6, no poller), "Repos" (the dev-lane
@@ -3978,17 +4162,21 @@ function setTypeBadge(elm, label) {
 // read touches no gitea at all, so the tab renders with gitea stopped and after
 // the last mirror is gone. Repos is the opposite case and belongs where it is:
 // it enumerates exactly those live mirrors, so it shares Fetch's read and its
-// gitea-running gate.
+// gitea-running gate. (While Gitea is not running the strip shows none of
+// these but Gitea — SERVICES_GITEA_TABS — so their own stopped cards are only
+// what a first read lands on before the page knows.)
+//
+// Past a divider, the shared services that are not Gitea: "MCP" (the MCP
+// gateway) and "Aldine" (the shared LaTeX editor).
 
-let devActiveTab = "gitea";
+// Open Services, on `tab` when given (a project pane's link to Gitea or Repos).
+function openServices(tab) { openHostPage("services", tab); }
 
-function openDevelopment() { openHostPage("development"); }
-
-// The Development sections, keyed like HOST_PAGES.development.tabs (the strip
+// The Gitea-backed sections, keyed like HOST_PAGES.services.tabs (the strip
 // tabs ARE the section switch). Gitea stays the landing section: the inventory
-// is a management surface, not the thing you open the page to do. In-page
-// jumps (`devActiveTab = "repos"; renderDevelopmentInto(view)`) and the 401
-// landings call this directly, so it also repaints the strip's highlight.
+// is a management surface, not the thing you open the page to do. The 401
+// landings call renderServicesInto directly, so it also repaints the strip's
+// highlight.
 const DEV_TAB_RENDER = {
     gitea: renderDevGiteaTab,
     fetch: renderDevFetchTab,
@@ -3998,12 +4186,38 @@ const DEV_TAB_RENDER = {
     backup: renderDevBackupTab,
 };
 
-function renderDevelopmentInto(view) {
-    if (state.hostPage === "development") mountHostStrip();
+function renderServicesInto(view) {
+    if (state.hostPage === "services") mountHostStrip();
+    const tab = servicesActiveTab;
+    if (tab === "mcp") {
+        // Reads no project list for itself: the Host tabs' session hooks.
+        syncSidebarFromBroker();
+        seedLifecycleFromBroker();
+        seedSoftwareFromBroker();
+        return renderMcpInto(view);
+    }
+    if (tab === "aldine") {
+        // Its row is a build-lane target: learn a Turn on running elsewhere.
+        seedSoftwareFromBroker();
+        return renderAldineInto(view);
+    }
     view.innerHTML = "";
+    if (tab === "reviews") {
+        // The review model above the review history. Its row fills through its
+        // own read and lands its own failures, so the history below never
+        // waits on it.
+        const reviewerRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
+            el("span", { class: "mgmt-loading" }, ["…"]),
+        ]);
+        view.appendChild(el("div", { class: "dev-reviewer-default" }, [
+            el("div", { class: "mgmt-infra-sub" }, ["Reviewer"]),
+            reviewerRow,
+        ]));
+        appendDefaultModelRow(view, reviewerRow, "reviewer", "Review model");
+    }
     const body = el("div", { class: "dev-body" });
     view.appendChild(body);
-    const render = DEV_TAB_RENDER[devActiveTab] || renderDevGiteaTab;
+    const render = DEV_TAB_RENDER[tab] || renderDevGiteaTab;
     render(view, body);
 }
 
@@ -4014,7 +4228,7 @@ function renderDevelopmentInto(view) {
 // makes that survivable.
 //
 // The panel shows the EXPORT'S OWN facts and nothing else. It deliberately does
-// not summarise what is inside: the Development page's repo counters filter to
+// not summarise what is inside: the Services page's repo counters filter to
 // the mirrors (not the consumer forks, which is where boards live) and count
 // only OPEN items, so any headline drawn from them would state a number
 // materially smaller than what the file actually holds.
@@ -4041,7 +4255,7 @@ async function renderDevBackupTab(view, body) {
         // 401/403/503 and a verb's refusal as HTTP 200 with {ok:false}. They must
         // not collapse into one error card — a 503 means the broker is
         // unreachable, which is a different remedy from a refused verb.
-        if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+        if (res.status === 401) return renderMgmtLogin(view, renderServicesInto);
         if (res.status === 403) return renderMgmtRejected(body);
         if (res.status === 503) return renderMgmtUnavailable(body);
     }
@@ -4070,6 +4284,8 @@ async function renderDevBackupTab(view, body) {
     // same read the Repos and Fetch tabs do. One level too high is SILENT:
     // undefined is falsy, so the tab reports gitea down while it is up.
     const gstate = dev.result.gitea || {};
+    // The strip shows the Gitea-backed tabs only while Gitea runs.
+    if (noteServicesGitea(gstate)) return;
     const running = !!gstate.running;
     // The artifact read is allowed to be absent without failing the page: it is
     // a relay like the one beside it, so an empty reading means "no backup"
@@ -4279,7 +4495,7 @@ async function renderDevReviewsTab(view, body) {
     try {
         res = await fetch("/broker/dev/reviews");
     } catch (e) { return renderMgmtUnavailable(body); }
-    if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (res.status === 401) return renderMgmtLogin(view, renderServicesInto);
     if (res.status === 403) return renderMgmtRejected(body);
     // _relay's 503 body is PARSEABLE JSON ({ok:false, broker_unavailable}) and
     // carries no message — peel it explicitly or the error card below renders
@@ -4358,6 +4574,8 @@ function devReviewHistoryRow(v) {
 }
 
 async function renderDevGiteaTab(view, body) {
+    // Sized to the page, so the web UI takes what the bar above it leaves.
+    body.classList.add("dev-gitea-body");
     body.innerHTML = "";
     body.appendChild(el("div", { class: "mgmt-loading" }, ["Opening Gitea…"]));
     // Gate on gitea RUNNING before minting a session / loading the iframe — a
@@ -4367,7 +4585,7 @@ async function renderDevGiteaTab(view, body) {
     try {
         devRes = await fetch("/broker/dev");
     } catch (e) { return renderMgmtUnavailable(body); }
-    if (devRes.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (devRes.status === 401) return renderMgmtLogin(view, renderServicesInto);
     if (devRes.status === 403) return renderMgmtRejected(body);
     // _relay's 503 body is PARSEABLE JSON ({ok:false, broker_unavailable}) —
     // without this peel a broker outage would fall through to the verb-error
@@ -4392,50 +4610,54 @@ async function renderDevGiteaTab(view, body) {
         return;
     }
     const gstate = dev.result.gitea || {};
-    if (gstate.upgrading || (gstate.upgrade && gstate.upgrade.phase !== "committed")) {
-        body.innerHTML = "";               // the "Opening Gitea…" line
-        devGiteaHeldNotice(body, gstate);
-        return;
+    // The strip shows the Gitea-backed tabs only while Gitea runs.
+    if (noteServicesGitea(gstate)) return;
+    // Gitea's own controls sit in a bar above the web UI in every state; the
+    // line under it says why the web UI is not there when it is not.
+    body.innerHTML = "";
+    body.appendChild(devGiteaBar(view, gstate));
+    const below = el("div", { class: "mgmt-loading" }, ["Opening Gitea…"]);
+    body.appendChild(below);
+    const say = (text, ...extra) => {
+        below.replaceWith(el("div", { class: "mgmt-empty" }, [el("span", {}, [text]), ...extra]));
+    };
+    const up = gstate.upgrade;
+    if (gstate.upgrading) {
+        return say("Gitea is being upgraded, put back or restored. Its web UI "
+                   + "opens here again when that finishes.");
+    }
+    if (up && up.phase === "damaged") {
+        return say("Gitea's upgrade record is damaged, so it is not safe to tell "
+                   + "which copy of Gitea's data is current. Its web UI opens here "
+                   + "again once the record is repaired.");
+    }
+    if (up && up.phase !== "committed") {
+        return say("An earlier Gitea upgrade or going back did not finish. Settle "
+                   + "it with Recover above to open the web UI.");
     }
     if (!gstate.running) {
-        body.innerHTML = "";
-        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
-        enable.onclick = () =>
-            devEnableGiteaDialog(view, () => renderDevGiteaTab(view, body));
-        body.appendChild(el("div", { class: "mgmt-empty" }, [
-            el("span", {}, [gstate.exists
-                ? "Gitea is stopped. Enable it to open the web UI. "
-                : "Gitea isn't enabled yet. Enable it under Sandboxes → " +
-                  "Infrastructure, or here: "]),
-            enable,
-        ]));
-        return;
+        return say(gstate.exists
+            ? "Gitea is stopped. Enable it above to open its web UI."
+            : "Gitea isn't enabled yet. Enable it above to open its web UI.");
     }
     let res;
     try {
         // /broker/-prefixed: the Management session cookie is Path=/broker.
         res = await fetch("/broker/dev/gitea-session", { method: "POST" });
     } catch (e) { return renderMgmtUnavailable(body); }
-    if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (res.status === 401) return renderMgmtLogin(view, renderServicesInto);
     if (res.status === 403) return renderMgmtRejected(body);
     let data;
     try { data = await res.json(); } catch (e) { data = {}; }
     if (!res.ok || !data.ok || !data.url) {
         // The running-gate above already passed, so this is a race (gitea
-        // stopped mid-flight) or a session hiccup — offer Enable + a retry,
+        // stopped mid-flight) or a session hiccup — offer a retry, which
+        // re-reads Gitea's state (the bar then offers Enable if it stopped),
         // never the stale "add a repo first" remedy.
-        body.innerHTML = "";
-        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
-        enable.onclick = () =>
-            devEnableGiteaDialog(view, () => renderDevGiteaTab(view, body));
         const retry = el("button", { class: "btn-small" }, ["Retry"]);
-        retry.onclick = () => renderDevGiteaTab(view, body);
-        body.appendChild(el("div", { class: "mgmt-empty" }, [
-            el("span", {}, ["Gitea isn't reachable right now. "]), enable, retry,
-        ]));
-        return;
+        retry.onclick = () => rerenderView(view);
+        return say("Gitea isn't reachable right now. ", retry);
     }
-    body.innerHTML = "";
     // clipboard-write delegation is what lets Gitea's native code-block copy
     // button work inside the cross-origin frame (Permissions-Policy features
     // whose default allowlist is 'self' are silently revoked otherwise).
@@ -4445,7 +4667,7 @@ async function renderDevGiteaTab(view, body) {
         allow: "fullscreen; clipboard-read; clipboard-write",
     });
     iframe.setAttribute("allowfullscreen", "");
-    body.appendChild(iframe);
+    below.replaceWith(iframe);
 }
 
 // Copied commands are pasted into a terminal, and some of their values come
@@ -4594,7 +4816,7 @@ function devVerdictBody(v, extraMeta) {
 // row → commits-panel → verdict-panel order), toggled thereafter via the
 // local ref, and stamped data-rkey-panel so a cell re-render can clear THIS
 // row's stale panel. The removal is scoped to the row's own sibling run,
-// never a document-wide query — the Development page and a per-project pane
+// never a document-wide query — the Services page and a per-project pane
 // showing the same repo carry colliding keys, and one surface must never
 // reach into the other's DOM; the initial build path (cell not yet in a row,
 // closest → null) needs no removal at all, the card wipe detaches old panels
@@ -5294,8 +5516,8 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
         // Only past that guard is data.result guaranteed non-null — reading
         // `running` above it would throw on exactly the verb-refusal path.
         if (data.result.running === false) {
-            fail("Gitea isn't running — start it from Sandboxes → "
-                 + "Infrastructure, then retry.", next);
+            fail("Gitea isn't running — start it under Services → "
+                 + "Gitea, then retry.", next);
             return;
         }
         // The cursor echo is a GUARD, not decoration: a broker running older
@@ -5383,14 +5605,14 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
 // (reviewing…, then the verdict) replaces that button.
 // `rerender` (optional) is the landing for the click-driven "done — refresh"
 // fallback and for dialogs opened from repainted cells (fires with view/body
-// intact): the Development page passes its Fetch-tab re-render, the
+// intact): the Services page passes its Fetch-tab re-render, the
 // per-project Fetch pane passes itself. Done itself never re-renders the page
 // — that would collapse every open commit list and drop its paging — it only
 // closes the box, resolving the cells first when a hard-killed op left them
 // unresolved. `onLogin` (optional) is the 401 POST-LOGIN landing and
 // must be VIEW-rooted — renderMgmtLogin wipes `view` (mgmtCard), detaching
 // any body-scoped target — so the scoped pane (where view === the pane
-// container) passes its own renderer and Development passes NOTHING (the
+// container) passes its own renderer and Services passes NOTHING (the
 // pre-slice Management landing). The two are deliberately distinct values.
 async function devReviewDialog(view, body, repo, sel, rerender, onLogin,
                                onAbort) {
@@ -5511,7 +5733,7 @@ async function renderDevFetchTab(view, body) {
     try {
         res = await fetch("/broker/dev");
     } catch (e) { return renderMgmtUnavailable(body); }
-    if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (res.status === 401) return renderMgmtLogin(view, renderServicesInto);
     if (res.status === 403) return renderMgmtRejected(body);
     if (res.status === 503) return renderMgmtUnavailable(body);
     let data;
@@ -5522,6 +5744,8 @@ async function renderDevFetchTab(view, body) {
                             [mgmtErrText(data) || "Could not load dev status."]));
         return;
     }
+    // The strip shows the Gitea-backed tabs only while Gitea runs.
+    if (noteServicesGitea(data.result.gitea)) return;
     renderDevFetchScreen(view, body, data.result);
 }
 
@@ -5622,14 +5846,13 @@ function renderDevFetchScreen(view, body, result) {
     for (const [, card] of pairs) body.appendChild(card);
     if (hidden) {
         body.appendChild(devHiddenLine(hidden, "Repos", () => {
-            devActiveTab = "repos";
-            renderDevelopmentInto(view);
+            selectHostTab("services", "repos");
         }));
     }
     body.appendChild(devFetchLegend());
 }
 
-// The 📋/▸/auto-commit legend — ONE copy shared by the Development page and
+// The 📋/▸/auto-commit legend — ONE copy shared by the Services page and
 // the project-wide (fetch-:all) pane so the two cannot drift; the per-repo
 // pane omits it deliberately (one card needs no legend).
 function devFetchLegend() {
@@ -5652,7 +5875,7 @@ function devFetchLegend() {
 // ---- rs-fetch visibility (the Repos tab's toggle, and the lists it filters) --
 //
 // A repo the operator has switched OFF is dropped from the rs-fetch LISTS — the
-// Development page's Fetch tab and a project's project-wide fetch pane. It is a
+// Services page's Fetch tab and a project's project-wide fetch pane. It is a
 // display setting and nothing more: the repo stays mirrored, its own per-repo
 // fetch tab still renders, and `rs-fetch <repo>` typed in a terminal is
 // unaffected (nothing in a container enumerates repos).
@@ -5666,9 +5889,9 @@ function devFetchVisible(repos) {
 // The "N repos hidden" footer. Never let a filtered list end silently — the
 // whole failure this guards against is a repo the operator cannot find and
 // cannot remember hiding. `onOpen` is the way back, and it differs per surface:
-// on the Development page it switches to the Repos tab (saying "Development →
+// on the Services page it switches to the Repos tab (saying "Services →
 // Repos" there would point at the page you are standing on); on a project's
-// pane it opens Development.
+// pane it opens Services on its Repos tab.
 function devHiddenLine(count, label, onOpen) {
     const open = el("button", { class: "btn-small" }, [label]);
     open.onclick = onOpen;
@@ -5774,7 +5997,7 @@ function devImageBytes(n) {
 }
 
 function devImagesShowing(body) {
-    return state.hostPage === "development" && devActiveTab === "images"
+    return state.hostPage === "services" && servicesActiveTab === "images"
         && body && body.isConnected;
 }
 
@@ -5785,7 +6008,7 @@ function devImagesShowing(body) {
 function devImagesRedraw(view, body) {
     if (devImagesShowing(body)) return renderDevImagesTab(view, body);
     const now = hostBody();
-    if (now && state.hostPage === "development" && devActiveTab === "images") {
+    if (now && state.hostPage === "services" && servicesActiveTab === "images") {
         return rerenderView(now);
     }
 }
@@ -5799,7 +6022,7 @@ async function renderDevImagesTab(view, body) {
                                         fetch("/broker/dev/image-active")]);
     } catch (e) { return renderMgmtUnavailable(body); }
     for (const r of [res, act]) {
-        if (r.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+        if (r.status === 401) return renderMgmtLogin(view, renderServicesInto);
         if (r.status === 403) return renderMgmtRejected(body);
         if (r.status === 503) return renderMgmtUnavailable(body);
     }
@@ -5818,6 +6041,8 @@ async function renderDevImagesTab(view, body) {
         ]));
         return;
     }
+    // The strip shows the Gitea-backed tabs only while Gitea runs.
+    if (noteServicesGitea(data.result.gitea)) return;
     // The broker's list is the truth about what is running; keep this page's
     // watcher flag for the builds it still names.
     const running = new Map();
@@ -6193,7 +6418,7 @@ async function renderDevReposTab(view, body) {
     try {
         res = await fetch("/broker/dev");
     } catch (e) { return renderMgmtUnavailable(body); }
-    if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (res.status === 401) return renderMgmtLogin(view, renderServicesInto);
     if (res.status === 403) return renderMgmtRejected(body);
     if (res.status === 503) return renderMgmtUnavailable(body);
     let data;
@@ -6209,6 +6434,8 @@ async function renderDevReposTab(view, body) {
         ]));
         return;
     }
+    // The strip shows the Gitea-backed tabs only while Gitea runs.
+    if (noteServicesGitea(data.result.gitea)) return;
     renderDevReposScreen(view, body, data.result);
 }
 
@@ -6431,7 +6658,7 @@ function devFetchToggle(view, body, r) {
             // Collapsing them into one that names only the session cause sends
             // an operator whose broker is down to re-login, which cannot help.
             if (res.status === 401) {
-                msg = "Management session expired — reload the page.";
+                msg = "Host session expired — reload the page.";
             } else if (res.status === 403) {
                 msg = "The broker rejected the webui.";
             } else if (res.status === 503) {
@@ -6512,11 +6739,11 @@ function devWorkedByProjects(names) {
     return [...new Set((Array.isArray(names) ? names : []).filter(Boolean))];
 }
 
-// Build ONE dev repo's card — shared by the Development Fetch tab (unscoped)
+// Build ONE dev repo's card — shared by the Services Fetch tab (unscoped)
 // and the per-project Fetch pane (scoped). view/body host the review dialog's
 // redirects and error cards (the host page, or the pane container — both work:
 // every render helper takes a bare element). opts:
-//   scoped   — hide the GLOBAL affordances: Remove (destructive, Development-
+//   scoped   — hide the GLOBAL affordances: Remove (destructive, Services-
 //              only) and the ≥2-fork dropdown (the Management-steered GLOBAL
 //              selector; steering from a pane would silently re-steer every
 //              consumer's rs-fetch/review reads) — the plain `fork:` badge
@@ -6535,7 +6762,7 @@ function devWorkedByProjects(names) {
 const DEV_PR_ROWS_SHOWN = 10;
 // Repos whose PR list the operator expanded. Session memory only (never the
 // vault): it keeps the list open across card re-renders (Sync, a fork change, a
-// review landing) until the page reloads. Keyed by repo — the Development page
+// review landing) until the page reloads. Keyed by repo — the Services page
 // and a project's pane showing the same repo share it.
 const devPrListExpanded = new Set();
 function buildDevRepoCard(view, body, r, attached, opts) {
@@ -6544,7 +6771,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     const rerender = (opts && opts.rerender)
         || (() => renderDevFetchTab(view, body));
     // The 401 post-login landing must be VIEW-rooted: renderMgmtLogin wipes
-    // `view` (mgmtCard), which on Development DETACHES `body` — so a
+    // `view` (mgmtCard), which on Services DETACHES `body` — so a
     // body-scoped rerender there would render into a dead node. The scoped
     // pane is its own view (view === body === the pane container), so its
     // rerender is safe; unscoped, undefined keeps the Management landing.
@@ -6644,7 +6871,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     // all, the PR/branch row copies) — never baked into a button at render,
     // so a copy can never contradict the tick. The box is stamped with its
     // repo so the writer can keep a second card for the same repo (the
-    // Development page and a project's pane) showing the same state.
+    // Services page and a project's pane) showing the same state.
     const acBox = el("input", { type: "checkbox", class: "dev-ac-check" });
     acBox.setAttribute("data-ac-repo", r.repo);
     acBox.checked = readFetchAutoCommit().includes(r.repo);
@@ -6885,11 +7112,11 @@ function buildDevRepoCard(view, body, r, attached, opts) {
 }
 
 // ---- Per-project Fetch panes (the `fetch-<repo>` and `fetch-:all` tabs) ----
-// The Development Fetch page's repo cards, rendered as a service pane off the
+// The Services Fetch tab's repo cards, rendered as a service pane off the
 // token-gated /broker/dev* relays. Two modes, ONE renderer:
 //   repo given  — the `fetch-<repo>` tab: that repo alone, off /broker/dev/
 //                 repo-status. Active-fork steered, so content is identical to
-//                 the Development page's card for it.
+//                 the Services page's card for it.
 //   repo null   — the `fetch-:all` tab of an rs-fetch-enabled project: EVERY
 //                 mirrored repo, off /broker/dev. All-mirrors because an
 //                 rs-fetch consumer can pull any mirror, and the mirror list is
@@ -6904,7 +7131,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
 // — see the filter below.
 //
 // Both modes are SCOPED: the global affordances (Remove, the ≥2-fork dropdown,
-// Enable Gitea's tailed op) stay on the Development page — steering the active
+// Enable Gitea's tailed op) stay on the Services page — steering the active
 // fork from a project pane would silently re-steer every other consumer's
 // rs-fetch and review reads — and the pane links there instead. The
 // transport-vs-verb ladder mirrors renderDevFetchTab, rendering into the pane
@@ -6960,13 +7187,13 @@ async function renderProjectFetchPane(container, repo) {
     if (devGiteaHeldNotice(container, gitea)) return;
     if (!gitea.exists || !gitea.running) {
         const openDev = el("button", { class: "btn-small" },
-                           ["Open Development"]);
-        openDev.onclick = () => openDevelopment();
+                           ["Open Services"]);
+        openDev.onclick = () => openServices("gitea");
         container.appendChild(el("div", { class: "mgmt-empty" }, [
             el("span", {}, [gitea.exists
-                ? "Gitea is stopped. Enable it from the Development page. "
-                : "The dev lane isn't enabled yet. Enable it from the "
-                  + "Development page. "]),
+                ? "Gitea is stopped. Enable it under Services → Gitea. "
+                : "The dev lane isn't enabled yet. Enable it under "
+                  + "Services → Gitea. "]),
             openDev,
         ]));
         return;
@@ -6988,7 +7215,7 @@ async function renderProjectFetchPane(container, repo) {
             [`No status for ${repo} — was the repo removed?`]));
         return;
     }
-    // Same ordering rule as the Development page: filter AFTER the empty gate
+    // Same ordering rule as the Services page: filter AFTER the empty gate
     // above, and only in all-repos mode — the per-repo `fetch-<repo>` tab was
     // opened by name, so it never hides its one repo.
     const visible = all ? devFetchVisible(rows) : rows;
@@ -7018,13 +7245,13 @@ async function renderProjectFetchPane(container, repo) {
     for (const [, card] of pairs) container.appendChild(card);
     // Reviewer-token state beside the cards' Review affordances (both Fetch
     // surfaces; same silent degradation on a missing field). Placed AFTER the
-    // cards so the two project panes read identically; the Development page
+    // cards so the two project panes read identically; the Services page
     // keeps its own placement above them.
     const revLine = devReviewerLine(result.reviewer);
     if (revLine) container.appendChild(revLine);
     if (hiddenCount) {
-        container.appendChild(devHiddenLine(hiddenCount, "Open Development",
-                                            () => openDevelopment()));
+        container.appendChild(devHiddenLine(hiddenCount, "Open Services",
+                                            () => openServices("repos")));
     }
     // The shared legend — worth carrying only where there are many cards and
     // the 📋/▸/auto-commit affordances need naming (the per-repo pane omits it).
@@ -7163,85 +7390,16 @@ function devRepoRemoveDialog(view, body, repo) {
     });
 }
 
-// Sandboxes → Infrastructure: shared host state that isn't a project, in two
-// sub-groups — "Development" (the shared gitea dev lane) and "Reviewer" (the
-// sandboxed reviewer's model/effort default). ALL static DOM (both sub-headers
-// and both rows) is built synchronously BEFORE any await: the gitea fill below
-// early-returns on unknown/not-enabled, and the reviewer control is
-// gitea-independent — building it before the ladder is what keeps a gitea
-// hiccup from vanishing the reviewer row (DOM order stays gitea-first; the
-// reviewer row fills through its own async path).
-async function appendInfraSection(view) {
-    const row = el("div", { class: "mgmt-row mgmt-infra-row" }, [
+// Services → Gitea: the bar above the web UI with Gitea's own controls —
+// its state and version, Enable, Set Gitea password, Upgrade / Go back /
+// Discard previous version, Recover after an interrupted upgrade. Built from
+// the gitea object of the tab's own /broker/dev read (`g`); every dialog's
+// Done re-renders the page the bar is on (rerenderView), which re-reads
+// Gitea's state and so also updates which Services tabs the strip shows.
+function devGiteaBar(view, g) {
+    const row = el("div", { class: "mgmt-row mgmt-infra-row dev-gitea-bar" }, [
         el("span", {}, ["Gitea (dev lane)"]),
-        el("span", { class: "mgmt-loading" }, ["…"]),
     ]);
-    const reviewerRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
-        el("span", { class: "mgmt-loading" }, ["…"]),
-    ]);
-    const refereeRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
-        el("span", { class: "mgmt-loading" }, ["…"]),
-    ]);
-    const analystRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
-        el("span", { class: "mgmt-loading" }, ["…"]),
-    ]);
-    const surveyorRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
-        el("span", { class: "mgmt-loading" }, ["…"]),
-    ]);
-    // Stamped with its build-lane target: paintSoftwareLabels shows a Turn on
-    // in flight (started here, elsewhere, or before a reload) in its status
-    // cell and keeps its buttons off meanwhile.
-    const aldineRow = el("div", { class: "mgmt-row mgmt-infra-row", "data-swtarget": "aldine" }, [
-        el("span", {}, ["Aldine"]),
-        el("span", { class: "mgmt-loading" }, ["…"]),
-    ]);
-    view.appendChild(el("div", { class: "mgmt-infra" }, [
-        el("h3", { class: "mgmt-infra-title" }, ["Shared services"]),
-        el("div", { class: "mgmt-infra-sub" }, ["Development"]),
-        row,
-        el("div", { class: "mgmt-infra-sub" }, ["LaTeX editor"]),
-        aldineRow,
-        el("div", { class: "hint" }, [ALDINE_HINT]),
-        el("div", { class: "mgmt-infra-sub" }, ["Reviewer"]),
-        reviewerRow,
-        el("div", { class: "mgmt-infra-sub" }, ["Referee"]),
-        refereeRow,
-        el("div", { class: "hint" }, [
-            "The referee checks a finding in a researcher-subagents project before you " +
-            "accept it. A new project of that type starts with this model; change an " +
-            "existing one in its ⚙ Agents box."]),
-        el("div", { class: "mgmt-infra-sub" }, ["Analyst"]),
-        analystRow,
-        el("div", { class: "hint" }, [
-            "The analyst carries out one analysis for the agent of a researcher-subagents " +
-            "project, in parallel with others. The default for new projects of that type; " +
-            "change an existing one in its ⚙ Agents box."]),
-        el("div", { class: "mgmt-infra-sub" }, ["Surveyor"]),
-        surveyorRow,
-        el("div", { class: "hint" }, [
-            "The surveyor answers one question from the web for the agent of a " +
-            "researcher-subagents project. The default for new projects of that type; " +
-            "change an existing one in its ⚙ Agents box."]),
-    ]));
-    appendDefaultModelRow(view, reviewerRow, "reviewer", "Review model");   // async, own fetch path
-    appendDefaultModelRow(view, refereeRow, "referee", "Referee model");
-    appendDefaultModelRow(view, analystRow, "analyst", "Analyst model");
-    appendDefaultModelRow(view, surveyorRow, "surveyor", "Surveyor model");
-    fillAldineRow(view, aldineRow);   // async, own fetch path
-    let g = null;
-    try {
-        const res = await fetch("/broker/dev");
-        if (res.ok) {
-            const b = await res.json();
-            if (b.ok && b.result) g = b.result.gitea || null;
-        }
-    } catch (e) { /* leave the unknown badge */ }
-    row.innerHTML = "";
-    row.appendChild(el("span", {}, ["Gitea (dev lane)"]));
-    if (!g) {
-        row.appendChild(el("span", { class: "type-badge" }, ["unknown"]));
-        return;
-    }
     const enableBtn = () => {
         const b = el("button", { class: "btn-small" }, ["Enable Gitea"]);
         b.onclick = () =>
@@ -7255,7 +7413,7 @@ async function appendInfraSection(view) {
     if (g.upgrading) {
         row.appendChild(el("span", { class: "type-badge" },
                            ["being upgraded, put back or restored…"]));
-        return;
+        return row;
     }
     // An upgrade cut off before the new version proved itself, or going back
     // cut off part way: Enable finishes either by putting the previous version
@@ -7276,12 +7434,12 @@ async function appendInfraSection(view) {
             rec.onclick = () => devEnableGiteaDialog(view, rerender);
             row.appendChild(rec);
         }
-        return;
+        return row;
     }
     if (!g.exists) {
         row.appendChild(el("span", { class: "type-badge" }, ["not enabled"]));
         row.appendChild(enableBtn());
-        return;
+        return row;
     }
     row.appendChild(el("span",
                        { class: g.running ? "state-running" : "state-stopped" },
@@ -7309,9 +7467,10 @@ async function appendInfraSection(view) {
         upBtn.onclick = () => devGiteaUpgradeDialog(view, g, rerender);
         row.appendChild(upBtn);
     }
+    return row;
 }
 
-// ---- the shared Aldine LaTeX editor (Sandboxes → Infrastructure) ----------
+// ---- the shared Aldine LaTeX editor (Services → Aldine) -------------------
 // One Aldine for the whole installation. Turn on is a background build-lane
 // action (the first one downloads its images, a few GB) tailed like a
 // Software build; Turn off is a plain confirm; Open opens it in a new browser
@@ -7319,7 +7478,7 @@ async function appendInfraSection(view) {
 const ALDINE_ON_TITLE = "Turning Aldine on";
 const ALDINE_HINT =
     "A shared LaTeX editor for every project's papers. Agents get it as the MCP " +
-    "server aldine: tick aldine for them under Sandboxes → MCP. A project whose " +
+    "server aldine: tick aldine for them under Services → MCP. A project whose " +
     "agent has it also gets an Aldine tab.";
 // The gateway entry's state, when it is not the normal "listed".
 const ALDINE_ENTRY_TEXT = {
@@ -7404,7 +7563,7 @@ async function fillAldineRow(view, row) {
     } catch (e) { res = null; }
     if (!row.isConnected) return;
     if (res && res.status === 401) {
-        return renderMgmtLogin(view, view.__rsRender || renderInfraInto);
+        return renderMgmtLogin(view, view.__rsRender || renderAldineInto);
     }
     if (!res || res.status !== 200 || !body) {
         row.replaceChildren(el("span", {}, ["Aldine"]),
@@ -7428,7 +7587,7 @@ async function aldineTurnOn(view, btn, errEl) {
     errEl.textContent = "";
     btn.disabled = true;
     const { status, body } = await mcpPost("/broker/software/build", { verb: "aldine_on" });
-    const landing = view.__rsRender || renderInfraInto;
+    const landing = view.__rsRender || renderAldineInto;
     const redirect = mgmtStatusRedirect(view, status, landing);
     if (redirect) return redirect();
     if (status !== 200 || !body.ok || !body.op_id) {
@@ -7454,7 +7613,7 @@ async function aldineOpen(view, errEl) {
     const r = await sharedOriginSession(SHARED_ORIGINS.aldine);
     if (r.status === 401) {
         if (w) w.close();
-        return renderMgmtLogin(view, view.__rsRender || renderInfraInto);
+        return renderMgmtLogin(view, view.__rsRender || renderAldineInto);
     }
     if (!r.url) {
         if (w) w.close();
@@ -7481,10 +7640,9 @@ function devVersionOlder(a, b) {
     return false;
 }
 
-// Sandboxes → Infrastructure → Settings: host-wide choices that are not a
-// service — today the task cap every project container gets (threads and
-// processes together). The section's static DOM is appended synchronously,
-// like the sections above it, so the page order never depends on fetch
+// Host → Defaults → Task limit: the task cap every project container gets
+// (threads and processes together). The section's static DOM is appended
+// synchronously, like the rows above it, so the page order never depends on fetch
 // timing; the row then fills from GET /broker/settings. A read failure is a
 // quiet badge in the row (the page's Refresh retries), never a page card.
 const SETTINGS_PIDS_LABEL = "Task limit per project container";
@@ -7495,7 +7653,7 @@ async function appendSettingsSection(view) {
         el("span", { class: "mgmt-loading" }, ["…"]),
     ]);
     view.appendChild(el("div", { class: "mgmt-infra" }, [
-        el("h3", { class: "mgmt-infra-title" }, ["Settings"]),
+        el("h3", { class: "mgmt-infra-title" }, ["Task limit"]),
         row,
         el("div", { class: "mgmt-settings-hint" }, [
             "Threads and processes together, per project. Saving changes "
@@ -7600,17 +7758,18 @@ function fillSettingsRow(view, row, settings, notice) {
     row.replaceChildren(...children);
 }
 
-// One installation-wide model/effort DEFAULT row of the Infrastructure
-// section, for a type no project dialog sets: `reviewer` (review_pr resolves
+// One installation-wide model/effort DEFAULT row (Services → Reviews,
+// Host → Defaults), for a type no project dialog sets: `reviewer` (review_pr resolves
 // it live at each run, so Apply takes effect on the very next review) and
 // `referee` (a finding's referee in researcher-subagents projects: the next
 // such project created starts with it; an existing one keeps its own, changed
 // in its ⚙ Agents box). Apply writes the pair into the operator's untracked
 // override via the token-gated model_default_set verb; Reset clears the
-// override key back to the tracked base. `view` is the Sandboxes page root
+// override key back to the tracked base. `view` is the host page's body
 // (the 401/403/503 ladders land there); `rowEl` is the pre-built row this
-// fills (created before appendInfraSection's gitea await — see the D-placement
-// note there); `ctype` the catalog type, `caption` the row's label.
+// fills (built synchronously with the rest of the tab, so the order on the
+// page never depends on fetch timing); `ctype` the catalog type, `caption`
+// the row's label.
 async function appendDefaultModelRow(view, rowEl, ctype, caption) {
     const cat = await ensureModelCatalog();
     rowEl.innerHTML = "";
@@ -7818,8 +7977,8 @@ const OP_CHECKLISTS = {
 
 // The deliberate "Enable Gitea" flow (STAGE_DEV_GITEA webui-first A): a tailed
 // op (dev_gitea_start ∈ PROGRESS_VERBS) that CREATES gitea from nothing or
-// resumes a stopped one. Shared by the Development Gitea tab, the Fetch tab's
-// stopped branch, and Sandboxes → Infrastructure. onDone(ok) re-renders the
+// resumes a stopped one. Shared by the Services Gitea bar, and the Fetch and
+// Backup tabs' stopped branches. onDone(ok) re-renders the
 // caller's surface against the now-running gitea.
 function devEnableGiteaDialog(view, onDone) {
     mgmtConfirmThenTail(view, {
@@ -7836,8 +7995,8 @@ function devEnableGiteaDialog(view, onDone) {
     });
 }
 
-// Upgrade the shared Gitea to the release this software ships (Sandboxes →
-// Infrastructure). A detached broker op (the dev lane), so it tails the build
+// Upgrade the shared Gitea to the release this software ships (Services →
+// Gitea). A detached broker op (the dev lane), so it tails the build
 // log terminal-first like a dev box. Step-up: the master password is retyped
 // and derived client-side; the backup passphrase rides the body to the broker
 // and on to the child's stdin, never a log.
@@ -8025,14 +8184,14 @@ function devGiteaHeldNotice(container, gitea) {
             + "record is repaired.";
     } else if (up && up.phase !== "committed") {
         text = "An earlier Gitea upgrade or going back did not finish. Settle it "
-            + "under Sandboxes → Infrastructure first.";
+            + "under Services → Gitea first.";
     }
     if (!text) return false;
     container.appendChild(el("div", { class: "mgmt-empty" }, [el("span", {}, [text])]));
     return true;
 }
 
-// Set the sandbox-admin gitea password (Sandboxes → Infrastructure). Step-up:
+// Set the sandbox-admin gitea password (Services → Gitea). Step-up:
 // retyped master password → client-side derivation, the proof rides the body
 // (the destroy mold). The NEW gitea password is a SEPARATE secret by design —
 // never the master password (gitea would become a second, weaker verifier of
@@ -8050,7 +8209,7 @@ function devGiteaPasswdDialog(view, onDone) {
         body: [
             el("p", {}, [
                 "Sets the sandbox-admin password — your interactive Gitea " +
-                "sign-in (the Development page's Gitea tab, git over http). " +
+                "sign-in (the Services page's Gitea tab, git over http). " +
                 "A separate secret from your master password, on purpose.",
             ]),
             el("div", { class: "field" }, [
@@ -8448,7 +8607,7 @@ function lifecycleFinish(project, opId, outcome, background) {
     syncSidebarFromBroker().then(() => {
         if (state.vault && stoppedFoldChanged()) refreshProjectRail();
     });
-    if (background && state.hostPage === "sandboxes" && sandboxesActiveTab === "management"
+    if (background && state.hostPage === "host" && hostActiveTab === "projects"
             && !document.querySelector(".modal-backdrop")) {
         const view = hostBody();
         if (view && !mgmtViewHoldsInput(view)) renderManagementInto(view);
@@ -8489,8 +8648,8 @@ async function lifecycleWatch(project) {
             entry.stallNoticed = true;
             const verb = entry.verb;
             showOpNotice(res.auth === 401
-                ? `${project}: sign in again under Sandboxes to see how the ${verb} ends`
-                : `${project}: Sandboxes refused this page, so the ${verb} can't be followed here`,
+                ? `${project}: sign in again under Host to see how the ${verb} ends`
+                : `${project}: Host refused this page, so the ${verb} can't be followed here`,
                 false, () => {});
         }
         return;
@@ -8917,16 +9076,16 @@ function paintSoftwareLabels() {
     }
 }
 
-// The Software tab's body, when it is on screen (Sandboxes → Software).
+// The Software tab's body, when it is on screen (Host → Software).
 function softwareView() {
-    if (state.hostPage !== "sandboxes" || sandboxesActiveTab !== "software") return null;
+    if (state.hostPage !== "host" || hostActiveTab !== "software") return null;
     return hostBody();
 }
 
-// The Infrastructure tab's body, when it is on screen (its Aldine row is the
-// one build-lane target that lives there).
-function infraView() {
-    if (state.hostPage !== "sandboxes" || sandboxesActiveTab !== "infrastructure") return null;
+// The Aldine tab's body, when it is on screen (its Aldine row is the one
+// build-lane target outside Host → Software).
+function aldineView() {
+    if (state.hostPage !== "services" || servicesActiveTab !== "aldine") return null;
     return hostBody();
 }
 
@@ -8984,7 +9143,7 @@ function softwareFinish(target, opId, outcome, background) {
     showOpNotice(softwareNoticeText(entry, target, outcome), outcome.ok,
                  () => softwareReplay(opId, softwareTitle(entry.verb, target)));
     const aldine = target === "aldine";
-    const view = aldine ? infraView() : softwareView();
+    const view = aldine ? aldineView() : softwareView();
     if (view && !document.querySelector(".modal-backdrop") && !mgmtViewHoldsInput(view)) {
         if (aldine) rerenderView(view); else renderSoftwareInto(view);
     }
@@ -9088,7 +9247,7 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
     doneBtn.onclick = () => {
         if (doneBtn.disabled) return;
         backdrop.remove();
-        // Default: the Sandboxes → Software tab (the original build-lane caller); the dev
+        // Default: the Host → Software tab (the original build-lane caller); the dev
         // review dialog passes a close that leaves the page as it is.
         if (onDone) onDone(); else renderSoftwareInto(view);
     };
@@ -9665,7 +9824,7 @@ const MODEL_PICKER_SPECS = [
 // A researcher-subagents project's helper roles and its finding referee, in the
 // order the create dialog shows them after Agent. They render only for a
 // manifest with `subagents: true` (elsewhere the backend refuses the fields),
-// each prefilled from its installation default (Sandboxes → Infrastructure).
+// each prefilled from its installation default (Host → Defaults).
 const SUBAGENT_PICKER_SPECS = [
     ["analyst", "Analyst", "Carries out one analysis for the agent, in parallel with others."],
     ["surveyor", "Surveyor", "Answers one question from the web for the agent."],
@@ -10100,7 +10259,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         title: "Wire this box to fetch dev-lane agent commits: rs-fetch " +
                "stages agent work from the shared Gitea into a git clone in " +
                "this box. Read-only — no write access to Gitea, no access " +
-               "to dev containers. Needs Gitea enabled (Sandboxes page).",
+               "to dev containers. Needs Gitea enabled (Services → Gitea).",
     }, [el("span", { class: "box-opt-name" }, ["rs-fetch"])]);
     fetchCard.onclick = () => {
         if (fetchCard.classList.contains("disabled")) return;
@@ -10375,7 +10534,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             agentPanels[n].style.display = n === activeAgentTab ? "" : "none";
         });
         agentsHint.textContent = !stagedAgents.length
-            ? "No agents available yet — pull one under Sandboxes → Software."
+            ? "No agents available yet — pull one under Host → Software."
             : on.length ? ""
             : isDev ? "A dev project needs at least one agent."
             : isResearcher ? "A researcher project is its research agent: tick Claude or pi."
@@ -10898,13 +11057,13 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         // the dialog has shown the outcome, and a dev create's tail cannot tell
         // success from failure here. On success, surface the new (running)
         // project in the sidebar — JIT-fetch its creds the same way Attach does,
-        // then refresh the rail — and the Sandboxes table when it is on screen.
+        // then refresh the rail — and the Host → Projects table when it is on screen.
         onDone: async (ok) => {
             if (floatBox && floatBox.backdrop.contains(view)) closeFloatBox();
             if (!ok) return;
             if (await attachIntoVault(nameI.value.trim())) refreshProjectRail();
             const table = hostBody();
-            if (table && state.hostPage === "sandboxes" && sandboxesActiveTab === "management"
+            if (table && state.hostPage === "host" && hostActiveTab === "projects"
                     && !mgmtViewHoldsInput(table)) {
                 renderManagementInto(table);
             }
@@ -12247,7 +12406,7 @@ function makeProjectRow(project) {
     const bell = el("span", { class: "activity-bell" });
     const line = [typeBadge, bell, activity];
     if (flight) line.push(el("span", { class: "project-inflight" }, [flight]));
-    // Stop, before the ⚙ — only on rows Sandboxes runs (_jit). A bookmark (a
+    // Stop, before the ⚙ — only on rows Host → Projects runs (_jit). A bookmark (a
     // box entered by hand) has no lifecycle here, so it keeps the lone ⚙.
     if (project._jit) line.push(makeRailPowerButton(project.name));
     line.push(configBtn);
@@ -12255,7 +12414,7 @@ function makeProjectRow(project) {
     // .active is stamped here so a rail rebuild (a drop, a create, a destroy)
     // keeps the "you are here" highlight — refreshProjectRail replaces the
     // whole <aside> and never re-activates. Gated on no host page being open:
-    // entering Management / Workflows / Development / Settings deliberately
+    // entering a host page (Services, Host) deliberately
     // clears the rail highlight while LEAVING state.activeProject set (it is
     // what leaveHostView reads to come back), and create/destroy both rebuild
     // the rail from inside those pages — an ungated stamp would paint the
@@ -12313,7 +12472,8 @@ function scheduleServicesRefresh() {
 // jiffies that passed between THIS page's oldest sample of the last minute
 // and its newest — a true one-minute average, so a single busy tick does not
 // make the bar jump. No data (locked, no session, unreadable /proc) = the
-// block is hidden — never a placeholder or a hint.
+// block is hidden — never a placeholder or a hint. A click on the block opens
+// the Host page (it stays open when it already is: the bars are not a toggle).
 
 function makeHostStats() {
     const bar = (key, label, title) => el("div", { class: "host-stat-bar", "data-stat": key, title }, [
@@ -12321,12 +12481,17 @@ function makeHostStats() {
         el("span", { class: "host-stat-label" }, [label]),
         el("span", { class: "host-stat-text" }),
     ]);
-    return el("div", { class: "host-stats" }, [
-        bar("cpu", "CPU:", "Host CPU in use, averaged over the last minute"),
-        bar("ram", "RAM:", "Host memory in use / total"),
+    const block = el("div", { class: "host-stats", title: "Open Host" }, [
+        bar("cpu", "CPU:", "Host CPU in use, averaged over the last minute — click to open Host"),
+        bar("ram", "RAM:", "Host memory in use / total — click to open Host"),
         el("div", { class: "host-stat-note", "data-stat": "stale", hidden: "" },
             ["The broker is running older code than is installed on the host — restart the broker to load it."]),
     ]);
+    block.onclick = (ev) => {
+        ev.stopPropagation();
+        if (state.hostPage !== "host") openHost();
+    };
+    return block;
 }
 
 // Paint one stats block from state.hostStats. Takes the node rather than
@@ -13251,8 +13416,8 @@ function makeLayoutSelector() {
 
 function openAddProjectModal() {
     // No import-string paste box: its only filler was the output of a host CLI
-    // command. A project on this sandbox attaches with one click (Sandboxes →
-    // Attach, which pulls the SSH coordinates from the broker); an external box
+    // command. A project on this sandbox attaches with one click (Host →
+    // Projects → Attach, which pulls the SSH coordinates from the broker); an external box
     // is entered by hand below. Neither needs a shell.
     const nameI = el("input", { type: "text" });
     const hostI = el("input", { type: "text" });
@@ -13297,7 +13462,7 @@ function openAddProjectModal() {
     const card = el("div", { class: "card" }, [
         el("h2", {}, ["Import project"]),
         el("div", { class: "hint" }, [
-            "For a project on this sandbox, use Attach under Sandboxes → Management — it "
+            "For a project on this sandbox, use Attach under Host → Projects — it "
             + "fetches the coordinates for you. This form is for a box you run "
             + "elsewhere.",
         ]),
@@ -14743,7 +14908,7 @@ function agentsUpdateHint(local, deployed, hasBoxes) {
 }
 
 // The Update dialog behind the Agents section: names the cached versions it will
-// deploy (the Sandboxes → Software tab's own data, flagging a row that reads stale), says
+// deploy (the Host → Software tab's own data, flagging a row that reads stale), says
 // what an update does and does not touch, and runs `agents_update` on the
 // lifecycle lane (its op log names each box refreshed or not).
 async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, local) {
@@ -14757,7 +14922,7 @@ async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, local) {
         el("li", {}, [
             r.agent + " " + (r.cached_version || "?"),
             r.matches_pin ? "" : " — the cached copy is stale; press Pull in " +
-                "Sandboxes → Software first to get the pinned version",
+                "Host → Software first to get the pinned version",
         ]));
     mgmtConfirmThenTail(boxOpView(), {
         title: `Update the agents of ${name}`,
@@ -14900,7 +15065,7 @@ function removeProjectFromSidebar(project) {
             "Its tab arrangement, its position in the list and its alert setting are "
             + "forgotten too. A "
             + "project on this sandbox comes back on its own once it is running — on "
-            + "the next page load, or as soon as you open Sandboxes. A box you run "
+            + "the next page load, or as soon as you open Host. A box you run "
             + "elsewhere, entered by hand under New Project, is known only to this "
             + "browser: it comes back only by entering it again, with its host, port, "
             + "user and password.",
@@ -15125,7 +15290,7 @@ function renderPassthroughLauncher(container, status, svc) {
 // The warning lines a port add/remove returns (a reserved entry it dropped from
 // the project's port list; the folders a re-run box started without), one ⚠
 // line each in `warnEl`, replacing what it showed. Shared by the four port
-// call sites: ⚙ Ports add/remove, the claim form, Sandboxes → Infrastructure's claim remove.
+// call sites: ⚙ Ports add/remove, the claim form, Host → Ports' claim remove.
 function showPortWarnings(warnEl, result) {
     const lines = (result && Array.isArray(result.warnings)) ? result.warnings : [];
     warnEl.replaceChildren(...lines.map((l) => el("div", {}, ["⚠ " + l])));
@@ -15228,7 +15393,7 @@ function buildPassthroughClaimForm(opts) {
     return wrap;
 }
 
-// Sandboxes → the moved-address notice: tabs whose browser address fell
+// Host → Projects → the moved-address notice: tabs whose browser address fell
 // outside the tab address range at the webui's last start, so they opened on a
 // new address where the browser's saved state for them starts fresh. The
 // placeholder is appended SYNCHRONOUSLY and filled async (section order must
@@ -15283,11 +15448,10 @@ async function fillOriginNotice(box) {
     box.hidden = false;
 }
 
-// Sandboxes → Infrastructure → Pass-through ports: the host-global view — the block, every
-// claim, remove-any, claim-for-any-project. Placed ABOVE Infrastructure at
-// both renderMgmtTable call sites. Static DOM is built SYNCHRONOUSLY before
-// any await (the appendInfraSection D-placement invariant: section order on
-// the page must not depend on fetch timing). No CLI is ever mentioned here.
+// Host → Ports → Pass-through ports: the host-global view — the block, every
+// claim, remove-any, claim-for-any-project. Static DOM is built SYNCHRONOUSLY
+// before any await (section order on the page must not depend on fetch
+// timing). No CLI is ever mentioned here.
 async function appendPassthroughSection(view, projects) {
     const table = el("div", { class: "mgmt-pt-list" });
     // Outside the table, which every refill empties: a remove's warnings stay.
@@ -15399,12 +15563,12 @@ function appendSharingSection(box, project, enabled) {
 function projectFoldersPendingText(r) {
     if (r.rebuilds) {
         return "Saved. The change applies when the project next starts " +
-               "(Stop, then Start, in Sandboxes → Management). That start re-creates " +
+               "(Stop, then Start, in Host → Projects). That start re-creates " +
                "the project's container: its agents keep their sign-ins and settings, " +
                "but anything installed outside /workspace is gone.";
     }
     return "Saved. The change applies when the project next starts: Stop, " +
-           "then Start, or Update, in Sandboxes → Management.";
+           "then Start, or Update, in Host → Projects.";
 }
 
 // ⚙ Project folders: the project's folders in RS's data folder, read-only at
@@ -15818,7 +15982,7 @@ function appendExportedPortsSection(box, project) {
 // (each holding one of the limited tab addresses) with Remove, and the paused
 // note. Fetched here through the gated route with alloc=0 — opening this box
 // never allocates an address — and never written into the tab map.
-const DETECTION_PAUSED_TEXT = "Detection is paused until you unlock again or open Sandboxes.";
+const DETECTION_PAUSED_TEXT = "Detection is paused until you unlock again or open Host.";
 
 function appendDetectedAppsSection(box, project) {
     const section = el("div", { class: "config-section" });
@@ -16977,7 +17141,7 @@ async function sharedOriginSession(cfg) {
     if (res.status === 401) {
         // The vault unlock auto-logs into Management, so a 401 here means the
         // vault and broker passwords disagree — a host-side fix, not a retry.
-        return { msg: "Not signed in to Management — unlock the vault again.",
+        return { msg: "Not signed in to Host — unlock the vault again.",
                  retry: false, status: 401 };
     }
     if (res.status === 403) return { msg: "Origin rejected.", retry: false, status: 403 };
@@ -17012,7 +17176,7 @@ async function mountSharedOrigin(container, status, cfg, path) {
     // clipboard-write delegation is what lets Gitea's native code-block copy
     // button work inside the cross-origin frame (Permissions-Policy features
     // whose default allowlist is 'self' are silently revoked otherwise). NO
-    // sandbox attribute — this follows the Development gitea frame, not the
+    // sandbox attribute — this follows the Services gitea frame, not the
     // neighbouring per-origin http tab, which does sandbox its iframe.
     const iframe = el("iframe", {
         class: "http-iframe",
@@ -17302,8 +17466,8 @@ async function waitForWebApp({ post, sleep, isCurrent, attempts, pollMs }) {
             if (b.result.ready === true) return { state: "ready" };
         } else if (!(r.status === 200 && b.error && b.error.kind === "busy")) {
             const msg = (b.error && b.error.message) ||
-                (r.status === 401 ? "Management is logged out" :
-                 r.status === 503 ? "Management is not reachable" :
+                (r.status === 401 ? "Host is logged out" :
+                 r.status === 503 ? "Host is not reachable" :
                  `error ${r.status}`);
             return { state: "error", message: msg };
         }
@@ -17328,7 +17492,7 @@ async function handleControl(project, serviceId, term, ws, ctrl) {
             `Stored: ${project.host_key_fingerprint}\n` +
             `Actual: ${ctrl.actual}\n\n` +
             `Accept the new key?\n\n` +
-            `Click OK only if you intentionally recreated the supervisor (e.g. you changed its services from Sandboxes) — otherwise this could be a man-in-the-middle.`,
+            `Click OK only if you intentionally recreated the supervisor (e.g. you changed its services from Host → Projects) — otherwise this could be a man-in-the-middle.`,
         );
         if (accept) {
             project.host_key_fingerprint = ctrl.actual;
