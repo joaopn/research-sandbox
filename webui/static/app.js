@@ -4864,7 +4864,9 @@ function devCopyBtn(cmd, label = "📋") {
 // also lands in a data-rkey DOM attribute; matching is a JS string compare
 // over [data-rkey] elements, never a CSS attribute-value selector (CSS.escape
 // maps NUL to U+FFFD, which would never match the stored value). Value:
-// {opId, watching, stalled}. Deliberately NOT persisted: after a page reload
+// {opId, watching, stalled, modal}; `modal` = a reopened box is tailing it
+// (devReviewReopen), and the watcher stands down while it is, so the box
+// alone sees the end. Deliberately NOT persisted: after a page reload
 // an in-flight review shows a plain Review button again — re-clicking runs a
 // duplicate review and the last ledger write wins (harmless, accepted).
 const devReviewsInFlight = new Map();
@@ -4881,11 +4883,26 @@ function devUpdateReviewCells(key, fill) {
     }
 }
 
-function devMarkReviewingCells(key) {
+// A review cell's in-flight content: "reviewing…" and a "Show progress"
+// button that opens the review's box again (never disabled: it only opens
+// the box). `ctx` is the context of whatever painted the cell — its own
+// render, or the dialog or bulk run that marked it — and is what a box
+// opened from here resolves the cells with; the registry holds no context,
+// so a cell re-rendered since carries its own render's.
+function devReviewingNodes(key, ctx) {
+    const btn = el("button", {
+        class: "btn-small dev-review-progress-btn",
+        title: "Open this review's progress box again",
+    }, ["Show progress"]);
+    btn.onclick = () => devReviewReopen(key, ctx);
+    return [el("span", { class: "dev-pr-meta dev-reviewing" }, ["reviewing…"]),
+            btn];
+}
+
+function devMarkReviewingCells(key, ctx) {
     devUpdateReviewCells(key, (cellEl) => {
         cellEl.innerHTML = "";
-        cellEl.appendChild(el("span", { class: "dev-pr-meta dev-reviewing" },
-                              ["reviewing…"]));
+        for (const n of devReviewingNodes(key, ctx)) cellEl.appendChild(n);
     });
 }
 
@@ -4960,9 +4977,10 @@ function devRenderPrReviewCell(cellEl, repo, p, v, ctx) {
     };
     const flight = devReviewsInFlight.get(rkey);
     if (flight) {
-        cellEl.appendChild(el("span",
-            { class: "dev-pr-meta dev-reviewing" }, ["reviewing…"]));
-        if (!flight.watching)   // stalled: restart with THIS render's context
+        for (const n of devReviewingNodes(rkey, ctx)) cellEl.appendChild(n);
+        // Stalled: restart with THIS render's context (a no-op while a box
+        // is open for it — that box sees the end).
+        if (!flight.watching)
             devWatchReview(rkey, flight.opId,
                            () => devResolvePrReviewCell(rkey, repo, p.number,
                                                         ctx));
@@ -5064,14 +5082,28 @@ async function devResolvePrReviewCell(key, repo, prNumber, ctx) {
 // failures (transport, 503, non-JSON) keep polling, like the modal loop.
 // The double-start guard is `watching`, set SYNCHRONOUSLY before the first
 // await — two renders restarting the same stalled entry cannot both pass it.
+// It stands down while a box is open for the entry (a reopened one): the box
+// sees the end and resolves the cells, and its dismissal starts a watcher
+// again — which is why every exit clears `watching`. The check runs after
+// every await, in the same synchronous run as the exit, so a box opened and
+// closed again while an await was pending is not noticed at all: the watcher
+// carries on, and that box's dismissal, finding `watching` set, started no
+// second one.
 async function devWatchReview(key, opId, onTerminal) {
     const entry = devReviewsInFlight.get(key);
-    if (!entry || entry.watching) return;
+    if (!entry || entry.watching || entry.modal) return;
     entry.watching = true;
     entry.stalled = false;
     let viewFrom = 0, sawTerminal = false;
-    const stall = () => { entry.watching = false; entry.stalled = true; };
+    const away = () => devReviewsInFlight.get(key) !== entry || entry.modal;
+    const standDown = () => { entry.watching = false; };
+    // A box that took over handles its own session expiry.
+    const stall = () => {
+        entry.watching = false;
+        if (!away()) entry.stalled = true;
+    };
     while (true) {
+        if (away()) return standDown();
         try {
             const r = await fetch(
                 `/broker/op/${encodeURIComponent(opId)}/log?from=${viewFrom}`);
@@ -5102,8 +5134,79 @@ async function devWatchReview(key, opId, onTerminal) {
         if (alive === false) break;   // hard-killed, or the terminal just landed
         await opSleep(OP_POLL_INTERVAL_MS);
     }
+    if (away()) return standDown();
+    entry.watching = false;
     devReviewsInFlight.delete(key);
     try { onTerminal(); } catch (e) { /* cell refresh is best-effort */ }
+}
+
+// "Show progress" in a review cell: the review's box again, live, from the
+// start of its log. Repo and subject come from the key; `ctx` is the clicked
+// cell's (devReviewingNodes). A review that has ended meanwhile only repaints
+// the cells from the ledger; a box already open does nothing.
+function devReviewReopen(key, ctx) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const cut = key.indexOf("\u0000");
+    const repo = key.slice(0, cut), loc = key.slice(cut + 1);
+    const pr = loc.startsWith("#") ? Number(loc.slice(1)) : null;
+    const resolveCells = pr !== null
+        ? () => devResolvePrReviewCell(key, repo, pr, ctx)
+        : () => devRefreshCommitCells(repo, loc, ctx);
+    const entry = devReviewsInFlight.get(key);
+    if (!entry) { resolveCells(); return; }
+    if (entry.modal) return;
+    const title = pr !== null ? `Review ${repo} #${pr}`
+                              : `Review ${repo} @${loc.slice(0, 9)}`;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" }, [el("h2", {}, [title])]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    devReviewTailBox(key, entry, backdrop, card, title, resolveCells);
+}
+
+// Tail a registered review in a reopened box, as devReviewDialog's box does:
+// a terminal resolves the cells in place, Done (or a click outside after the
+// end) closes and leaves the page alone, resolving the cells only when no
+// terminal arrived (a hard-killed op). The box passes no page to the tail, so
+// an expired session just closes it (never a login card over the page) and
+// stalls the entry for the next render to restart. `open` is this box's own
+// claim on `entry.modal`: a box dismissed and reopened at once leaves the
+// first tail still returning, and that return must not clear the new box's
+// claim. The end is taken once — `end()` drops the entry only while this box
+// holds it — and the watcher stands down while the box is open.
+async function devReviewTailBox(key, entry, backdrop, card, title, resolveCells) {
+    entry.modal = true;
+    let open = true, owned = false, resolved = false;
+    const resolveOnce = () => {
+        if (resolved) return;
+        resolved = true;
+        resolveCells();
+    };
+    // Drop the entry BEFORE resolving: a cell painted while it is still
+    // registered would read "reviewing…" again and restart a watcher.
+    const end = () => {
+        if (!open) return;
+        open = false;
+        entry.modal = false;
+        if (devReviewsInFlight.get(key) !== entry) return;
+        devReviewsInFlight.delete(key);
+        owned = true;
+    };
+    const closeLeavesPage = () => { if (owned) resolveOnce(); };
+    const dismiss = () => {
+        backdrop.remove();
+        if (!open) { closeLeavesPage(); return; }
+        open = false;
+        entry.modal = false;
+        devWatchReview(key, entry.opId, resolveCells);
+    };
+    await mgmtTailBuildLog(null, backdrop, card, entry.opId, title,
+                           closeLeavesPage, undefined, {
+        onDismiss: dismiss,
+        onTerminal: () => { end(); if (owned) resolveOnce(); },
+        onEnd: end,
+    });
+    if (open) { open = false; entry.modal = false; entry.stalled = true; }
 }
 
 // Render ONE commit's review cell from a ledger entry (v; null = never
@@ -5123,8 +5226,7 @@ function devRenderCommitReviewCell(cell, repo, sha, v, ctx) {
     cell.innerHTML = "";
     const flight = devReviewsInFlight.get(key);
     if (flight) {
-        cell.appendChild(el("span", { class: "dev-pr-meta dev-reviewing" },
-                            ["reviewing…"]));
+        for (const n of devReviewingNodes(key, ctx)) cell.appendChild(n);
         if (!flight.watching)   // stalled (post-relogin render): restart with
             devWatchReview(key, flight.opId,   // THIS render's context
                            () => devRefreshCommitCells(repo, sha, ctx));
@@ -5497,8 +5599,8 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
                 continue;
             }
             devReviewsInFlight.set(key, { opId: b.op_id, watching: false,
-                                          stalled: false });
-            devMarkReviewingCells(key);
+                                          stalled: false, modal: false });
+            devMarkReviewingCells(key, ctx);
             devWatchReview(key, b.op_id,
                            () => devRefreshCommitCells(repo, sha, ctx));
         }
@@ -5733,9 +5835,10 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin,
     const loc = sel.commit ? sel.commit : "#" + String(sel.pr);
     const key = devReviewKey(repo, loc);
     const abort = () => { if (onAbort) onAbort(); };
-    if (devReviewsInFlight.has(key)) { devMarkReviewingCells(key); return; }
-    if (document.querySelector(".modal-backdrop")) { abort(); return; }
     const onDone = rerender || (() => renderDevFetchTab(view, body));
+    const cctx = { view, body, sel, rerender: onDone, onLogin };
+    if (devReviewsInFlight.has(key)) { devMarkReviewingCells(key, cctx); return; }
+    if (document.querySelector(".modal-backdrop")) { abort(); return; }
     const title = sel.commit
         ? `Review ${repo} @${sel.commit.slice(0, 9)}`
         : `Review ${repo} #${sel.pr}`;
@@ -5749,7 +5852,6 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin,
     let opId = null;
     let dismissed = false;
     let terminalSeen = false;
-    const cctx = { view, body, sel, rerender: onDone, onLogin };
     // In-place completion resolve — fired by the OPEN modal's tail the moment
     // the terminal record lands (opts.onTerminal), and by the background
     // watcher on the dismissal path. Either way the page is never re-rendered
@@ -5765,10 +5867,12 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin,
     // hard-killed op (no terminal record) still needs its cells resolved.
     const closeLeavesPage = () => { if (!terminalSeen) resolveCells(); };
     // Hand the running op to the background watcher (the dismissal path).
+    // The cells it marks offer "Show progress", which opens a box of its own
+    // on this entry (devReviewReopen); this box is gone for good.
     const registerDetached = () => {
         devReviewsInFlight.set(key, { opId: opId, watching: false,
-                                      stalled: false });
-        devMarkReviewingCells(key);
+                                      stalled: false, modal: false });
+        devMarkReviewingCells(key, cctx);
         if (sel.commit) {
             devWatchReview(key, opId, () => devRefreshCommitCells(
                 repo, sel.commit, cctx));
