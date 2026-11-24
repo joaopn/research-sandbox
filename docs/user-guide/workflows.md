@@ -12,7 +12,7 @@ A workflow runs in one of two container kinds. An **inner-Docker** project has i
 | Workflow | Container | Agent (default) | Egress (default) | What you get |
 |---|---|---|---|---|
 | **`research`** (default) | inner Docker | Claude only | operator default | The full lab: a supervisor agent, headless analysis workers and role services |
-| **`researcher`** | inner Docker | Claude or pi | locked | One research agent that does its own analysis and keeps a memory; the Reader tab is always on, because the memory is read there |
+| **`researcher`** | inner Docker | Claude or pi | locked | One research agent that does its own analysis and keeps a memory; the Reader tab is always on, because the agent's pages are read there |
 | **`researcher-subagents`** | inner Docker | Claude or pi | locked | A researcher that hands analyses to helpers running in parallel; a finding is re-run and read by an independent referee before you accept it ([how it works](../architecture/Researcher-with-subagents.md)) |
 | **`sandbox-dind`** | inner Docker | Claude or pi | locked | An agent with its own Docker and boxes (`rs-sandbox` in its terminal) |
 | **`sandbox`** | single | none unless chosen | locked | A bare confined container: ssh, byobu, editor. Add agents with `--agent claude` and/or `--agent pi` |

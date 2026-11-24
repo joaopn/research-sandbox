@@ -14,6 +14,6 @@
     "reader": true
   },
   "memory": true,
-  "description": "One research agent that does its own analysis and keeps a memory you read in the Reader tab: what it is doing, the findings you accepted, what it tried.",
+  "description": "One research agent that does its own analysis, keeps a memory, and writes pages you read in the Reader tab: what waits for you, what you accepted, and a logbook of the work.",
   "greeting": "Researcher: one research agent with a memory.\n\nRun `claude` or `pi` here, whichever this project carries. The agent does its\nown analysis in this container, on the data folders you gave the project, and\nkeeps its own memory under /workspace/memory/. Read what it has for you in the\nReader tab: README.md, the front page (what waits for you, what is running,\nwhere things stand, what is known); staging/, the claims waiting for you;\nresults/, what you accepted; logbook/, the story of the work, one entry per\ntopic, written when you type /log. The agent writes these pages; do not edit\nthem.\n\nA finding enters the record only when you accept it: say \"accept F-3\".\n"
 }
