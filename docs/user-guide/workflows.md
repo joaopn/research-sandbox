@@ -41,3 +41,14 @@ python research.py workflow list                 # the full catalog
 ```
 
 Every shipped workflow except `research` defaults to **`--egress locked`** (80/443, and DNS to the configured resolvers only, no ICMP) — containment first. `research` takes the operator's configured default, open unless changed (it needs pip/apt). In both modes the router drops private (LAN) addresses; see [Security model](security-model.md) for what closes the paths around it. Override the mode with `--egress`, or in the create form.
+
+## Working with a researcher
+
+In a `researcher` or `researcher-subagents` project you talk with one research agent in its terminal, and read what it knows in the **Reader** tab.
+
+- **What you read.** The memory's front page, `memory/front.md`: what is being studied, the agent's beliefs, the work in flight, the open threads, and, once you have accepted any, "What we know about the data".
+- **What you decide.** The agent proposes results as claims and tells you their ids: findings (`F-3`), facts about the data (`D-1`, such as an inventory line, a gap or a count), open questions and retractions. Accept them in the chat ("accept F-3", "accept D-1 D-2"), or reject one and say why. Only what you accept enters the record. In a `researcher-subagents` project a finding is first re-run and read by an independent referee; facts need neither.
+- **The helpers' work** (`researcher-subagents`). Each analyst writes its results and its full write-up, `writeup.md`, into its own results folder, and the agent journals the dead ends and surprises it reports.
+- **Long runs.** A run left going for hours is registered by the agent and listed at every session start as running, ended (with its log's last line) or gone.
+
+How the memory works: [Researcher workflow](../architecture/Researcher-workflow.md). The helpers and the checks: [Researcher with subagents](../architecture/Researcher-with-subagents.md).

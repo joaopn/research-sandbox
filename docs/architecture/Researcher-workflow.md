@@ -57,6 +57,8 @@ The agent keeps its memory through one command, `rs-memory`. Its refusals name t
 | `open`, `close`, `consolidate` | start a session; end one and rewrite the front page |
 | `job add`, `list`, `done` | register a long run left going, show its state, mark it handled |
 
+A claim is one kind: a finding, an open question (`--question`), a retraction (`--withdraws`) or a fact (`--fact`). A claim given two kinds is refused.
+
 A fact (`claim --fact`, an id `D-<n>`) is a descriptive result about the data: an inventory line, a gap, a count. It needs a scope and evidence like a finding, and the user's accept, but never the checks of a project with analysts. One accept can take several facts at once.
 
 The front page ends with a section of its own, "What we know about the data": one line per current accepted fact, with its id, statement and scope. It is written from the record every time the page is written, and an accept that changes it rewrites the page under the same page number. A fact that is withdrawn or superseded leaves it. The section is never read back as items, so consolidation cannot change it, but its beliefs may point at a fact, as at a finding.

@@ -14,10 +14,13 @@ An update to RS's own code (a `git pull`) reaches the running system in parts. E
 | The browser UI | `python research.py webui start --rebuild`; its pages are built into its image |
 | What a DIND project receives at each start: RS's instructions, the working-mode and test-policy files, the box tool | Stop and start the project |
 | Container images | `python research.py start --rebuild` (or **Rebuild all** in the browser, Sandboxes → Software), then stop and start each project |
+| The agents' downloads: Claude Code, pi, and RS's rules extension for pi | **Pull** on the agent's row under Sandboxes → Software (a row that needs it reads "stale — re-pull"), or `python research.py agent pull --agent pi`; then stop and start each project |
 
 When it is unclear which parts an update touched, do all of them. The cost is the rebuild time and one restart per project, which interrupts the work running in it.
 
 A project that has not been restarted since an update keeps working as before. An action that needs the new version there is refused with a message that says to restart the project.
+
+A `researcher` or `researcher-subagents` project needs its image to carry the memory command its instructions describe. On an older image its start ends with an error that names **Rebuild all**, and its memory is not set up until the rebuild and a stop and start.
 
 ## Once: the update that stops tracking `.env`
 
