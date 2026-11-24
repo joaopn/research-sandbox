@@ -3796,22 +3796,69 @@ function renderDefaultsInto(view) {
     appendSettingsSection(view);
 }
 
-// Services → Aldine: the shared LaTeX editor's row (stamped with its
-// build-lane target, so paintSoftwareLabels shows a Turn on in flight —
-// started here, elsewhere or before a reload — in its status cell and keeps
-// its buttons off meanwhile) and what it is for.
+// Services → Aldine: the shared LaTeX editor itself, like Services → Gitea —
+// a bar on top and the editor taking the rest of the page. The bar is
+// Aldine's row (stamped with its build-lane target, so paintSoftwareLabels
+// shows a Turn on in flight — started here, elsewhere or before a reload — in
+// its status cell and keeps its buttons off meanwhile) plus the page's
+// Refresh, which sits outside the row's buttons so it stays usable then.
 function renderAldineInto(view) {
     view.innerHTML = "";
-    view.appendChild(hostRefreshHeader(view));
-    const aldineRow = el("div", { class: "mgmt-row mgmt-infra-row", "data-swtarget": "aldine" }, [
+    const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
+    refresh.onclick = () => rerenderView(view);
+    const bar = el("div", {
+        class: "mgmt-row mgmt-infra-row aldine-bar", "data-swtarget": "aldine",
+    }, [
         el("span", {}, ["Aldine"]),
         el("span", { class: "mgmt-loading" }, ["…"]),
+        refresh,
     ]);
-    view.appendChild(el("div", { class: "mgmt-infra" }, [
-        aldineRow,
-        el("div", { class: "hint" }, [ALDINE_HINT]),
-    ]));
-    fillAldineRow(view, aldineRow);   // async, own fetch path
+    const below = el("div", { class: "mgmt-loading" }, ["Opening Aldine…"]);
+    // Sized to the page, so the editor takes what the bar above it leaves.
+    view.appendChild(el("div", { class: "aldine-body" }, [bar, below]));
+    mountAldineEditor(view, bar, refresh, below);   // async, own fetch path
+}
+
+// Under the bar: the editor when the status read says Aldine is on and its
+// app runs and answers (when the bar offers Open), else a line saying why and
+// what Aldine is for. Every write checks its node is still in the page — a
+// tab switch or a re-render during a read leaves this one behind.
+async function mountAldineEditor(view, bar, refresh, below) {
+    const a = await fillAldineRow(view, bar, refresh);
+    if (!below.isConnected) return;
+    const hint = () => el("div", { class: "hint" }, [ALDINE_HINT]);
+    const say = (text, ...extra) => {
+        below.replaceWith(el("div", { class: "mgmt-empty" }, [el("span", {}, [text]), ...extra]),
+                          hint());
+    };
+    // A failed read: the bar says so (Refresh retries); no editor.
+    if (!a) return below.replaceWith(hint());
+    if (!a.on) return say("Aldine is off. Turn it on above to open the editor here.");
+    if (a.app !== "running") {
+        return say("Aldine is stopped. Turn it on above to open the editor here.");
+    }
+    if (a.healthy === false) {
+        return say("Aldine is running but not answering. Turn it on above to repair "
+                   + "it, or Refresh to check again.");
+    }
+    const r = await sharedOriginSession(SHARED_ORIGINS.aldine);
+    if (!below.isConnected) return;
+    if (r.status === 401) return renderMgmtLogin(view, view.__rsRender || renderAldineInto);
+    if (!r.url) {
+        if (!r.retry) return say(r.msg);
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = () => rerenderView(view);
+        return say(r.msg + " ", retry);
+    }
+    // As the project's Aldine tab and the Gitea tab: clipboard delegation for
+    // the cross-origin frame, and no sandbox attribute.
+    const iframe = el("iframe", {
+        class: "aldine-frame",
+        src: r.url,
+        allow: "fullscreen; clipboard-read; clipboard-write",
+    });
+    iframe.setAttribute("allowfullscreen", "");
+    below.replaceWith(iframe);
 }
 
 function mgmtCard(view, children) {
@@ -7762,31 +7809,39 @@ function aldineRowParts(view, a) {
     return parts;
 }
 
-// Fill the row from GET /broker/aldine. A read failure is a quiet badge in
-// the row (the page's Refresh retries) — the transport-vs-verb split: an
-// unreachable broker says "unknown", a refusal shows its own text.
-async function fillAldineRow(view, row) {
+// Fill the row from GET /broker/aldine; `refresh` (the page's Refresh) stays
+// in the row in every outcome, right after its buttons. A read failure is a
+// quiet badge in the row (Refresh retries) — the transport-vs-verb split: an
+// unreachable broker says "unknown", a refusal shows its own text. Returns
+// the status result, or null when there is none to act on.
+async function fillAldineRow(view, row, refresh) {
     let res = null, body = null;
     try {
         res = await fetch("/broker/aldine");
         try { body = await res.json(); } catch (e) { body = null; }
     } catch (e) { res = null; }
-    if (!row.isConnected) return;
+    if (!row.isConnected) return null;
     if (res && res.status === 401) {
-        return renderMgmtLogin(view, view.__rsRender || renderAldineInto);
+        renderMgmtLogin(view, view.__rsRender || renderAldineInto);
+        return null;
     }
     if (!res || res.status !== 200 || !body) {
         row.replaceChildren(el("span", {}, ["Aldine"]),
-                            el("span", { class: "type-badge" }, ["unknown"]));
-        return;
+                            el("span", { class: "type-badge" }, ["unknown"]), refresh);
+        return null;
     }
     if (!body.ok || !body.result) {
         row.replaceChildren(el("span", {}, ["Aldine"]),
-                            el("span", { class: "mcp-test mcp-test-bad" }, [mgmtErrText(body)]));
-        return;
+                            el("span", { class: "mcp-test mcp-test-bad" }, [mgmtErrText(body)]),
+                            refresh);
+        return null;
     }
-    row.replaceChildren(...aldineRowParts(view, body.result));
+    const parts = aldineRowParts(view, body.result);
+    const act = parts.findIndex((p) => p.classList && p.classList.contains("sw-act"));
+    parts.splice(act + 1, 0, refresh);
+    row.replaceChildren(...parts);
     paintSoftwareLabels();
+    return body.result;
 }
 
 // Turn on / Update: start the build-lane action and tail it in a box that can
