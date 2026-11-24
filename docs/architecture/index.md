@@ -60,6 +60,7 @@ Each page ends with its full list of design decisions and their costs; these are
 - RS's files (instructions, skills, `/log`, pi's MCP servers) live in the agent's home, never in the workspace's `.claude/` or `.pi/`; a file left by an older RS fails the operation with an error.
 - What a person supplies for an RS tool inside a container (a settings file, a token) lives under `/workspace`, the only folder that survives a recreate; RS's own staged files may stay in home because RS writes them again at every start.
 - A container's search path holds only the RS commands a person types there; RS's helpers live in a private folder, and a container from before that layout refuses helper actions until it is stopped and started.
+- Claude's links to the operator's Anthropic account (claude.ai connectors, Remote Control, Claude in Chrome) are blocked by default in every project and Claude box, by one switch; it is a default the agent can undo inside its own container, not a wall.
 
 ### [Research](Research.md)
 
