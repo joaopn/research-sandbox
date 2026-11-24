@@ -349,6 +349,14 @@ body {
     opacity: 0.6;
     cursor: default;
 }
+/* A spinner whose action the page knows opens its progress box: the gear's
+   neutral hover, not Stop's red or Start's blue. */
+.project-rail .project .project-power-btn.busy:hover:not(:disabled),
+.project-rail .stopped-project .project-power-btn.busy:hover:not(:disabled) {
+    color: var(--fg-base);
+    background: var(--btn-secondary-bg);
+    border-color: var(--border-strong);
+}
 .project-rail .project-power-btn.busy svg { animation: rail-spin 1s linear infinite; }
 @keyframes rail-spin { to { transform: rotate(360deg); } }
 /* The inline confirm that replaces a row's content (app.js openRailConfirm). */

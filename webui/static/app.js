@@ -1593,13 +1593,17 @@ function makeStoppedRow(name) {
 }
 
 // Stop on a list row, Start on a fold row. Its click opens the inline confirm
-// on the row it sits in (found at click time: rows are rebuilt freely).
+// on the row it sits in (found at click time: rows are rebuilt freely). While
+// an action the page knows runs, the spinner opens that action's progress box
+// instead (there is no page to land on from the rail, so its Done only closes).
 function makeRailPowerButton(name, idle = "stop") {
     const btn = el("button", { class: "project-power-btn", type: "button" });
     paintRailPower(btn, name, idle);
     btn.onclick = (ev) => {
         ev.stopPropagation();
         if (btn.disabled) return;
+        if (lifecycleInFlight.has(name)) { lifecycleReopen(name, null); return; }
+        if (railPending.has(name)) return;
         const holder = btn.closest(".project, .stopped-project");
         if (holder) openRailConfirm(holder, name, idle);
     };
@@ -1657,20 +1661,25 @@ function railBusyLabel(name) {
 }
 
 // Paint one power button: `idle` is the verb it offers when nothing runs
-// ("stop" on a list row, "start" on a fold row); busy = a disabled spinner.
+// ("stop" on a list row, "start" on a fold row); busy = a spinner, which opens
+// the action's progress box once the page knows the action, and stays
+// disabled while only the request is unanswered (no op to show yet).
 function paintRailPower(btn, name, idle) {
-    const busy = lifecycleInFlight.has(name) || railPending.has(name);
+    const known = lifecycleInFlight.has(name);
+    const busy = known || railPending.has(name);
     const mode = busy ? "busy" : idle;
     // The label follows every repaint (queued → starting…); the icon only
     // changes with the mode, so a spinning icon is not restarted.
-    const title = busy ? (railBusyLabel(name) || "working…")
+    const title = busy ? (railBusyLabel(name) || "working…") + (known ? " — show progress" : "")
                        : `${idle === "stop" ? "Stop" : "Start"} ${name}`;
     btn.title = title;
     btn.setAttribute("aria-label", title);
+    // Set on every repaint: a pending request becomes a known action without
+    // leaving the busy mode.
+    btn.disabled = busy && !known;
     if (btn.dataset.mode === mode) return;
     btn.dataset.mode = mode;
     btn.innerHTML = RAIL_ICON_SVG[mode];
-    btn.disabled = busy;
     btn.classList.toggle("busy", busy);
     btn.classList.toggle("go", mode === "start");
 }
@@ -8508,7 +8517,10 @@ const LIFECYCLE_TITLES = { start: "Starting", stop: "Stopping", update: "Updatin
 // project that already has one, so one entry per project is exact). Value:
 // {opId, verb, queued, modal, watching, stalled, onDone}. `modal` = an open op
 // box is tailing it; `watching` = a background watcher is. A 401/403 stalls the
-// watcher (entry kept, `stalled`), and the next seed restarts it.
+// watcher (entry kept, `stalled`), and the next seed restarts it. While a
+// project has an entry, its rail spinner and its Host → Projects row open the
+// box again (lifecycleReopen); the watcher stands down while a box is open, so
+// the box alone sees the end and no notice is posted for it.
 const lifecycleInFlight = new Map();
 // Op ids this page saw finish (the softwareFinished twin): the lane lists an
 // op until its child exits, so a seed racing a finishing child must not revive
@@ -8574,7 +8586,26 @@ function paintLifecycleLabels() {
         const stateEl = row.querySelector(".mgmt-state");
         if (!stateEl) continue;
         const entry = lifecycleInFlight.get(row.getAttribute("data-project"));
-        const buttons = row.querySelectorAll(".mgmt-actions button");
+        const buttons = row.querySelectorAll(".mgmt-actions button:not(.lc-progress-btn)");
+        // An in-flight row also gets one "Show progress" button (never
+        // disabled: it only opens the box again), first among its actions, and
+        // loses it when the action ends; looked up before it is added, so
+        // repaints never stack it.
+        const progressBtn = row.querySelector(".lc-progress-btn");
+        const actions = row.querySelector(".mgmt-actions");
+        if (entry && !progressBtn && actions) {
+            const b = el("button", {
+                class: "btn-small lc-progress-btn",
+                title: "Open this action's progress box again",
+            }, ["Show progress"]);
+            b.onclick = () => {
+                const r = b.closest(".mgmt-prow[data-project]");
+                if (r) lifecycleReopen(r.getAttribute("data-project"), b.closest(".host-body"));
+            };
+            actions.prepend(b);
+        } else if (!entry && progressBtn) {
+            progressBtn.remove();
+        }
         if (entry) {
             stateEl.textContent = lifecycleLabel(entry);
             stateEl.classList.add("state-inflight");
@@ -8707,7 +8738,10 @@ function mgmtViewHoldsInput(view) {
 
 // Background watcher for one in-flight entry (a dismissed op box, or an op this
 // page learned from GET /broker/lifecycle). The double-start guard is
-// `watching`, set before the first await.
+// `watching`, set before the first await. It stands down while a box is open
+// for the entry (a reopened one): the box sees the end and finishes it without
+// a notice, and its dismissal starts a watcher again — which is why every exit
+// clears `watching`.
 async function lifecycleWatch(project) {
     const entry = lifecycleInFlight.get(project);
     if (!entry || entry.watching || entry.modal) return;
@@ -8718,10 +8752,17 @@ async function lifecycleWatch(project) {
     const res = await lifecyclePoll(
         st,
         (rec) => lifecycleSetQueued(project, opId, rec.step === "queue"),
-        () => lifecycleInFlight.get(project) !== entry);
-    if (res === null) return;                   // superseded
+        () => lifecycleInFlight.get(project) !== entry || entry.modal);
+    entry.watching = false;
+    if (res === null || entry.modal) {          // superseded, or a box took over
+        // A box that opened and closed again before this watcher noticed found
+        // it still running and did not start another: carry on from here.
+        if (lifecycleInFlight.get(project) === entry && !entry.modal && !entry.stalled) {
+            lifecycleWatch(project);
+        }
+        return;
+    }
     if (res.auth) {
-        entry.watching = false;
         entry.stalled = true;
         // A sidebar action has no op box to show the expiry: say it once.
         if (entry.fromRail && !entry.stallNoticed) {
@@ -8921,22 +8962,33 @@ function folderChoicesLine(choices, error) {
 // op from its log (the notice's click): no registry, no hooks, just the record.
 // `opts.onClose` (optional) is what Done leads to instead of re-rendering
 // `view` (the mgmtTailOp twin): a dialog opened from the ⚙ window passes it.
+// Registers the op, then tails it in the box (lifecycleTailBox).
 async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
                              onDone, opts) {
+    const replay = !!(opts && opts.replay);
+    const entry = (!replay && project) ? lifecycleRegister(project, opId, verb, onDone) : null;
+    await lifecycleTailBox(view, backdrop, card, entry, opId, title, verb, project, opts);
+}
+
+// Tail one op in an open box: the first box (`entry` just registered), every
+// reopened one (`entry` the registry's own, so its hook and its sidebar origin
+// stay), or a replay (`entry` null). `open` is this box's own claim on
+// `entry.modal`: a box dismissed and reopened at once leaves the first tail
+// still returning, and that return must not clear the new box's claim.
+async function lifecycleTailBox(view, backdrop, card, entry, opId, title, verb, project, opts) {
     const replay = !!(opts && opts.replay);
     const { listEl, markDone, markMsg, markWarn, dropPending } = opChecklist(verb);
     const waitEl = el("div", { class: "op-waiting" });
     const failEl = el("div", { class: "op-fail" });
     const bgBtn = el("button", { class: "btn btn-secondary" }, ["Continue in background"]);
     const doneBtn = el("button", { class: "btn", disabled: "" }, [replay ? "…" : "Working…"]);
-    const entry = (!replay && project) ? lifecycleRegister(project, opId, verb, onDone) : null;
     if (entry) entry.modal = true;
-    let finished = false, dismissed = false;
+    let open = !!entry, finished = false, dismissed = false;
     const dismiss = () => {
         if (finished || dismissed) return;
         dismissed = true;
         backdrop.remove();
-        if (entry) { entry.modal = false; lifecycleWatch(project); }
+        if (open) { open = false; entry.modal = false; lifecycleWatch(project); }
     };
     bgBtn.onclick = dismiss;
     backdrop.onclick = (e) => { if (e.target === backdrop) dismiss(); };
@@ -8967,12 +9019,29 @@ async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
         if (verb === "agents_update" && rec.msg) markMsg(rec.msg);
         else markDone(rec.step, rec.msg);
     }, () => dismissed);
-    if (res === null) return;                   // sent to the background
+    // Sent to the background: whatever this tail returns late lands nowhere.
+    if (res === null || dismissed) return;
     if (res.auth) {
         // Session expired mid-tail: the action carries on at the broker. Keep
         // the entry (stalled) so the next seed after re-login picks it back up.
+        if (open) { open = false; entry.modal = false; entry.stalled = true; }
+        if (!replay && !view && !(opts && opts.onClose)) {
+            // Opened from the sidebar: no page to land on a sign-in, so the box
+            // stays and says why it stopped following (once, like the
+            // watcher's own notice for a sidebar action).
+            if (entry) entry.stallNoticed = true;
+            finished = true;
+            backdrop.onclick = null;
+            waitEl.textContent = "";
+            bgBtn.remove();
+            failEl.textContent = res.auth === 401
+                ? "Signed out — sign in again under Host to see how this ends."
+                : "Host refused this page, so this action can't be followed here.";
+            doneBtn.textContent = "Close";
+            doneBtn.disabled = false;
+            return;
+        }
         backdrop.remove();
-        if (entry) { entry.modal = false; entry.stalled = true; }
         if (replay || !view) return;
         const redirect = mgmtStatusRedirect(view, res.auth);
         return redirect ? redirect() : undefined;
@@ -8986,7 +9055,29 @@ async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
     if (!res.ok) failEl.textContent = lifecycleFailText(res);
     doneBtn.textContent = "Done";
     doneBtn.disabled = false;
-    if (entry) { entry.modal = false; lifecycleFinish(project, opId, res, false); }
+    if (open) { open = false; entry.modal = false; lifecycleFinish(project, opId, res, false); }
+}
+
+// The rail's spinner or a Host → Projects row's "Show progress": the box again,
+// live, from the start of the op's log, on the registry's own entry (never a
+// new one: that would drop its hook and its sidebar origin and supersede its
+// watcher). `view` is the page Done re-renders — the row's page, or null from
+// the rail, where Done only closes. An action that has ended meanwhile, or a
+// box already open, only repaints.
+function lifecycleReopen(project, view) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const entry = lifecycleInFlight.get(project);
+    if (!entry || entry.modal || lifecycleFinished.has(entry.opId)) {
+        paintLifecycleLabels();
+        return;
+    }
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card" });
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    lifecycleTailBox(view, backdrop, card, entry, entry.opId,
+                     `${LIFECYCLE_TITLES[entry.verb] || "Working on"} ${project}`,
+                     entry.verb, project, null);
 }
 
 // Build the phase-1 confirm card; on confirm, fire `cfg.request()`, then hand
