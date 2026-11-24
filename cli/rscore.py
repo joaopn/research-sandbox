@@ -26365,7 +26365,7 @@ def _row_has_image(names: "set[str] | None", repo: str) -> "bool | None":
 
 def _built_image_names_or_none(host_port: str) -> "set[str] | None":
     # A failed listing must never fail the page or degrade a healthy row: the
-    # image mark is an extra, and image errors are the Images tab's to show.
+    # image mark is an extra, and image errors are the Repos tab's to show.
     try:
         return _built_image_names(host_port)
     except (gitea.GiteaError, OSError):

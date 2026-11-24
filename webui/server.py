@@ -2068,7 +2068,7 @@ async def broker_dev_image_handler(request: web.Request) -> web.Response:
 async def broker_dev_image_active_handler(request: web.Request) -> web.Response:
     """GET /broker/dev/image-active — the image builds running right now
     ([{op_id, repo}]), relayed to the token-gated dev_image_active verb. A
-    field-less READ: the Images tab re-learns running builds after a reload."""
+    field-less READ: the Repos tab re-learns running builds after a reload."""
     status, reply = await _relay(request, "dev_image_active", {})
     return web.json_response(reply, status=status)
 

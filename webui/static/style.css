@@ -2374,11 +2374,19 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
    them, which is exactly the case this rule exists for. */
 html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 
-/* The Images tab: the image cell's second line, and the action buttons kept
-   together on the right. */
-.dev-images-table .dev-image-sub { color: var(--fg-faint); font-size: 12px; margin-top: 2px; }
-.dev-images-table .dev-image-actions { text-align: right; white-space: nowrap; }
-.dev-images-table .dev-image-actions .btn-small + .btn-small { margin-left: 6px; }
+/* The Repos table's Image column: the built image's status line, its second
+   line, and its buttons under it. The buttons wrap rather than sit in one
+   unbreakable row, so the column is never wider than its widest button needs
+   and the switch beside it keeps its place on a phone (the column is not a
+   .dev-repos-opt one: it carries the only build controls there are). */
+.dev-repos-table .dev-image-sub { color: var(--fg-faint); font-size: 12px; margin-top: 2px; }
+.dev-repos-table .dev-image-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+    margin-top: 4px;
+}
+.dev-repos-table .dev-image-actions:empty { display: none; }
 /* A row whose status could not be read: dimmed like the retired-fork rows, so
    it reads as "nothing to report here" rather than as data. Its toggle stays at
    full strength — that control still works and is the reason the row renders. */

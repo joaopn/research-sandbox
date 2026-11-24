@@ -8,7 +8,7 @@ Staged into rs-fetch surfaces beside rs-fetch and rs-sync. Run by hand:
     rs-publish <repo> --no-latest --apply      # upload and tag, leave :latest
     rs-publish <repo> --latest <tag> --apply   # move :latest to a published tag
 
-RS builds images from the Services page's Images tab and keeps one per repo
+RS builds images from the Services page's Repos tab and keeps one per repo
 on its local shelf (the shared Gitea's registry). This tool reads that image
 with the read-only image token staged at ~/.dev-tokens/image-reader.token and
 uploads it, byte for byte, under every git tag recorded on it (or, when its
@@ -960,7 +960,7 @@ def publish(args, env: dict, image: str) -> int:
     top = shelf.get_manifest(shelf_name, SHELF_TAG)
     if top is None:
         die(f"{args.repo} has no built image; build one on the Services "
-            f"page's Images tab")
+            f"page's Repos tab")
     img = ShelfImage(shelf, shelf_name, top)
     tags = version_tags(img)
     commit = img.commit()
@@ -1090,7 +1090,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="rs-publish",
         description="Publish a dev repo's built image (from the Services "
-                    "page's Images tab) to a registry. Dry run unless --apply.")
+                    "page's Repos tab) to a registry. Dry run unless --apply.")
     ap.add_argument("repo", help="the mirrored repo whose built image to publish")
     ap.add_argument("--apply", action="store_true", help="do it (default: show only)")
     ap.add_argument("--no-latest", action="store_true", help="leave :latest where it is")

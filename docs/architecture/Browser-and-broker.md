@@ -42,7 +42,7 @@ The left rail lists the projects, with four entries at its bottom.
 |---|---|---|
 | Projects rail | Always shown | Lists projects and opens their tabs; host CPU and memory, which open Host when clicked |
 | New Project | Floating window | Workflow cards to create a project; import an existing one |
-| Services | Tabs: Gitea, Fetch, Repos, Images, Reviews, Backup, MCP, Aldine | The [Dev lane](Dev-lane.md): Gitea with its Enable, upgrade and admin password controls, fetch commands, repositories, image builds of mirrored repos, reviews and the reviewer's model, Gitea backups; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring; the shared [Aldine](Aldine.md) editor. While Gitea is not running, only Gitea, MCP and Aldine show |
+| Services | Tabs: Gitea, Repos, Fetch, Reviews, MCP, Aldine | The [Dev lane](Dev-lane.md): Gitea with its Enable, upgrade, admin password and Backup controls (backups in a dialog from its bar), repositories with the image builds of each, fetch commands, reviews and the reviewer's model; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring; the shared [Aldine](Aldine.md) editor. While Gitea is not running, only Gitea, MCP and Aldine show |
 | Host | Tabs: Projects, Software, Ports, Defaults | Project table; agent, editor and image builds; pass-through ports; the default models of a new researcher-subagents project's referee, analyst and surveyor, and the task limit of each project container |
 | Settings | Floating window | Interface settings kept in the browser: themes, layout, zoom, terminal font |
 
@@ -167,7 +167,7 @@ Every normal operation is done in the browser. These host steps are not:
 | Store the reviewer token | `research dev reviewer-token` (after `claude setup-token` in a project terminal) | It writes a secret file on the host |
 | Restore Gitea from a backup | `research dev board import <file>` | It replaces every repository and board, so it is confirmed at the host |
 
-The browser names these commands only where they apply: when the broker is unreachable, when the passwords do not match, in the reviewer warning, and on the Backup tab. Broker error messages follow the same rule, since they reach the browser unchanged.
+The browser names these commands only where they apply: when the broker is unreachable, when the passwords do not match, in the reviewer warning, and in the backup dialog (the Backup button on Services → Gitea). Broker error messages follow the same rule, since they reach the browser unchanged.
 
 ## Design decisions
 

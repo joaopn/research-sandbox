@@ -2250,7 +2250,7 @@ const HOST_TAB_DIVIDER = "divider";
 
 // The Services tabs that act on Gitea: the strip hides them while Gitea is not
 // running. Gitea itself (its bar enables it), MCP and Aldine always show.
-const SERVICES_GITEA_TABS = ["fetch", "repos", "images", "reviews", "backup"];
+const SERVICES_GITEA_TABS = ["repos", "fetch", "reviews"];
 // Whether Gitea runs, from the newest /broker/dev answer the Services page
 // read (noteServicesGitea): null until the first one, and then every tab shows,
 // so nothing disappears from the strip before anything is known.
@@ -2260,9 +2260,8 @@ const HOST_PAGES = {
     services: {
         title: "Services",
         landing: "gitea",
-        tabs: [["gitea", "Gitea"], ["fetch", "Fetch"], ["repos", "Repos"],
-               ["images", "Images"], ["reviews", "Reviews"],
-               ["backup", "Backup"], HOST_TAB_DIVIDER,
+        tabs: [["gitea", "Gitea"], ["repos", "Repos"], ["fetch", "Fetch"],
+               ["reviews", "Reviews"], HOST_TAB_DIVIDER,
                ["mcp", "MCP"], ["aldine", "Aldine"]],
         shown: (k) => servicesGiteaRunning !== false || !SERVICES_GITEA_TABS.includes(k),
         get: () => servicesActiveTab,
@@ -2295,7 +2294,9 @@ function hostTabKeys(pageKey) {
 // The last tab the operator picked on each page, kept in this browser
 // (localStorage, one key per page) so a page reopens where it was left. Every
 // access is guarded: storage can be missing or refuse (a private window,
-// blocked site data), and then a page simply opens on its landing tab.
+// blocked site data), and then a page simply opens on its landing tab. So
+// does a remembered tab the page no longer has (Services' retired Images and
+// Backup tabs, now part of Repos and of the Gitea bar).
 const HOST_TAB_STORAGE_PREFIX = "rs.hostTab.";
 
 function hostTabRemembered(pageKey) {
@@ -4147,12 +4148,14 @@ function setTypeBadge(elm, label) {
 // ---- Services host page (STAGE_DEV_GITEA S3) -------------------------------
 // The Gitea-backed sub-tabs: "Gitea" (Gitea's own controls in a bar, above the
 // gitea web UI on its own origin port, session
-// minted via the Management-anchored /broker/dev/gitea-session), "Fetch" (the
-// RS-rendered open-PR/branch list with click-to-copy rs-fetch commands, fed by
-// one /broker/dev read per open — Q6, no poller), "Repos" (the dev-lane
-// inventory: per-repo activity counts and the rs-fetch visibility switches that
-// decide which repos the Fetch list shows, off the SAME /broker/dev read) and
-// "Reviews" (every verdict ever recorded, off its own ledger read). The Fetch
+// minted via the Management-anchored /broker/dev/gitea-session; the bar's
+// Backup button opens the backup dialog), "Repos" (the dev-lane inventory:
+// per-repo activity counts, the rs-fetch visibility switches that decide which
+// repos the Fetch list shows, and each repo's built image with its Build /
+// Cancel / Discard), "Fetch" (the RS-rendered open-PR/branch list with
+// click-to-copy rs-fetch commands, fed by one /broker/dev read per open — Q6,
+// no poller; Repos makes the SAME read) and "Reviews" (every verdict ever
+// recorded, off its own ledger read). The Fetch
 // tab is the guaranteed copy surface; the agent's final-comment code block
 // inside Gitea (with Gitea's own copy button) is the convenience layer.
 //
@@ -4181,9 +4184,7 @@ const DEV_TAB_RENDER = {
     gitea: renderDevGiteaTab,
     fetch: renderDevFetchTab,
     repos: renderDevReposTab,
-    images: renderDevImagesTab,
     reviews: renderDevReviewsTab,
-    backup: renderDevBackupTab,
 };
 
 function renderServicesInto(view) {
@@ -4221,15 +4222,15 @@ function renderServicesInto(view) {
     render(view, body);
 }
 
-// The Backup tab: take and discard an encrypted copy of the whole
-// dev Gitea. The board — issues, pull requests and their discussion — is the
-// human<->agent channel and exists in no git object, while an agent owns its
-// fork and in gitea ownership implies destruction. This is the surface that
-// makes that survivable.
+// The Gitea backup (the Backup button on Services → Gitea's bar): take and
+// discard an encrypted copy of the whole dev Gitea. The board — issues, pull
+// requests and their discussion — is the human<->agent channel and exists in
+// no git object, while an agent owns its fork and in gitea ownership implies
+// destruction. This is the surface that makes that survivable.
 //
-// The panel shows the EXPORT'S OWN facts and nothing else. It deliberately does
-// not summarise what is inside: the Services page's repo counters filter to
-// the mirrors (not the consumer forks, which is where boards live) and count
+// The dialog shows the EXPORT'S OWN facts and nothing else. It deliberately
+// does not summarise what is inside: the Services page's repo counters filter
+// to the mirrors (not the consumer forks, which is where boards live) and count
 // only OPEN items, so any headline drawn from them would state a number
 // materially smaller than what the file actually holds.
 function devBackupBytes(n) {
@@ -4238,9 +4239,50 @@ function devBackupBytes(n) {
     return mb >= 1 ? mb.toFixed(1) + " MiB" : Math.max(1, Math.round(n / 1024)) + " KiB";
 }
 
-async function renderDevBackupTab(view, body) {
-    body.innerHTML = "";
-    body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading backup…"]));
+// What the Gitea tab's own read of GET /broker/dev/board-export says about a
+// resident backup: true (one is held), false (none), null (the read did not
+// answer cleanly — the bar then still offers Backup, whose dialog shows why).
+async function devBackupHeld(res) {
+    if (!res || !res.ok) return null;
+    let b;
+    try { b = await res.json(); } catch (e) { return null; }
+    if (!b || !b.ok || !b.result) return null;
+    return !!b.result.present;
+}
+
+// The backup dialog. A normal modal (the one-dialog guard): Take and Discard
+// close it, open their own confirm-and-tail dialog, and reopen it, freshly
+// read, when that one is cancelled or done — so it always shows the file as it
+// is now, and the page under it (the Gitea web UI) is never re-rendered.
+// `onFacts(showButton)` (optional) tells the bar whether its Backup button
+// still has something to show (a held backup, or a running Gitea to take one).
+// `view` is the page's view: a sign-in or an unreachable broker closes the
+// dialog and lands the page, like the bar's other dialogs.
+function devBackupDialog(view, onFacts) {
+    if (document.querySelector(".modal-backdrop")) return null;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const panel = el("div", { class: "dev-backup-panel" }, [
+        el("div", { class: "mgmt-loading" }, ["Loading backup…"]),
+    ]);
+    const closeBtn = el("button", { class: "btn btn-secondary" }, ["Close"]);
+    const card = el("div", { class: "card dev-backup-card" }, [
+        el("h2", {}, ["Gitea backup"]), panel,
+        el("div", { class: "btn-row" }, [closeBtn]),
+    ]);
+    const close = () => backdrop.remove();
+    closeBtn.onclick = close;
+    backdrop.onclick = (e) => { if (e.target === backdrop) close(); };
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    devBackupFill(view, backdrop, panel, onFacts);
+    return backdrop;
+}
+
+async function devBackupFill(view, backdrop, panel, onFacts) {
+    const again = () => devBackupDialog(view, onFacts);
+    // Leave the dialog and land the page (a sign-in, a rejected webui, an
+    // unreachable broker): the bar's other dialogs do the same.
+    const land = (fn) => { backdrop.remove(); return fn(); };
     // Two independent reads: whether gitea is up (a backup needs it running),
     // and whether a backup is already resident (its host path, size and age, from
     // the host — the page cannot compute a path inside a container).
@@ -4249,70 +4291,67 @@ async function renderDevBackupTab(view, body) {
         [devRes, artRes] = await Promise.all([
             fetch("/broker/dev"), fetch("/broker/dev/board-export"),
         ]);
-    } catch (e) { return renderMgmtUnavailable(body); }
+    } catch (e) {
+        return backdrop.isConnected ? land(() => renderMgmtUnavailable(view)) : undefined;
+    }
+    // Closed while the reads were out: nothing to fill.
+    if (!backdrop.isConnected) return undefined;
     for (const res of [devRes, artRes]) {
         // The transport-vs-verb split: _relay reports its OWN failures as
         // 401/403/503 and a verb's refusal as HTTP 200 with {ok:false}. They must
         // not collapse into one error card — a 503 means the broker is
         // unreachable, which is a different remedy from a refused verb.
-        if (res.status === 401) return renderMgmtLogin(view, renderServicesInto);
-        if (res.status === 403) return renderMgmtRejected(body);
-        if (res.status === 503) return renderMgmtUnavailable(body);
+        const redirect = mgmtStatusRedirect(view, res.status, renderServicesInto);
+        if (redirect) return land(redirect);
     }
-    let dev = {}, art = {};
-    try { dev = await devRes.json(); } catch (e) { dev = {}; }
+    let dev, art = {};
+    try { dev = await devRes.json(); } catch (e) { return land(() => renderMgmtUnavailable(view)); }
     try { art = await artRes.json(); } catch (e) { art = {}; }
-    body.innerHTML = "";
-    const rerender = () => renderDevBackupTab(view, body);
+    if (!backdrop.isConnected) return undefined;
+    panel.innerHTML = "";
 
-    // A VERB refusal (HTTP 200 carrying {ok:false}) or an unparseable body must
-    // render the REAL error — never collapse into the "Gitea isn't running"
-    // card below. That collapse is B38: it sends the operator to press Enable on
-    // a Gitea that is already up, hiding whatever actually failed. The sibling
-    // tabs carry the same arm for exactly this reason.
-    if (!devRes.ok || !dev.ok || !dev.result) {
+    // A VERB refusal (HTTP 200 carrying {ok:false}) must render the REAL error
+    // — never collapse into a "Gitea isn't running" line. That collapse is B38:
+    // it sends the operator to press Enable on a Gitea that is already up,
+    // hiding whatever actually failed. The Services tabs carry the same arm
+    // for exactly this reason.
+    if (!devRes.ok || !dev || !dev.ok || !dev.result) {
         const retryE = el("button", { class: "btn-small" }, ["Retry"]);
-        retryE.onclick = rerender;
-        body.appendChild(el("div", { class: "mgmt-empty" }, [
+        retryE.onclick = () => { backdrop.remove(); again(); };
+        panel.appendChild(el("div", { class: "mgmt-empty" }, [
             el("span", {}, [(mgmtErrText(dev)
                              || "Could not read the dev state.") + " "]),
             retryE,
         ]));
-        return;
+        return undefined;
     }
     // `running` is nested under result.gitea, not at the top of result — the
-    // same read the Repos and Fetch tabs do. One level too high is SILENT:
-    // undefined is falsy, so the tab reports gitea down while it is up.
+    // same read the Services tabs do. One level too high is SILENT:
+    // undefined is falsy, so the dialog reports gitea down while it is up.
     const gstate = dev.result.gitea || {};
-    // The strip shows the Gitea-backed tabs only while Gitea runs.
-    if (noteServicesGitea(gstate)) return;
     const running = !!gstate.running;
-    // The artifact read is allowed to be absent without failing the page: it is
-    // a relay like the one beside it, so an empty reading means "no backup"
+    const up = gstate.upgrade;
+    // An upgrade, a going back or a restore holds Gitea (devGiteaHeldNotice's
+    // three cases): the bar says which, and no backup can be taken meanwhile.
+    const held = !!gstate.upgrading || !!(up && up.phase !== "committed");
+    // The artifact read is allowed to be absent without failing the dialog: it
+    // is a relay like the one beside it, so an empty reading means "no backup"
     // rather than "broken"; the dev-state arm above is what catches a real
     // failure, and this default only covers the ordinary absent-file case.
-    const info = (art && art.ok && art.result) ? art.result : {};
+    const known = !!(art && art.ok && art.result);
+    const info = known ? art.result : {};
+    const canTake = running && !held;
+    if (onFacts) onFacts(running || !known || !!info.present);
 
-    if (!running) {
-        // Only in place of Enable: a held Gitea with a backup already on disk
-        // still shows where that file is.
-        if (devGiteaHeldNotice(body, gstate)) return;
-        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
-        enable.onclick = () => devEnableGiteaDialog(view, rerender);
-        const retry = el("button", { class: "btn-small" }, ["Retry"]);
-        retry.onclick = rerender;
-        body.appendChild(el("div", { class: "mgmt-empty" }, [
-            el("span", {}, ["Gitea isn't running, so there is nothing to back "
-                            + "up yet. "]), enable, retry,
-        ]));
-        return;
+    const kids = [];
+    if (!canTake) {
+        kids.push(el("p", {}, [held
+            ? "Gitea is held by an upgrade, a going back or a restore (the bar "
+              + "says which), so a new backup cannot be taken until that is "
+              + "settled."
+            : "Gitea isn't running, so a new backup cannot be taken until it "
+              + "is enabled again (Enable, in the bar above the web UI)."]));
     }
-
-    const head = el("div", { class: "dev-repo-head" }, [
-        el("span", { class: "dev-repo-name" }, ["Backup"]),
-    ]);
-    const kids = [head];
-
     if (info.present) {
         const when = info.created_at
             ? new Date(info.created_at).toLocaleString() : "unknown";
@@ -4365,6 +4404,7 @@ async function renderDevBackupTab(view, body) {
     ]));
     // The FOURTH sanctioned exemption to the no-CLI-mention directive, granted
     // for exactly this and deliberately not taken until the command existed.
+    // Its one place is this dialog (the Backup button on Services → Gitea).
     kids.push(el("p", { class: "dev-repo-meta" }, [
         "Restoring is done on the machine running this, not from here — it "
         + "stops Gitea and replaces every repository and every board, so it "
@@ -4372,21 +4412,29 @@ async function renderDevBackupTab(view, body) {
         el("code", {}, ["research dev board import <file>"]),
     ]));
 
-    const take = el("button", { class: "btn-small" },
-                   [info.present ? "Take a new backup" : "Take a backup"]);
-    take.onclick = () => devBoardExportDialog(view, rerender);
-    const actions = [take];
+    const actions = [];
+    if (canTake) {
+        const take = el("button", { class: "btn-small" },
+                       [info.present ? "Take a new backup" : "Take a backup"]);
+        take.onclick = () => { backdrop.remove(); devBoardExportDialog(view, again); };
+        actions.push(take);
+    }
     if (info.present) {
+        // A pure file removal at the broker: it needs no running Gitea.
         const discard = el("button", { class: "btn-small btn-danger" },
                            ["Discard"]);
-        discard.onclick = () => devBoardDiscardDialog(view, rerender);
+        discard.onclick = () => { backdrop.remove(); devBoardDiscardDialog(view, again); };
         actions.push(discard);
     }
-    kids.push(el("div", { class: "btn-row left" }, actions));
-    body.appendChild(el("div", { class: "card dev-repo-card" }, kids));
+    if (actions.length) kids.push(el("div", { class: "btn-row left" }, actions));
+    for (const k of kids) panel.appendChild(k);
+    return undefined;
 }
 
-function devBoardExportDialog(view, onDone) {
+// Take and Discard, opened from the backup dialog: `back` reopens it, freshly
+// read, when this one is cancelled or its Done is pressed (in place of the
+// usual page re-render, which would reload the Gitea web UI under it).
+function devBoardExportDialog(view, back) {
     const pp1 = el("input", { type: "password", autocomplete: "new-password" });
     const pp2 = el("input", { type: "password", autocomplete: "new-password" });
     const masterI = el("input", { type: "password", autocomplete: "current-password" });
@@ -4442,12 +4490,13 @@ function devBoardExportDialog(view, onDone) {
                 proof: await deriveLoginProof(masterI.value),
             }),
         }),
-        onDone: (ok) => { if (onDone) onDone(ok); },
+        onCancel: back,
+        onClose: back,
         focus: () => pp1.focus(),
     });
 }
 
-function devBoardDiscardDialog(view, onDone) {
+function devBoardDiscardDialog(view, back) {
     const masterI = el("input", { type: "password", autocomplete: "current-password" });
     mgmtConfirmThenTail(view, {
         title: "Discard this backup",
@@ -4472,7 +4521,8 @@ function devBoardDiscardDialog(view, onDone) {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ proof: await deriveLoginProof(masterI.value) }),
         }),
-        onDone: (ok) => { if (onDone) onDone(ok); },
+        onCancel: back,
+        onClose: back,
         focus: () => masterI.focus(),
     });
 }
@@ -4581,9 +4631,15 @@ async function renderDevGiteaTab(view, body) {
     // Gate on gitea RUNNING before minting a session / loading the iframe — a
     // stopped gitea would otherwise proxy the iframe into an unreachable
     // upstream (the _proxy_http 502 is the backstop; this is the graceful path).
-    let devRes;
+    // Beside it, whether a backup is held: the bar's Backup button shows when
+    // there is one or Gitea runs to take one. That read is only a hint for the
+    // button — its failure is the backup dialog's to show, never this tab's.
+    let devRes, artRes;
     try {
-        devRes = await fetch("/broker/dev");
+        [devRes, artRes] = await Promise.all([
+            fetch("/broker/dev"),
+            fetch("/broker/dev/board-export").catch(() => null),
+        ]);
     } catch (e) { return renderMgmtUnavailable(body); }
     if (devRes.status === 401) return renderMgmtLogin(view, renderServicesInto);
     if (devRes.status === 403) return renderMgmtRejected(body);
@@ -4614,8 +4670,9 @@ async function renderDevGiteaTab(view, body) {
     if (noteServicesGitea(gstate)) return;
     // Gitea's own controls sit in a bar above the web UI in every state; the
     // line under it says why the web UI is not there when it is not.
+    const backupHeld = await devBackupHeld(artRes);
     body.innerHTML = "";
-    body.appendChild(devGiteaBar(view, gstate));
+    body.appendChild(devGiteaBar(view, gstate, backupHeld));
     const below = el("div", { class: "mgmt-loading" }, ["Opening Gitea…"]);
     body.appendChild(below);
     const say = (text, ...extra) => {
@@ -5948,21 +6005,23 @@ function devHideSyncedTick(pairs) {
     return el("div", { class: "dev-hide-synced-row" }, [label]);
 }
 
-// ---- The Repos tab: the dev-lane inventory + the rs-fetch switches ----------
+// ---- The Repos tab: the dev-lane inventory, the rs-fetch switches and the
+// ---- built images ------------------------------------------------------------
 //
 // Reads the SAME /broker/dev payload the Fetch tab reads — one verb, no second
 // read path — through the same transport-vs-verb ladder: a thrown fetch, a 503
 // or an unparseable body mean the broker is unreachable; a 200 carrying
 // {ok:false} means the broker ANSWERED and the verb refused, which is a
 // different thing and must not be reported as an outage.
-// ---- the Images tab ---------------------------------------------------------
-// One row per mirrored repo: its built image (at most one — a build replaces
-// it), and the actions Build, Cancel, Discard. A build runs as a broker job;
-// this page starts it, shows its log and can stop it. Publishing the image is
-// not done here: that is `rs-publish`, run where the registry token lives (the
-// row's copy button gives the command).
 //
-// Running builds are re-learned from the broker on every render (a reload
+// Each repo row's Image column: its built image (at most one — a build
+// replaces it), and the actions Build, Cancel, Discard. A build runs as a
+// broker job; this page starts it, shows its log and can stop it. Publishing
+// the image is not done here: that is `rs-publish`, run where the registry
+// token lives (the row's copy button gives the command).
+//
+// Running builds are re-learned from the broker on every render of the tab
+// (GET /broker/dev/image-active, beside the /broker/dev read; a reload
 // forgets this page's memory), keyed by the repo's name in lower case: the
 // broker runs one build per repo and compares names that way.
 //
@@ -5996,130 +6055,64 @@ function devImageBytes(n) {
     return mb >= 1 ? mb.toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " kB";
 }
 
-function devImagesShowing(body) {
-    return state.hostPage === "services" && servicesActiveTab === "images"
+function devReposShowing(body) {
+    return state.hostPage === "services" && servicesActiveTab === "repos"
         && body && body.isConnected;
 }
 
-// Redraw the Images tab after something changed: the caller's own body when
+// Redraw the Repos tab after something changed: the caller's own body when
 // that is still the tab on screen, else whatever shows the tab now (a dialog
 // or a watcher can outlive the body it was opened from, when the page was
 // rebuilt meanwhile). Nothing when another page or tab is showing.
-function devImagesRedraw(view, body) {
-    if (devImagesShowing(body)) return renderDevImagesTab(view, body);
+function devReposRedraw(view, body) {
+    if (devReposShowing(body)) return renderDevReposTab(view, body);
     const now = hostBody();
-    if (now && state.hostPage === "services" && servicesActiveTab === "images") {
+    if (now && state.hostPage === "services" && servicesActiveTab === "repos") {
         return rerenderView(now);
     }
+    return undefined;
 }
 
-async function renderDevImagesTab(view, body) {
-    body.innerHTML = "";
-    body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading built images…"]));
-    let res, act;
-    try {
-        [res, act] = await Promise.all([fetch("/broker/dev"),
-                                        fetch("/broker/dev/image-active")]);
-    } catch (e) { return renderMgmtUnavailable(body); }
-    for (const r of [res, act]) {
-        if (r.status === 401) return renderMgmtLogin(view, renderServicesInto);
-        if (r.status === 403) return renderMgmtRejected(body);
-        if (r.status === 503) return renderMgmtUnavailable(body);
-    }
-    let data, active;
-    try { data = await res.json(); active = await act.json(); }
-    catch (e) { return renderMgmtUnavailable(body); }
-    const failed = (!res.ok || !data.ok || !data.result) ? data
-        : ((!act.ok || !active.ok || !active.result) ? active : null);
-    if (failed) {
-        body.innerHTML = "";
-        const retry = el("button", { class: "btn-small" }, ["Retry"]);
-        retry.onclick = () => renderDevImagesTab(view, body);
-        body.appendChild(el("div", { class: "mgmt-empty" }, [
-            el("span", {}, [(mgmtErrText(failed) || "Could not load the built images.") + " "]),
-            retry,
-        ]));
-        return;
-    }
-    // The strip shows the Gitea-backed tabs only while Gitea runs.
-    if (noteServicesGitea(data.result.gitea)) return;
-    // The broker's list is the truth about what is running; keep this page's
-    // watcher flag for the builds it still names.
+// Adopt the builds the broker reports running (the image-active reply's
+// result): the broker's list is the truth about what is running; keep this
+// page's log-box flag for the builds it still names. Then every running build
+// gets a watcher, so its row settles by itself and its end is announced once
+// — started here, not by the screen, so a render that ends on a stopped
+// Gitea or an empty list still hands each adopted build a watcher (the
+// replaced entries' watchers end at their next tick). By the listed name when
+// the repo is listed (that is the spelling the notice shows), else by the
+// broker's.
+function devImageAdopt(view, body, activeResult, repos) {
     const running = new Map();
-    for (const b of (Array.isArray(active.result.builds) ? active.result.builds : [])) {
+    const names = new Map();
+    for (const b of (Array.isArray(activeResult.builds) ? activeResult.builds : [])) {
         if (!b || typeof b.repo !== "string" || typeof b.op_id !== "string") continue;
         if (devImageEnded.has(b.op_id)) continue;
         const had = devImageBuild(b.repo);
         running.set(b.repo.toLowerCase(),
                     { opId: b.op_id, watching: false,
                       modal: !!(had && had.opId === b.op_id && had.modal) });
+        names.set(b.repo.toLowerCase(), b.repo);
     }
     devImageBuilds.clear();
     for (const [k, v] of running) devImageBuilds.set(k, v);
-    renderDevImagesScreen(view, body, data.result);
-}
-
-function renderDevImagesScreen(view, body, result) {
-    body.innerHTML = "";
-    const gitea = result.gitea || {};
-    const repos = Array.isArray(result.repos) ? result.repos : [];
-    if (devGiteaHeldNotice(body, gitea)) return;
-    if (!gitea.exists || !gitea.running) {
-        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
-        enable.onclick = () =>
-            devEnableGiteaDialog(view, () => renderDevImagesTab(view, body));
-        body.appendChild(el("div", { class: "mgmt-empty" }, [
-            el("span", {}, [gitea.exists ? "Gitea is stopped. "
-                                         : "The dev lane isn't enabled yet. "]),
-            enable,
-        ]));
-        return;
-    }
-    if (!repos.length) {
-        body.appendChild(el("div", { class: "mgmt-empty" }, [
-            "No dev repos yet. A repo is mirrored here when you create a dev "
-            + "project from a GitHub URL (New Project → Dev), or add a dev box to "
-            + "an existing project.",
-        ]));
-        return;
-    }
-    const head = el("tr", {}, [
-        el("th", {}, ["Repo"]),
-        el("th", {}, ["Built image"]),
-        el("th", {}, [""]),
-    ]);
-    const idle = [];
-    const rows = repos.filter((r) => r && typeof r.repo === "string")
-        .map((r) => devImageRow(view, body, r.repo, idle));
-    body.appendChild(el("div", { class: "dev-repos-wrap" }, [
-        el("table", { class: "dev-repos-table dev-images-table" }, [
-            el("thead", {}, [head]), el("tbody", {}, rows),
-        ]),
-    ]));
-    body.appendChild(el("div", { class: "hint" }, [
-        "Build takes what GitHub has now for the branch or tag you name: push "
-        + "the commit and its version tags to GitHub first. Each repo keeps one "
-        + "built image; a new build replaces it. The image records the git tags "
-        + "on its commit. Built images are not part of the Gitea backup. "
-        + "📋 rs-publish copies the command that publishes a built image: paste "
-        + "it in a fetch-enabled project or box terminal; it shows what it "
-        + "would upload, and uploads nothing until run again with --apply.",
-    ]));
-    devImageFillAll(idle);
-    // Every running build the broker named (started here, in another browser,
-    // or before a reload) gets a watcher, so its row settles by itself. By the
-    // listed name: that is the spelling the notice shows.
-    for (const r of repos) {
-        if (r && typeof r.repo === "string" && devImageBuild(r.repo)) {
-            devImageWatch(view, body, r.repo);
+    for (const r of (Array.isArray(repos) ? repos : [])) {
+        if (r && typeof r.repo === "string" && names.has(r.repo.toLowerCase())) {
+            names.set(r.repo.toLowerCase(), r.repo);
         }
     }
+    for (const name of names.values()) devImageWatch(view, body, name);
 }
 
-function devImageRow(view, body, repo, idle) {
-    const info = el("td", { class: "dev-image-info" }, ["…"]);
-    const acts = el("td", { class: "dev-image-actions" });
-    const row = el("tr", {}, [el("td", {}, [repo]), info, acts]);
+// One repo's Image cell: the built image's status line (filled later by
+// devImageFillAll) above its buttons, or "building…" with Show log and Cancel
+// while a build runs. `imagesErr` is set when this render could not read the
+// running builds: the cell then says so and offers no Build (a build might be
+// running), unless the page itself knows of one.
+function devImageCell(view, body, repo, idle, imagesErr) {
+    const info = el("div", { class: "dev-image-info" }, ["…"]);
+    const acts = el("div", { class: "dev-image-actions" });
+    const cell = el("td", { class: "dev-repos-image" }, [info, acts]);
     const building = devImageBuild(repo);
     if (building) {
         info.textContent = "building…";
@@ -6134,13 +6127,17 @@ function devImageRow(view, body, repo, idle) {
         };
         acts.appendChild(log);
         acts.appendChild(cancel);
-        return row;
+        return cell;
+    }
+    if (imagesErr) {
+        info.textContent = "not read: " + imagesErr;
+        return cell;
     }
     const build = el("button", { class: "btn-small" }, ["Build"]);
     build.onclick = () => devImageBuildDialog(view, body, repo);
     acts.appendChild(build);
     idle.push({ view, body, repo, info, acts });
-    return row;
+    return cell;
 }
 
 // The idle rows' images, read ONE AT A TIME: each read is several Gitea calls
@@ -6234,7 +6231,7 @@ async function devImageTail(view, body, repo, opId) {
     const card = el("div", { class: "card sw-build-card" });
     backdrop.appendChild(card);
     document.body.appendChild(backdrop);
-    const again = () => devImagesRedraw(view, body);
+    const again = () => devReposRedraw(view, body);
     const current = () => { const e = devImageBuild(repo); return (e && e.opId === opId) ? e : null; };
     const first = current();
     if (first) first.modal = true;
@@ -6270,8 +6267,8 @@ async function devImageTail(view, body, repo, opId) {
 }
 
 // Watch a build no log box is open for: when its job is over, say so in a
-// corner notice and repaint the tab if it is the one showing. It polls the
-// job's liveness only. It belongs to ONE entry object: a re-render replaces
+// corner notice and repaint the Repos tab if it is the one showing. It polls
+// the job's liveness only. It belongs to ONE entry object: a re-render replaces
 // the entries and starts its own watchers, and this one ends at its next
 // tick. An expired session stops it; the tab's next render starts a new one.
 async function devImageWatch(view, body, repo) {
@@ -6296,7 +6293,7 @@ async function devImageWatch(view, body, repo) {
     // drop it too, from the broker's list).
     devImageBuilds.delete(repo.toLowerCase());
     devImageAnnounce(repo, opId);
-    devImagesRedraw(view, body);
+    devReposRedraw(view, body);
 }
 
 // The corner notice's "show the details": the finished build's whole log.
@@ -6374,7 +6371,7 @@ function devImageBuildDialog(view, body, repo) {
         close();
         devImageBuilds.set(repo.toLowerCase(), { opId: b.op_id, modal: false, watching: false });
         // The row turns to "building…" (the tab is read again for that).
-        devImagesRedraw(view, body);
+        devReposRedraw(view, body);
         devImageTail(view, body, repo, b.op_id);
     };
     ref.focus();
@@ -6407,22 +6404,28 @@ function devImageDiscardDialog(view, body, repo) {
         const said = await devImagePost(view, "/broker/dev/image-discard", { repo: repo });
         if (said) { errEl.textContent = "Not discarded: " + said; go.disabled = false; return; }
         close();
-        devImagesRedraw(view, body);
+        devReposRedraw(view, body);
     };
 }
 
 async function renderDevReposTab(view, body) {
     body.innerHTML = "";
     body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading dev repos…"]));
-    let res;
+    // Two reads side by side: the dev state (the repos, Gitea's state) and the
+    // image builds running right now (the Image column).
+    let res, act;
     try {
-        res = await fetch("/broker/dev");
+        [res, act] = await Promise.all([fetch("/broker/dev"),
+                                        fetch("/broker/dev/image-active")]);
     } catch (e) { return renderMgmtUnavailable(body); }
-    if (res.status === 401) return renderMgmtLogin(view, renderServicesInto);
-    if (res.status === 403) return renderMgmtRejected(body);
-    if (res.status === 503) return renderMgmtUnavailable(body);
-    let data;
-    try { data = await res.json(); } catch (e) { return renderMgmtUnavailable(body); }
+    for (const r of [res, act]) {
+        if (r.status === 401) return renderMgmtLogin(view, renderServicesInto);
+        if (r.status === 403) return renderMgmtRejected(body);
+        if (r.status === 503) return renderMgmtUnavailable(body);
+    }
+    let data, active;
+    try { data = await res.json(); active = await act.json(); }
+    catch (e) { return renderMgmtUnavailable(body); }
     if (!res.ok || !data.ok || !data.result) {
         body.innerHTML = "";
         const retry = el("button", { class: "btn-small" }, ["Retry"]);
@@ -6436,7 +6439,13 @@ async function renderDevReposTab(view, body) {
     }
     // The strip shows the Gitea-backed tabs only while Gitea runs.
     if (noteServicesGitea(data.result.gitea)) return;
-    renderDevReposScreen(view, body, data.result);
+    // The running-builds verb refused (a 200 carrying {ok:false}): the
+    // inventory still renders and the Image column says why it is empty; the
+    // builds this page already knows keep their entries and watchers.
+    const imagesErr = (!act.ok || !active || !active.ok || !active.result)
+        ? mgmtErrText(active) : "";
+    if (!imagesErr) devImageAdopt(view, body, active.result, data.result.repos);
+    renderDevReposScreen(view, body, data.result, imagesErr);
 }
 
 // One inventory row's plain-language state, or "" when there is nothing to say.
@@ -6461,7 +6470,7 @@ function devCountCell(n) {
               [typeof n === "number" ? String(n) : "—"]);
 }
 
-function renderDevReposScreen(view, body, result) {
+function renderDevReposScreen(view, body, result, imagesErr) {
     body.innerHTML = "";
     const gitea = result.gitea || {};
     const repos = Array.isArray(result.repos) ? result.repos : [];
@@ -6473,7 +6482,7 @@ function renderDevReposScreen(view, body, result) {
     if (!gitea.exists || !gitea.running) {
         const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
         enable.onclick = () =>
-            devEnableGiteaDialog(view, () => renderDevReposTab(view, body));
+            devEnableGiteaDialog(view, () => devReposRedraw(view, body));
         body.appendChild(el("div", { class: "mgmt-empty" }, [
             el("span", {}, [gitea.exists ? "Gitea is stopped. "
                                          : "The dev lane isn't enabled yet. "]),
@@ -6493,7 +6502,10 @@ function renderDevReposScreen(view, body, result) {
     // column: it is the longest value in the table, and on a phone a sixth
     // column pushed the rs-fetch switch — the one control here — off-screen.
     // The two optional columns are CSS-hidden at narrow widths (see style.css),
-    // which leaves repo + counts + switch, the set that is worth a phone.
+    // which leaves repo + counts + switch + image, the set that is worth a
+    // phone. The Image column comes last, so the rs-fetch switch keeps its
+    // place on a phone however much an image's status line holds; it stays on
+    // a phone because it carries the only build controls there are.
     const head = el("tr", {}, [
         el("th", {}, ["Repo"]),
         el("th", { class: "dev-repos-num" }, ["Issues"]),
@@ -6501,8 +6513,10 @@ function renderDevReposScreen(view, body, result) {
         el("th", { class: "dev-repos-opt" }, ["Synced"]),
         el("th", { class: "dev-repos-opt" }, ["Worked by"]),
         el("th", {}, ["rs-fetch"]),
+        el("th", {}, ["Image"]),
     ]);
     const rows = [];
+    const idle = [];
     for (const r of repos) {
         // Deduplicated PROJECT names (devWorkedByProjects says why). An EMPTY
         // list does NOT mean nobody is working the repo — provision_consumer
@@ -6510,7 +6524,7 @@ function renderDevReposScreen(view, body, result) {
         // plainly, never as a warning state.
         const worked = devWorkedByProjects(
             attachments.filter((a) => a && a.repo === r.repo).map((a) => a.project));
-        rows.push(devRepoInventoryRow(view, body, r, worked));
+        rows.push(devRepoInventoryRow(view, body, r, worked, idle, imagesErr));
     }
     body.appendChild(el("div", { class: "dev-repos-wrap" }, [
         el("table", { class: "dev-repos-table" }, [
@@ -6522,8 +6536,17 @@ function renderDevReposScreen(view, body, result) {
         + "fork is where the agent files work and where you file tasks for it. "
         + "Switching rs-fetch off hides a repo from the Fetch tab and from "
         + "every project's rs-fetch tab; it never deletes anything, and "
-        + "rs-fetch still works on it by name in a terminal.",
+        + "rs-fetch still works on it by name in a terminal. "
+        + "In the Image column, Build takes what GitHub has now for the branch "
+        + "or tag you name: push the commit and its version tags to GitHub "
+        + "first. Each repo keeps one built image; a new build replaces it. The "
+        + "image records the git tags on its commit. Built images are not part "
+        + "of the Gitea backup. "
+        + "📋 rs-publish copies the command that publishes a built image: paste "
+        + "it in a fetch-enabled project or box terminal; it shows what it "
+        + "would upload, and uploads nothing until run again with --apply.",
     ]));
+    devImageFillAll(idle);
 }
 
 // ONE inventory row. The degraded arm is not optional: dev_status hands back a
@@ -6536,9 +6559,14 @@ function renderDevReposScreen(view, body, result) {
 // The one exception, on either arm, is a repo this host has not added (gitea
 // holds it, this host's dev-lane records do not): the switch is disabled and the
 // row says why, since every write on it would be refused.
-function devRepoInventoryRow(view, body, r, worked) {
+//
+// The Image column (devImageCell) needs only the repo's name. A degraded row
+// shows "—" there like its other cells — except while a build of that repo
+// runs: its building line, Show log and Cancel stay reachable.
+function devRepoInventoryRow(view, body, r, worked, idle, imagesErr) {
     const toggle = devFetchToggle(view, body, r);
     const notAdded = devRepoNotAdded(r);
+    const named = typeof r.repo === "string" && r.repo !== "";
     if (r.error) {
         const errCell = [
             el("div", { class: "dev-repo-name" }, [r.repo || ""]),
@@ -6553,6 +6581,11 @@ function devRepoInventoryRow(view, body, r, worked) {
             el("td", { class: "dev-repos-opt" }, ["—"]),
             el("td", { class: "dev-repos-opt" }, ["—"]),
             el("td", {}, [toggle]),
+            // The image actions never depend on the repo's status read, so a
+            // degraded row keeps them (the old Images tab offered them too).
+            named
+                ? devImageCell(view, body, r.repo, idle, imagesErr)
+                : el("td", { class: "dev-repos-image" }, ["—"]),
         ]);
     }
     // Sub-line: what this row's numbers belong to. The fork NAME is the
@@ -6583,6 +6616,8 @@ function devRepoInventoryRow(view, body, r, worked) {
         el("td", { class: "dev-pr-meta dev-repos-opt" },
            [worked.length ? worked.join(", ") : "—"]),
         el("td", {}, [toggle]),
+        named ? devImageCell(view, body, r.repo, idle, imagesErr)
+              : el("td", { class: "dev-repos-image" }, ["—"]),
     ]);
 }
 
@@ -6679,7 +6714,7 @@ function devFetchToggle(view, body, r) {
             btn.textContent = on ? "Enabled" : "Disabled";
             return;
         }
-        renderDevReposTab(view, body);
+        devReposRedraw(view, body);
     };
     return el("span", { class: "dev-fetch-cell" }, [btn, err]);
 }
@@ -6919,7 +6954,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     // not be read, absent = an older broker — all show nothing). No quoting
     // needed: a built image exists only for a repo whose lower-cased name
     // passed the image-name rule (letters, digits, ".", "_", "-", never led
-    // by "-"), so the name is shell-plain — the Images tab's argument.
+    // by "-"), so the name is shell-plain — the Repos tab's Image column's argument.
     const publishCopies = r.image === true
         ? [devCopyBtn("rs-publish " + r.repo, "📋 rs-publish")]
         : [];
@@ -7392,14 +7427,27 @@ function devRepoRemoveDialog(view, body, repo) {
 
 // Services → Gitea: the bar above the web UI with Gitea's own controls —
 // its state and version, Enable, Set Gitea password, Upgrade / Go back /
-// Discard previous version, Recover after an interrupted upgrade. Built from
-// the gitea object of the tab's own /broker/dev read (`g`); every dialog's
-// Done re-renders the page the bar is on (rerenderView), which re-reads
-// Gitea's state and so also updates which Services tabs the strip shows.
-function devGiteaBar(view, g) {
+// Discard previous version, Recover after an interrupted upgrade, and Backup.
+// Built from the gitea object of the tab's own /broker/dev read (`g`); every
+// dialog's Done re-renders the page the bar is on (rerenderView), which
+// re-reads Gitea's state and so also updates which Services tabs the strip
+// shows. The backup dialog is the exception: it reopens itself after a Take or
+// a Discard and leaves the web UI as it is (devBackupDialog).
+//
+// Backup shows in every state of the bar whenever a backup is held, or Gitea
+// runs so one can be taken; `backupHeld` is true / false / null (not known —
+// shown then, so a failed read surfaces in the dialog rather than hiding).
+function devGiteaBar(view, g, backupHeld) {
     const row = el("div", { class: "mgmt-row mgmt-infra-row dev-gitea-bar" }, [
         el("span", {}, ["Gitea (dev lane)"]),
     ]);
+    const backupBtn = el("button", { class: "btn-small" }, ["Backup"]);
+    const showBackup = (show) => { backupBtn.style.display = show ? "" : "none"; };
+    backupBtn.onclick = () => devBackupDialog(view, showBackup);
+    showBackup(!!g.running || backupHeld !== false);
+    // Every return below hands back the row through here, so Backup is the
+    // bar's last button in each state.
+    const done = () => { row.appendChild(backupBtn); return row; };
     const enableBtn = () => {
         const b = el("button", { class: "btn-small" }, ["Enable Gitea"]);
         b.onclick = () =>
@@ -7409,11 +7457,12 @@ function devGiteaBar(view, g) {
     const rerender = () => rerenderView(view);
     const up = g.upgrade || null;
     // While an upgrade or a restore holds Gitea, nothing here can act on it:
-    // say so instead of offering buttons that would only be refused.
+    // say so instead of offering buttons that would only be refused (Backup
+    // stays when a backup is held: its dialog says where the file is).
     if (g.upgrading) {
         row.appendChild(el("span", { class: "type-badge" },
                            ["being upgraded, put back or restored…"]));
-        return row;
+        return done();
     }
     // An upgrade cut off before the new version proved itself, or going back
     // cut off part way: Enable finishes either by putting the previous version
@@ -7434,12 +7483,12 @@ function devGiteaBar(view, g) {
             rec.onclick = () => devEnableGiteaDialog(view, rerender);
             row.appendChild(rec);
         }
-        return row;
+        return done();
     }
     if (!g.exists) {
         row.appendChild(el("span", { class: "type-badge" }, ["not enabled"]));
         row.appendChild(enableBtn());
-        return row;
+        return done();
     }
     row.appendChild(el("span",
                        { class: g.running ? "state-running" : "state-stopped" },
@@ -7467,7 +7516,7 @@ function devGiteaBar(view, g) {
         upBtn.onclick = () => devGiteaUpgradeDialog(view, g, rerender);
         row.appendChild(upBtn);
     }
-    return row;
+    return done();
 }
 
 // ---- the shared Aldine LaTeX editor (Services → Aldine) -------------------
@@ -7978,7 +8027,7 @@ const OP_CHECKLISTS = {
 // The deliberate "Enable Gitea" flow (STAGE_DEV_GITEA webui-first A): a tailed
 // op (dev_gitea_start ∈ PROGRESS_VERBS) that CREATES gitea from nothing or
 // resumes a stopped one. Shared by the Services Gitea bar, and the Fetch and
-// Backup tabs' stopped branches. onDone(ok) re-renders the
+// Repos tabs' stopped branches. onDone(ok) re-renders the
 // caller's surface against the now-running gitea.
 function devEnableGiteaDialog(view, onDone) {
     mgmtConfirmThenTail(view, {
@@ -8329,7 +8378,8 @@ function opChecklist(verb) {
     return { listEl, markDone, markMsg, markWarn, markNote, dropPending };
 }
 
-async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
+// `onClose` (optional) replaces the Done button's page re-render.
+async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone, onClose) {
     const { listEl, markDone, markWarn, markNote, dropPending } = opChecklist(verb);
 
     // The failure reason — populated ONLY on failure; the running/done state is
@@ -8343,7 +8393,8 @@ async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
     doneBtn.onclick = () => {
         if (doneBtn.disabled) return;
         backdrop.remove();
-        rerenderView(view);
+        if (onClose) onClose();
+        else rerenderView(view);
     };
     card.innerHTML = "";
     card.appendChild(el("h2", {}, [title]));
@@ -8915,7 +8966,9 @@ function mgmtConfirmThenTail(view, cfg) {
     const backdrop = el("div", { class: "modal-backdrop" });
     const errEl = el("div", { class: "error" });
     const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
-    cancel.onclick = () => backdrop.remove();
+    // cfg.onCancel (optional): what a Cancel leads back to (the backup dialog
+    // reopens itself this way).
+    cancel.onclick = () => { backdrop.remove(); if (cfg.onCancel) cfg.onCancel(); };
     const go = el("button", { class: cfg.danger ? "btn btn-danger" : "btn" },
                  [cfg.confirmLabel]);
     const card = el("div", { class: cfg.cardClass ? "card " + cfg.cardClass : "card" }, [
@@ -8964,7 +9017,7 @@ function mgmtConfirmThenTail(view, cfg) {
         } else {
             await mgmtTailOp(view, backdrop, card, body.op_id,
                              cfg.tailTitle || cfg.title, cfg.checklist || cfg.verb,
-                             cfg.onDone);
+                             cfg.onDone, cfg.onClose);
         }
     };
     backdrop.appendChild(card);

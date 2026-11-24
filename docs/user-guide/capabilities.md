@@ -58,7 +58,7 @@ The box window (or `rs-sandbox create`) sets per-box options over the type's def
 
 ### Publishing a dev repo's image
 
-RS builds a pushed tag or branch of a mirrored dev repo into a Docker image from the Services page's **Images** tab, and keeps one built image per repo. `rs-publish`, in any fetch-enabled project or box terminal, uploads it to a public registry under each git tag on its commit (or the full commit id when it has none) and moves `latest`. RS itself never holds the registry credential. When the repo has a built image, its card on the Services page's Fetch tab and its row on the Images tab each have a 📋 rs-publish button that copies the command.
+RS builds a pushed tag or branch of a mirrored dev repo into a Docker image from the Services page's **Repos** tab (each repo's Image column), and keeps one built image per repo. `rs-publish`, in any fetch-enabled project or box terminal, uploads it to a public registry under each git tag on its commit (or the full commit id when it has none) and moves `latest`. RS itself never holds the registry credential. When the repo has a built image, its card on the Services page's Fetch tab and its row on the Repos tab each have a 📋 rs-publish button that copies the command.
 
 1. On GitHub, create a classic token with `write:packages`.
 2. In the fetch terminal, write `/workspace/.rs-publish.env` and `chmod 600` it:
@@ -69,7 +69,7 @@ RS builds a pushed tag or branch of a mirrored dev repo into a Docker image from
    RS_PUBLISH_TOKEN=<the token>
    ```
 
-3. Tag and push the collected commit, build it on the Images tab, then:
+3. Tag and push the collected commit, build it on the Repos tab, then:
 
    ```bash
    rs-publish <repo>           # shows what it would do; uploads nothing

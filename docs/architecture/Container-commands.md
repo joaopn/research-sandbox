@@ -8,7 +8,7 @@ nav_order: 2
 
 RS puts a small set of commands into its containers. Each one is aimed at a particular user: the dev agent, the maintainer collecting work, or the operator on the host. A container's search path holds only the commands meant for whoever works in that kind of container. RS's own helpers are kept in a private folder (`/usr/local/lib/rs`), and nobody runs them by name.
 
-Most of these tasks can also be done from the webui. The Fetch tab copies ready-made `rs-fetch` and `rs-sync` commands, and the Images tab builds images and copies the `rs-publish` command. The commands are what an agent uses, and what a person types in a terminal.
+Most of these tasks can also be done from the webui. The Fetch tab copies ready-made `rs-fetch` and `rs-sync` commands, and the Repos tab builds images and copies the `rs-publish` command. The commands are what an agent uses, and what a person types in a terminal.
 
 ```mermaid
 flowchart TD
@@ -25,7 +25,7 @@ flowchart TD
     person --> rssync["rs-sync<br/>issues and PRs to GitHub"]
     person --> rspub["rs-publish<br/>image to a registry"]
   end
-  subgraph host["Host terminal or Images tab"]
+  subgraph host["Host terminal or Repos tab"]
     op["Operator"] --> img["research dev image<br/>build, show, discard"]
   end
   land --> gitea["Agent's fork on Gitea"]
@@ -52,7 +52,7 @@ flowchart TD
 | `rs-fetch` | Maintainer | Projects and boxes created with the rs-fetch option |
 | `rs-sync` | Maintainer | Same as rs-fetch |
 | `rs-publish` | Maintainer | Same as rs-fetch |
-| `research dev image` | Operator | Host terminal; the Services page's Images tab does the same |
+| `research dev image` | Operator | Host terminal; the Services page's Repos tab does the same |
 | `rs-web-restart` | Anyone in the box | Boxes with a web app (OpenKnowledge) |
 | `rs-worker` | Research supervisor | Research projects ([Research workflow](Research-workflow.md)) |
 
@@ -154,7 +154,7 @@ Settings live in `/workspace/.rs-publish.env`: the registry (`ghcr.io/<owner>`),
 
 During an upload, rs-publish shows its progress. In a terminal, one line is redrawn in place with the current layer, the total, the speed and the time left, and it says when a sent layer is waiting for the registry's check. When the output goes to a pipe or a log, it prints one line per uploaded layer as it goes. If whatever reads the output goes away (`| head`, a full disk), the run stops with one error and tags nothing more.
 
-GitHub keeps a newly published package private. rs-publish says so after a publish; making it public is a one-time change in the package's settings on GitHub. The Images tab's 📋 rs-publish button copies the command for a repository with a built image.
+GitHub keeps a newly published package private. rs-publish says so after a publish; making it public is a one-time change in the package's settings on GitHub. The Repos tab's 📋 rs-publish button copies the command for a repository with a built image.
 
 ## For the operator on the host
 
@@ -166,7 +166,7 @@ python research.py dev image show <repo>
 python research.py dev image discard <repo>
 ```
 
-`build` builds the image from what GitHub has now. It runs in a throwaway project with no agent and no credentials. The new image replaces the repository's previous one on the shelf. The Images tab on the Services page does the same, with a log and a Cancel button. Details: [Dev lane](Dev-lane.md), "Built images".
+`build` builds the image from what GitHub has now. It runs in a throwaway project with no agent and no credentials. The new image replaces the repository's previous one on the shelf. The Repos tab on the Services page does the same, with a log and a Cancel button. Details: [Dev lane](Dev-lane.md), "Built images".
 
 ## Design decisions
 

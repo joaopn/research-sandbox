@@ -127,9 +127,9 @@ flowchart TD
 
 The stored image carries its commit, the git tags on that commit and the repository's address as labels. The broker runs the same build as a background job, which is what the webui's build page will call. Several repositories build at once; one repository builds one image at a time. Cancel stops a running build: the job removes its own builder and the image already stored stays. A build and a discard wait while Gitea is upgraded or restored. A builder left behind by a build that died hard is removed by the next build of any repository.
 
-The Services page's Images tab is the normal way to use this. It lists every mirrored repository with its built image (git tags, commit, build time, size) or "none". Build opens a dialog for an optional branch or tag and Dockerfile path, then a log box with a Cancel button. The log box can be sent to the background: the row then shows "building…" and settles by itself with a notice. Discard removes the stored image. The terminal commands above do the same.
+The Services page's Repos tab is the normal way to use this. Its Image column shows each mirrored repository's built image (git tags, commit, build time, size) or "none". Build opens a dialog for an optional branch or tag and Dockerfile path, then a log box with a Cancel button. The log box can be sent to the background: the row then shows "building…" and settles by itself with a notice. Discard removes the stored image. The terminal commands above do the same.
 
-A build started from the terminal is not shown as building on the tab. Publishing the image to a registry is `rs-publish`, typed in a fetch-enabled project or box: see [Container commands](Container-commands.md). When a repository has a built image, its row on the Images tab and its card on the Fetch tab each have a 📋 rs-publish button that copies the command.
+A build started from the terminal is not shown as building on the tab. Publishing the image to a registry is `rs-publish`, typed in a fetch-enabled project or box: see [Container commands](Container-commands.md). When a repository has a built image, its row on the Repos tab and its card on the Fetch tab each have a 📋 rs-publish button that copies the command.
 
 ## Docs site
 

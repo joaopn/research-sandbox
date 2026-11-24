@@ -2412,7 +2412,8 @@ def cmd_dev_board_import(args: argparse.Namespace) -> None:
 
 
 def cmd_dev_board_discard(args: argparse.Namespace) -> None:
-    """Remove the resident backup. The CLI twin of the Backup tab's Discard —
+    """Remove the resident backup. The CLI twin of the backup dialog's Discard
+    (the Backup button on Services → Gitea) —
     the webui is the primary surface, but the CLI stays capable."""
     try:
         res = rscore.dev_board_discard(_build(rscore.DevBoardDiscardRequest))
