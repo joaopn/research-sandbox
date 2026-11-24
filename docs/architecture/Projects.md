@@ -47,7 +47,7 @@ A project or box that still holds a file an older RS wrote there (`/workspace/CL
 
 ## Lifecycle
 
-Stop, Start, Update and Destroy are under Host → Projects. Stop and Start are also on each project's row in the sidebar (see [Browser and broker](Browser-and-broker.md)). An inner-Docker project cannot be restarted in place, so every start re-creates its container from the current RS image.
+Stop and Start are on each project's row in the sidebar; Update and Destroy are in its ⚙ window, under Project (see [Browser and broker](Browser-and-broker.md)). Host → Projects lists every project on the host and destroys only one the sidebar cannot show: its container is gone, or stuck in a state other than running or stopped. An inner-Docker project cannot be restarted in place, so every start re-creates its container from the current RS image.
 
 | Action | Inner-Docker project | Single-container project |
 |---|---|---|

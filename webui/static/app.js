@@ -1482,8 +1482,9 @@ async function syncSidebarFromBroker(prefetched, seq) {
 // ---- the rail's "Stopped" fold ------------------------------------------------
 // Projects whose container is cleanly stopped (`exited`, what Stop produces) sit
 // in a fold below the list, each with Start and its ⚙. Unusual container
-// states (paused, restarting, half-created) are not listed: Host → Projects shows and
-// handles those. The fold list is broker-derived and in memory only.
+// states (paused, restarting, half-created) are not listed: Host → Projects
+// shows those, each with Destroy (the only action it takes on a project).
+// The fold list is broker-derived and in memory only.
 let sidebarSyncSeq = 0;
 let sidebarSyncApplied = 0;
 function nextSidebarSyncSeq() {
@@ -1751,7 +1752,7 @@ async function railLifecycle(name, verb) {
     railPending.set(name, verb);
     paintLifecycleLabels();
     // A stop/start recreates or ends the supervisor: forget the remembered tab,
-    // as Management does (mgmtAction).
+    // so the project re-lands on its default tab rather than a dead session.
     delete state.projectLastService[name];
     let failure = null;
     try {
@@ -3940,13 +3941,15 @@ function mgmtCompare(a, b, key, dir) {
     return String(a.name).localeCompare(String(b.name));
 }
 
+// The host's project inventory: what is here, in what state, how big. It
+// acts on a project only where nothing else can: Attach puts a running
+// project back in the sidebar, and Destroy is offered on a row the sidebar
+// cannot show — orphaned (its container is gone) or a container in another
+// state than running or exited — so it has no sidebar row and no ⚙. Creating is New
+// Project's job; Start and Stop are on each project's sidebar row; Update and
+// Destroy in its ⚙ → Project (the hint under the table says so).
 function renderMgmtTable(view, projects) {
     view.innerHTML = "";
-    // The New Project box is the create entry point (the workflow picker is
-    // its card grid); this button just opens it. mgmtCreateDialog is only
-    // ever opened from a workflows card, with a chosen workflow manifest.
-    const create = el("button", { class: "btn-small" }, ["+ New project"]);
-    create.onclick = () => openWorkflows();
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => renderManagementInto(view);
     // Disk sizes are a USER-TRIGGERED measurement: summing a workspace means
@@ -3960,7 +3963,7 @@ function renderMgmtTable(view, projects) {
     // The page's name is the strip chip (Host) and this tab's (Projects),
     // so the header row carries only the toolbar.
     view.appendChild(el("div", { class: "mgmt-header" }, [
-        el("div", { class: "mgmt-toolbar" }, [create, refresh, measure]),
+        el("div", { class: "mgmt-toolbar" }, [refresh, measure]),
     ]));
     // Above both branches, so a host with no projects still sees it.
     appendOriginNotice(view);   // async fill, placeholder appended now
@@ -4011,26 +4014,22 @@ function renderMgmtTable(view, projects) {
         const badge = el("span", { class: "type-badge" });          // filled by mgmtFillStatus
         const sizeEl = el("span", { class: "mgmt-size" }, ["—"]);   // filled by Measure sizes
         fill[p.project] = { badge, size: sizeEl };
-        // Attach + Update need a live supervisor (bridge endpoint / recreate);
-        // only offered while running. Destroy is always available. An
-        // orphaned project (its container is gone) offers ONLY Destroy: there
-        // is no container to start or stop.
+        // Attach needs a live supervisor (its bridge endpoint), so only a
+        // running row has it. Destroy only on a row the sidebar cannot show
+        // (orphaned, or a container stuck created, paused, restarting or
+        // dead): a running or stopped project is destroyed from its ⚙ → Project.
+        const noSidebarRow = !running && p.state !== "exited";
         const actions = [];
-        if (!orphaned) {
-            const power = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
-            power.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start");
-            actions.push(power);
-        }
         if (running) {
             const attach = el("button", { class: "btn-small" }, ["Attach"]);
             attach.onclick = () => mgmtAttach(view, p.project, attach);
-            const update = el("button", { class: "btn-small" }, ["Update"]);
-            update.onclick = () => mgmtUpdate(view, p.project);
-            actions.push(attach, update);
+            actions.push(attach);
         }
-        const destroy = el("button", { class: "btn-small btn-danger" }, ["Destroy"]);
-        destroy.onclick = () => mgmtDestroyDialog(view, p.project);
-        actions.push(destroy);
+        if (noSidebarRow) {
+            const destroy = el("button", { class: "btn-small btn-danger" }, ["Destroy"]);
+            destroy.onclick = () => mgmtDestroyDialog(view, p.project);
+            actions.push(destroy);
+        }
         const tr = el("tr", { class: "mgmt-prow", "data-project": p.project }, [
             el("td", { class: "mgmt-pname" }, [el("span", { class: "mgmt-name-text" }, [p.project])]),
             el("td", { class: "mgmt-workflow" }, [badge]),
@@ -4063,6 +4062,10 @@ function renderMgmtTable(view, projects) {
             el("thead", {}, [el("tr", {}, [...heads, el("th", { scope: "col" }, ["Actions"])])]),
             tbody,
         ]),
+    ]));
+    view.appendChild(el("div", { class: "hint mgmt-ptable-hint" }, [
+        "Start and stop a project on its row in the sidebar; update or destroy it "
+        + "in its ⚙ → Project.",
     ]));
     applySort();
     paintLifecycleLabels();   // rows with an action in flight: label + disabled buttons
@@ -7877,26 +7880,6 @@ async function appendDefaultModelRow(view, rowEl, ctype, caption) {
     rowEl.appendChild(errEl);
 }
 
-function mgmtAction(view, name, action) {
-    // A stop/start recreates the supervisor (fresh container + re-deployed editor),
-    // so drop the project's remembered tab — it should re-land on the editor default
-    // rather than a now-dead terminal session from before the restart.
-    delete state.projectLastService[name];
-    const desc = action === "start"
-        ? `Start "${name}". This recreates the supervisor (fresh container, re-staged images) and takes a moment. Running work is unaffected.`
-        : `Stop "${name}". This interrupts any running work in the supervisor.`;
-    mgmtConfirmThenTail(view, {
-        title: `${action === "start" ? "Start" : "Stop"} project ${name}`,
-        verb: action,
-        project: name,
-        confirmLabel: action === "start" ? "Start" : "Stop",
-        body: [el("p", {}, [desc])],
-        request: () => fetch(
-            `/broker/project/${encodeURIComponent(name)}/${action}`,
-            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
-    });
-}
-
 // An auth/availability status the caller should defer to (re-render the right
 // card), or null if the response carries a real verb result to handle.
 // `onLogin` (optional) is the post-login landing for the 401 arm — a caller
@@ -8507,10 +8490,11 @@ function lifecycleSetQueued(project, opId, queued) {
 }
 
 // Repaint every surface that shows an in-flight action: the rail row's tag and
-// the Management row (state cell + its action buttons, disabled meanwhile — the
-// broker would refuse them anyway). A Management row whose action ended while
-// the table could not be re-rendered (a dialog was open) says so and keeps its
-// buttons off: its render-time buttons describe the project BEFORE the action.
+// the Host → Projects row (state cell + whatever action buttons it shows —
+// Attach, or Destroy on an orphaned row, none on a stopped one — disabled
+// meanwhile). A row whose action ended while the table could not be
+// re-rendered (a dialog was open) says so and keeps its buttons off: its
+// render-time buttons describe the project BEFORE the action.
 function paintLifecycleLabels() {
     for (const row of document.querySelectorAll(".project-rail .project[data-name]")) {
         const name = row.getAttribute("data-name");
@@ -8890,6 +8874,8 @@ function folderChoicesLine(choices, error) {
 // "Continue in background" button (and a backdrop click) that closes the box
 // while the action carries on under a watcher. `opts.replay` re-shows a FINISHED
 // op from its log (the notice's click): no registry, no hooks, just the record.
+// `opts.onClose` (optional) is what Done leads to instead of re-rendering
+// `view` (the mgmtTailOp twin): a dialog opened from the ⚙ window passes it.
 async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
                              onDone, opts) {
     const replay = !!(opts && opts.replay);
@@ -8912,7 +8898,9 @@ async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
     doneBtn.onclick = () => {
         if (doneBtn.disabled) return;
         backdrop.remove();
-        if (!replay && view) rerenderView(view);
+        if (replay) return;
+        if (opts && opts.onClose) opts.onClose();
+        else if (view) rerenderView(view);
     };
     card.innerHTML = "";
     card.appendChild(el("h2", {}, [title]));
@@ -9009,7 +8997,8 @@ function mgmtConfirmThenTail(view, cfg) {
             // background while the action carries on.
             await lifecycleTail(view, backdrop, card, body.op_id,
                                 cfg.tailTitle || cfg.title, cfg.verb,
-                                cfg.project || null, cfg.onDone);
+                                cfg.project || null, cfg.onDone,
+                                cfg.onClose ? { onClose: cfg.onClose } : undefined);
         } else if (tailMode === "buildlog") {
             await mgmtTailBuildLog(view, backdrop, card, body.op_id,
                                    cfg.tailTitle || cfg.title,
@@ -11361,8 +11350,25 @@ async function mgmtAttach(view, name, btn) {
 
 // ---- update (file-only recreate) -------------------------------------------
 
-function mgmtUpdate(view, name) {
-    mgmtConfirmThenTail(view, {
+// Re-render Host → Projects when it is the page on screen (gated on the page
+// AND its tab), and only when the table holds none of the operator's typing:
+// the landing of a ⚙ → Project dialog, which must never re-render a page that
+// is not open.
+function rerenderProjectsTabIfOpen() {
+    const view = hostBody();
+    if (view && state.hostPage === "host" && hostActiveTab === "projects"
+            && !mgmtViewHoldsInput(view)) {
+        renderManagementInto(view);
+    }
+}
+
+// ⚙ → Project → Update. It runs on the lifecycle lane, so the sidebar row
+// shows "updating…" and a background finish posts the corner notice, as for
+// every start, stop and update. On success it closes THIS project's ⚙ window
+// (which shows the state from before the update); Done re-renders Host →
+// Projects only when that page is open.
+function mgmtUpdate(name) {
+    mgmtConfirmThenTail(boxOpView(), {
         title: `Update project ${name}`,
         tailTitle: `Updating ${name}`,
         verb: "update",
@@ -11375,12 +11381,18 @@ function mgmtUpdate(view, name) {
         ])],
         request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`,
             { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
+        onDone: (ok) => { if (ok) closeProjectConfigBox(name); },
+        onClose: rerenderProjectsTabIfOpen,
     });
 }
 
 // ---- destroy (type-name confirm + step-up re-auth) -------------------------
 
-function mgmtDestroyDialog(view, name) {
+// Opened from a project's ⚙ → Project (`fromGear`, with boxOpView() as the
+// view) or from an orphaned Host → Projects row (the table's view). From the
+// ⚙, success closes THAT project's window and Done re-renders Host → Projects
+// only when it is the open page; from the table, Done re-renders the table.
+function mgmtDestroyDialog(view, name, fromGear) {
     const nameI = el("input", { type: "text", placeholder: name, autocomplete: "off" });
     const pwI = el("input", { type: "password", autocomplete: "current-password" });
     mgmtConfirmThenTail(view, {
@@ -11418,6 +11430,7 @@ function mgmtDestroyDialog(view, name) {
         }),
         onDone: async (ok) => {
             if (!ok) return;
+            if (fromGear) closeProjectConfigBox(name);
             // Tear down the gone project's open terminals/websockets (no dead
             // reconnect spam), drop it from the sidebar + persisted vault —
             // including its saved tab arrangement, so a reused name starts
@@ -11435,6 +11448,7 @@ function mgmtDestroyDialog(view, name) {
             try { await persistVault(); } catch (e) { /* best-effort */ }
             refreshProjectRail();
         },
+        onClose: fromGear ? rerenderProjectsTabIfOpen : undefined,
         focus: () => nameI.focus(),
     });
 }
@@ -12433,12 +12447,11 @@ function makeRailSeparator(name) {
 function makeProjectRow(project) {
     const dot = el("span", { class: "status-dot" });
     const name = el("span", { class: "name" }, [project.name]);
-    // No per-row DESTROY: project lifecycle is the Management panel's job
-    // (broker create/destroy). The rail just reflects the running set — create
-    // adds a row, destroy removes it (see mgmtConfirmThenTail onDone hooks).
-    // The gear's Sidebar section does carry a per-row REMOVE, which is a
-    // different thing: it forgets this browser's bookmark and touches nothing
-    // on the sandbox (appendSidebarSection).
+    // No DESTROY on the row itself: Update and Destroy sit in the gear's
+    // Project section (appendProjectSection), and a create adds a row, a
+    // destroy removes it (see the mgmtConfirmThenTail onDone hooks). That
+    // section also carries Remove from sidebar, which is a different thing: it
+    // forgets this browser's bookmark and touches nothing on the sandbox.
     const head = el("div", { class: "project-head" }, [dot, name]);
     // Second line: a project-type badge (research/sandbox/dev, painted once per
     // rail render by paintProjectBadges) plus the always-present config gear,
@@ -13534,7 +13547,8 @@ function openAddProjectModal() {
 // Render-free teardown of a project's in-page state — close its terminals +
 // websockets (so a destroyed container stops drawing reconnect attempts), drop
 // its cached services, and clear it as active if it was. Callers handle the
-// vault entry + re-render. Used when a project is destroyed via Management.
+// vault entry + re-render. Used when a project is destroyed (⚙ → Project, or
+// an orphaned Host → Projects row) and by Remove from sidebar.
 function teardownProjectState(name) {
     for (const k of Object.keys(state.terminals)) {
         if (k.startsWith(`${name}:`)) {
@@ -14073,9 +14087,10 @@ function openProjectConfigBox(project) {
 }
 
 // The window's content: the section list and one pane per section, Tabs,
-// Extensions, Agents, Sharing, Ports and Sidebar in that order (the short
-// form, for a project whose tabs never loaded: Tabs, Sharing, Ports,
-// Sidebar). It opens on Tabs; which section was picked is not remembered.
+// Extensions, Agents, Sharing, Ports, Alerts and Project in that order (the
+// short form, for a project whose tabs never loaded or that is stopped: Tabs,
+// Sharing, Ports, Alerts, Project). It opens on Tabs; which section was
+// picked is not remembered.
 // Every pane is built at open (the hidden ones are display:none), so each
 // section loads as it did when it was a folded box. Every section builder
 // below fills its pane.
@@ -14123,10 +14138,7 @@ function makeProjectConfigBox(project) {
         appendExportedPortsSection(portsBox, project);
         appendDetectedAppsSection(portsBox, project);
         if (!activitySkipped(project.name)) appendAlertsSection(pane("Alerts", "alerts"), project);
-        // Removing a stopped project is not offered until a removal is
-        // remembered: today it would only wipe its saved layout and leave its
-        // fold row in place.
-        if (!stopped) appendSidebarSection(pane("Sidebar", "sidebar"), project);
+        appendProjectSection(pane("Project", "project"), project, stopped);
         select("tabs");
         return layout;
     }
@@ -14175,7 +14187,7 @@ function makeProjectConfigBox(project) {
     appendExportedPortsSection(portsBox, project);
     appendDetectedAppsSection(portsBox, project);
     if (!activitySkipped(project.name)) appendAlertsSection(pane("Alerts", "alerts"), project);
-    appendSidebarSection(pane("Sidebar", "sidebar"), project);
+    appendProjectSection(pane("Project", "project"), project, false);
     select("tabs");
     return layout;
 }
@@ -15040,31 +15052,59 @@ function appendAlertsSection(box, project) {
     ]));
 }
 
-// The "Sidebar" section — drop this browser's bookmark for a project. It is the
-// ONLY way to get rid of a row whose project is no longer here: the sidebar is a
-// per-browser list, and the one other place that ever removed a row is the
-// completion hook of Management's Destroy. That table also lists a project whose
-// container is gone while its workspace, network or volume remain (an orphaned
-// row, Destroy only), but a project with NOTHING left on this host — destroyed
-// elsewhere, or a box on another host entered by hand — is in no table at all
-// and has only this exit.
+// The "Project" section (⚙ → Project): what the sidebar row's Start and Stop
+// leave out — Update (running only), Destroy, and Remove from sidebar, each a
+// button with one line saying what it does. `stopped` = the project sits in
+// the rail's "Stopped" fold.
+//
+// Update and Destroy go only to a project this sandbox runs: a row the broker
+// minted (`_jit`) or a fold row. A bookmark entered by hand (a box run
+// elsewhere) has no lifecycle here — the rule the row's Stop button follows —
+// so its section holds Remove alone.
+//
+// Remove from sidebar drops this browser's bookmark for a project. It is the
+// ONLY way to get rid of a row whose project is no longer here: the sidebar is
+// a per-browser list, and the one other place that ever removed a row is the
+// completion hook of Destroy. Host → Projects also lists a project whose
+// container is gone while its workspace, network or volume remain (an
+// orphaned row, Destroy only), but a project with NOTHING left on this host —
+// destroyed elsewhere, or a box on another host entered by hand — is in no
+// table at all and has only this exit. It is not offered for a stopped
+// project until a removal is remembered: today it would only wipe its saved
+// layout and leave its fold row in place.
 //
 // Appended at BOTH exits of makeProjectConfigBox on purpose. The early one is
 // taken while a row has never been opened; the full one the moment it IS opened,
 // because the services list carries the always-on entries for ANY name, existing
 // or not. A tail-only append would hide the affordance in half the cases it
 // exists for — including the reported one.
-function appendSidebarSection(box, project) {
-    // `box` is the window's Sidebar pane, the last section (makeProjectConfigBox).
+function appendProjectSection(box, project, stopped) {
+    // `box` is the window's Project pane, the last section (makeProjectConfigBox).
+    const name = project.name;
+    const runsHere = stopped || !!project._jit;
     const section = el("div", { class: "config-section" });
-    const btn = el("button", { class: "btn-small btn-danger" }, ["Remove from sidebar"]);
-    btn.onclick = () => removeProjectFromSidebar(project);
-    section.appendChild(btn);
-    box.appendChild(section);
-    box.appendChild(el("div", { class: "config-hint" }, [
-        "Removes the bookmark from this browser only — nothing on the sandbox is "
-        + "created, changed or destroyed.",
+    const action = (btn, what) => section.appendChild(el("div", { class: "config-action" }, [
+        btn, el("div", { class: "config-action-text" }, [what]),
     ]));
+    if (runsHere && !stopped) {
+        const update = el("button", { class: "btn-small" }, ["Update"]);
+        update.onclick = () => mgmtUpdate(name);
+        action(update, "Recreates the project's container with the latest workspace "
+            + "templates. Running work is interrupted; no image is rebuilt.");
+    }
+    if (runsHere) {
+        const destroy = el("button", { class: "btn-small btn-danger" }, ["Destroy"]);
+        destroy.onclick = () => mgmtDestroyDialog(boxOpView(), name, true);
+        action(destroy, "Deletes the project for good: its container, workspace, "
+            + "volume and network.");
+    }
+    if (!stopped) {
+        const remove = el("button", { class: "btn-small btn-danger" }, ["Remove from sidebar"]);
+        remove.onclick = () => removeProjectFromSidebar(project);
+        action(remove, "Removes the bookmark from this browser only — nothing on the "
+            + "sandbox is created, changed or destroyed.");
+    }
+    box.appendChild(section);
 }
 
 // Confirm, then forget the row. This performs EXACTLY the browser-state half of
@@ -15616,12 +15656,14 @@ function appendSharingSection(box, project, enabled) {
 function projectFoldersPendingText(r) {
     if (r.rebuilds) {
         return "Saved. The change applies when the project next starts " +
-               "(Stop, then Start, in Host → Projects). That start re-creates " +
-               "the project's container: its agents keep their sign-ins and settings, " +
-               "but anything installed outside /workspace is gone.";
+               "(Stop, then Start, on the project's row in the sidebar). That " +
+               "start re-creates the project's container: its agents keep their " +
+               "sign-ins and settings, but anything installed outside /workspace " +
+               "is gone.";
     }
     return "Saved. The change applies when the project next starts: Stop, " +
-           "then Start, or Update, in Host → Projects.";
+           "then Start, on the project's row in the sidebar, or Update in its " +
+           "⚙ → Project.";
 }
 
 // ⚙ Project folders: the project's folders in RS's data folder, read-only at
@@ -17545,7 +17587,7 @@ async function handleControl(project, serviceId, term, ws, ctrl) {
             `Stored: ${project.host_key_fingerprint}\n` +
             `Actual: ${ctrl.actual}\n\n` +
             `Accept the new key?\n\n` +
-            `Click OK only if you intentionally recreated the supervisor (e.g. you changed its services from Host → Projects) — otherwise this could be a man-in-the-middle.`,
+            `Click OK only if you intentionally recreated the supervisor (e.g. you updated it from its ⚙ → Project, or stopped and started it from its sidebar row) — otherwise this could be a man-in-the-middle.`,
         );
         if (accept) {
             project.host_key_fingerprint = ctrl.actual;

@@ -54,8 +54,7 @@
     --tag-data: #db61a2;
     /* management-table actions column: fixed so every per-row grid resolves the
        same column tracks (header + rows align regardless of how many action
-       buttons a row shows). Sized to fit the 4-button running row
-       (Stop · Attach · Update · Destroy). */
+       buttons a row shows). Sized for the .mgmt-row grids' widest row. */
     --mgmt-actions-w: 300px;
 }
 
@@ -627,6 +626,21 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     margin-top: 8px;
     color: var(--fg-faint);
     font-size: 11px;
+    line-height: 1.3;
+}
+/* ⚙ → Project: one block per action (Update, Destroy, Remove from sidebar),
+   its button with the line saying what it does under it. */
+.project-config-box .config-action {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 4px 2px;
+}
+.project-config-box .config-action + .config-action { margin-top: 8px; }
+.project-config-box .config-action-text {
+    color: var(--fg-muted);
+    font-size: 12px;
     line-height: 1.3;
 }
 
@@ -1667,6 +1681,8 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 }
 .mgmt-ptable .mgmt-size-cell { text-align: right; }
 .mgmt-ptable .mgmt-actions { flex-wrap: nowrap; }
+/* The line under the table saying where start, stop, update and destroy are. */
+.mgmt-ptable-hint { text-align: center; margin-top: 10px; }
 /* The phone layout's sort control (no column headers there). */
 .mgmt-sortbar { display: none; }
 
@@ -2797,6 +2813,7 @@ html.mobile .mgmt-ptable .mgmt-name-text { white-space: normal; }
 html.mobile .mgmt-ptable .mgmt-size-cell { text-align: right; }
 html.mobile .mgmt-ptable .mgmt-actions-cell { grid-column: 1 / -1; }
 html.mobile .mgmt-ptable .mgmt-actions { justify-content: flex-start; flex-wrap: wrap; }
+html.mobile .mgmt-ptable-hint { text-align: left; }
 html.mobile .mgmt-sortbar {
     display: flex;
     align-items: center;

@@ -179,7 +179,7 @@ def resolve_wiring():
         token = ""
     if not token:
         raise MirrorError(f"the dev-lane access token is not staged at {token_file}; "
-                          f"ask the operator to restart the project (Stop, then Start, in Host → Projects)")
+                          f"ask the operator to restart the project (Stop, then Start, on the project's row in the sidebar)")
     return DEV_GITEA_URL, token
 
 
