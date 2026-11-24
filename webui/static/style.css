@@ -1751,6 +1751,14 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 .sw-fleet-line { font-size: 13px; color: var(--fg-accent); font-style: italic; }
 .sw-fleet-line .sw-status { display: block; margin: -6px 0 14px; }
 .sw-fleet-line .sw-status:empty { display: none; }
+/* "Show progress" (opens a build's box again while it is in flight): on a dist
+   row its own line under the cells, under the action buttons (the actions track
+   is sized for Pull and Refresh); on the fleet line beside the status text. */
+.sw-dists .sw-progress-btn { grid-column: 1 / -1; justify-self: end; }
+.sw-fleet-line:has(> .sw-progress-btn) {
+    display: flex; align-items: center; gap: 10px; margin: -6px 0 14px;
+}
+.sw-fleet-line:has(> .sw-progress-btn) .sw-status { margin: 0; }
 /* Build-lane dialog: a scrolling raw build-log tail (the authenticated stream of
    the host-only full log) + a coarse phase line. */
 .sw-build-card { width: 640px; max-width: 100%; }

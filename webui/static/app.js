@@ -9069,7 +9069,9 @@ function mgmtConfirmThenTail(view, cfg) {
 // entry per target is exact. Value: {opId, verb, agent, queued, modal,
 // watching, stalled}; `modal` = an open box is tailing it, `watching` = a
 // background watcher is. A 401/403 stalls the watcher (entry kept) and the next
-// seed restarts it.
+// seed restarts it. While a target is in flight its row offers "Show progress",
+// which opens the box again (softwareReopen); the watcher stands down while a
+// box is open, so the box alone sees the end and no notice is posted for it.
 const softwareInFlight = new Map();
 // Op ids this page saw finish: a seed racing a finishing child (holder gone,
 // per-op lock not yet) must not revive one and post a second notice.
@@ -9124,14 +9126,32 @@ function swSetQueued(target, opId, queued) {
 // would refuse them) and the fleet line under the header (+ Rebuild all). A
 // row whose build ended while the page could not re-render says so and keeps
 // its buttons off: its render-time status describes the dist BEFORE the build.
+// An in-flight row also gets one "Show progress" button (never disabled: it
+// only opens the box again), and loses it once the target is no longer in
+// flight; the button is looked up before it is added, so repaints never stack
+// it. The Aldine row puts it with its other buttons; a dist row and the fleet
+// line, whose action cell has no room for a third button, below or beside the
+// status (style.css).
 function paintSoftwareLabels() {
     for (const row of document.querySelectorAll("[data-swtarget]")) {
         const target = row.getAttribute("data-swtarget");
         const stateEl = row.querySelector(".sw-status");
         const buttons = target === "fleet"
             ? document.querySelectorAll(".sw-fleet-btn")
-            : row.querySelectorAll(".sw-act button");
+            : row.querySelectorAll(".sw-act button:not(.sw-progress-btn)");
         const entry = softwareInFlight.get(target);
+        const progressBtn = row.querySelector(".sw-progress-btn");
+        if (entry && !progressBtn) {
+            const b = el("button", {
+                class: "btn-small sw-progress-btn",
+                title: "Open this action's progress box again",
+            }, ["Show progress"]);
+            b.onclick = () => softwareReopen(b);
+            const act = target === "aldine" ? row.querySelector(".sw-act") : null;
+            if (act) act.prepend(b); else row.appendChild(b);
+        } else if (!entry && progressBtn) {
+            progressBtn.remove();
+        }
         if (entry) {
             if (stateEl) stateEl.textContent = swLabel(entry);
             buttons.forEach((b) => {
@@ -9238,7 +9258,10 @@ function softwareFinish(target, opId, outcome, background) {
 
 // Background watcher for one in-flight build (a dismissed box, or a build this
 // page learned from GET /broker/software/active). The double-start guard is
-// `watching`, set before the first await.
+// `watching`, set before the first await. It stands down while a box is open
+// for the entry (a reopened one): the box sees the end and finishes it without
+// a notice, and its dismissal starts a watcher again — which is why every exit
+// clears `watching`.
 async function softwareWatch(target) {
     const entry = softwareInFlight.get(target);
     if (!entry || entry.watching || entry.modal) return;
@@ -9249,9 +9272,17 @@ async function softwareWatch(target) {
     const res = await lifecyclePoll(
         st,
         (rec) => swSetQueued(target, opId, rec.step === "queue"),
-        () => softwareInFlight.get(target) !== entry);
-    if (res === null) return;                   // superseded
-    if (res.auth) { entry.watching = false; entry.stalled = true; return; }
+        () => softwareInFlight.get(target) !== entry || entry.modal);
+    entry.watching = false;
+    if (res === null || entry.modal) {          // superseded, or a box took over
+        // A box that opened and closed again before this watcher noticed found
+        // it still running and did not start another: carry on from here.
+        if (softwareInFlight.get(target) === entry && !entry.modal && !entry.stalled) {
+            softwareWatch(target);
+        }
+        return;
+    }
+    if (res.auth) { entry.stalled = true; return; }
     softwareFinish(target, opId, res, true);
 }
 
@@ -9280,15 +9311,24 @@ async function seedSoftwareFromBroker() {
 }
 
 // Phase 2 of a build box: the streaming log tail, closable. Registers the op
-// so the page shows it in flight; dismissing hands it to a watcher; an end
-// reached while the box is open drops it (no notice — the operator saw it).
+// so the page shows it in flight, then tails it in the box (softwareTailBox).
 // `landing` (default: the Software tab) is where Done, a close after the end
 // and a sign-in land — the Aldine row passes its own page's re-render.
 async function softwareTail(view, backdrop, card, opId, title, target, payload, landing) {
-    landing = landing || renderSoftwareInto;
     const entry = swRegister(target, opId, payload.verb, payload.agent);
+    await softwareTailBox(view, backdrop, card, entry, title, target,
+                          landing || renderSoftwareInto);
+}
+
+// Tail one registered entry in an open box — the first box and every reopened
+// one. Dismissing hands the op to a watcher; an end reached while the box is
+// open drops it (no notice — the operator saw it). `open` is this box's own
+// claim on `entry.modal`: a box dismissed and reopened at once leaves the first
+// tail still returning, and that return must not clear the new box's claim.
+async function softwareTailBox(view, backdrop, card, entry, title, target, landing) {
+    const opId = entry.opId;
     entry.modal = true;
-    let ended = false;
+    let open = true, ended = false;
     const dismiss = () => {
         backdrop.remove();
         if (ended) {
@@ -9297,7 +9337,8 @@ async function softwareTail(view, backdrop, card, opId, title, target, payload, 
             if (view && view.isConnected) landing(view);
             return;
         }
-        if (!entry.modal) return;
+        if (!open) return;
+        open = false;
         entry.modal = false;
         softwareWatch(target);
     };
@@ -9307,13 +9348,38 @@ async function softwareTail(view, backdrop, card, opId, title, target, payload, 
         onRecord: (rec) => swSetQueued(target, opId, rec.step === "queue"),
         onEnd: (outcome) => {
             ended = true;
+            open = false;
             entry.modal = false;
             softwareFinish(target, opId, outcome, false);
         },
     });
     // Session expired mid-tail: the build carries on at the broker. Keep the
     // entry (stalled) so the next seed after re-login picks it back up.
-    if (!ended && entry.modal) { entry.modal = false; entry.stalled = true; }
+    if (open) { open = false; entry.modal = false; entry.stalled = true; }
+}
+
+// "Show progress" on an in-flight row: the same box again, from the start of
+// the log. The page to land on is the one the button sits in (the box that
+// started the action may belong to a page since redrawn or left). An action
+// that has ended meanwhile, or a box already open, only repaints the row.
+function softwareReopen(btn) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const row = btn.closest("[data-swtarget]");
+    const target = row ? row.getAttribute("data-swtarget") : null;
+    const entry = target ? softwareInFlight.get(target) : null;
+    const view = btn.closest(".host-body");
+    if (!entry || entry.modal || softwareFinished.has(entry.opId) || !view) {
+        paintSoftwareLabels();
+        return;
+    }
+    const landing = target === "aldine" ? (view.__rsRender || renderAldineInto)
+                                        : renderSoftwareInto;
+    const title = softwareTitle(entry.verb, target);
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" }, [el("h2", {}, [title])]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    softwareTailBox(view, backdrop, card, entry, title, target, landing);
 }
 
 // ---- software: build lane (pull / rebuild) ---------------------------------
