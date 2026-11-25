@@ -159,3 +159,4 @@ The lab workflow's decisions are proposals until built; they are listed on [Lab 
 - One shared Aldine for the installation, not one per project; every wired agent sees every paper.
 - Aldine's own login is off, so only the web interface and the MCP gateway can reach it, on its own networks.
 - Pinned by version and image digest; the papers are kept across updates and Turn off.
+- The paper check is one skill and one helper role, in researcher projects and zotero boxes only; no project type or box type of its own.

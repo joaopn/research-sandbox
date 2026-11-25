@@ -23,6 +23,8 @@ python research.py project mcp allow myproj arxiv
 
 **Aldine, the shared LaTeX editor.** Turned on under Services → Aldine (or `research aldine on`), it appears on the MCP tab as the server `aldine`; tick it for an agent, a box or a research project's workers like any server. A project with something wired to it also gets an **Aldine** tab. There is one Aldine and one set of papers for the whole installation. See [Aldine](../architecture/Aldine.md).
 
+**Checking a paper's citations.** The agent of a `researcher` or `researcher-subagents` project, or of a zotero box, can check a paper's citations once it is ticked for Aldine. Ask it with `/paper-check <paper>` in Claude Code, `/skill:paper-check <paper>` in pi, or in plain words. It leaves one review comment per problem on the paper, read in the Aldine tab, and lists every citation with its verdict in `/workspace/paper-check/<paper>/checks.md`. See [Checking a paper's citations](../architecture/Aldine.md#checking-a-papers-citations).
+
 ### Worker services — `worker`
 
 Pipeline-side agents the supervisor's analysis workers call through the proxy (`research worker list`):
@@ -46,7 +48,7 @@ Each box comes from a **box type** over two images (base, or browser with Playwr
 | **`empty`** | base | off | a blank box, no instructions |
 | **`byo`** | base | on | bring your own: clones a repo at a ref and runs a setup command at boot |
 | **`dev`** | base | on, editor on | works a GitHub repo through its own fork in the shared Gitea, delivering through pull requests |
-| **`zotero`** | base | on | a Zotero library through the zotero MCP server; asks for a Zotero API key and library ID |
+| **`zotero`** | base | on | a Zotero library through the zotero MCP server; asks for a Zotero API key and library ID; its agent can check a paper's citations in Aldine |
 | **`open-knowledge`** | base | on | an OpenKnowledge knowledge base in its own tab; Share files on by default, notes' history optionally on Gitea |
 | **`paper-orchestra`** | base | on, editor on | the PaperOrchestra repo, cloned at boot |
 | **`websearcher`** | browser | on | web research with Playwright and headless Chromium |

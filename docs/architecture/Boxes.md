@@ -41,13 +41,13 @@ A box type is a preset: base or browser image, whether an agent is on by default
 | empty | base | off | Blank box, no instructions |
 | byo | base | on | Clones a repo at a pinned ref and runs a setup command |
 | dev | base | on, editor on | Works a GitHub repo through its own Gitea fork ([Dev lane](Dev-lane.md)) |
-| zotero | base | on | A Zotero library through the zotero MCP server |
+| zotero | base | on | A Zotero library through the zotero MCP server; its agent can check a paper's citations in Aldine |
 | open-knowledge | base | on | An OpenKnowledge knowledge base in its own tab |
 | paper-orchestra | base | on, editor on | The PaperOrchestra repo, cloned at boot |
 | websearcher | browser | on | Web research with Playwright and headless Chromium |
 | data-wrangler | base | on | Schemas, queries and extracts through the project's database MCPs |
 
-The zotero type asks for a Zotero API key and library ID and installs its MCP server at boot. The open-knowledge type copies the project's node into the box and starts OpenKnowledge itself. It has Share files on by default, can keep its notes' history on Gitea, and gives every other sharing agent in the project an `/ok` command that writes notes into its mailbox.
+The zotero type asks for a Zotero API key and library ID and installs its MCP server at boot. Its agent has the [paper check](Aldine.md#checking-a-papers-citations) and uses the library's full text of each source for it. The open-knowledge type copies the project's node into the box and starts OpenKnowledge itself. It has Share files on by default, can keep its notes' history on Gitea, and gives every other sharing agent in the project an `/ok` command that writes notes into its mailbox.
 
 The operator can register more types in `~/.research-sandbox/box-registry.json` on the host, with their instructions inline. A registered type uses the base or browser image, cannot reuse a built-in name, and cannot use Gitea history, a web app or skills for other agents. Its MCP servers' environment values may hold only plain text and the type's own fields, because Claude and pi read other forms differently. The catalog is re-read at every box add, so a new type works on existing projects; a registry that cannot be read, or a type that breaks a rule, stops the box add with an error.
 
