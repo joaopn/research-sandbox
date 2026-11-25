@@ -2220,6 +2220,10 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
        (which the vault/login cards keep). */
     max-width: none;
     min-width: 0;
+    /* One line of space below each card so consecutive repos read as
+       separate boxes. Below, not above: a card the Hide synced tick hides is
+       display:none and takes its margin with it. */
+    margin-bottom: 1em;
 }
 /* wraps on a narrow screen (the rs-sync buttons widen the row) */
 .dev-repo-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
