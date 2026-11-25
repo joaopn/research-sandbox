@@ -11,6 +11,12 @@ FROM rs-substrate-base:latest
 # carries the substrate + entrypoint + the MCP proxy tooling (below); what runs
 # inside (agent, box harness) is delivered per-project.
 
+# poppler-utils: `pdftotext`, and what an agent's file reader needs to read a
+# PDF (a researcher project's paper check reads sources with it).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 # MCP proxy support (STAGE_DIND_UNIFY): extensions on a sandbox-dind project get the
 # same proxy-routed upstreams as research, so bake the config renderer + the reload
 # helper (which also creates the rs-inner bridge). mcp_render_config.py is stdlib —

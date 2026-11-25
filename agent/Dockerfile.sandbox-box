@@ -14,13 +14,15 @@ FROM rs-ext-base:latest
 # greet-and-shell.sh (so the box's webui tab greet step works). Adds:
 #   - git: to clone a repo you want to inspect before trusting it.
 #   - iputils-ping: basic reachability checks from inside the box.
+#   - poppler-utils: `pdftotext`, and what an agent's file reader needs to read
+#     a PDF (a zotero box's paper check reads sources with it).
 # Plus a minimal idle entrypoint (no clone, no creds, no artifact surfaces); it
 # writes its own bypassPermissions settings.json + cp's the agent/editor dists at
 # boot, so no claude/editor is baked here.
 
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git iputils-ping \
+        git iputils-ping poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Minimal idle entrypoint (also rs-ext-base's default; re-COPYd here so the box
