@@ -2935,20 +2935,31 @@ def _account_links_warnings(state: str) -> list[dict]:
     return [{"kind": "account-links", "reason": reason}]
 
 
-def _harness_env_pairs(harness: "dict | None", agent: str) -> list[tuple[str, str]]:
-    """The RS_HARNESS_* variables a box runs with, from its entry: set values
-    only, `none` and the default test policy read as unset, nothing for an
-    agent-less box. ONE helper for what _run_box emits and what a start
-    compares against."""
-    if agent == "none" or not isinstance(harness, dict):
+def _preset_paper_check(preset: "dict | None") -> bool:
+    """Whether a resolved box type gives its box's agent the paper check
+    (`paper_check: true`; the catalog allows it on built-in types only).
+    Literal `is True`: the staged catalog sits in the project's folder."""
+    return isinstance(preset, dict) and preset.get("paper_check") is True
+
+
+def _harness_env_pairs(harness: "dict | None", agent: str, *,
+                       paper_check: bool) -> list[tuple[str, str]]:
+    """The RS_HARNESS_* variables a box runs with, from its entry and its
+    type: set values only, `none` and the default test policy read as unset,
+    RS_HARNESS_PAPER_CHECK=1 when its type carries the paper check
+    (_preset_paper_check), nothing for an agent-less box. ONE helper for what
+    _run_box emits and what a start compares against."""
+    if agent == "none":
         return []
     out = []
-    for f, var in HARNESS_ENV.items():
+    for f, var in HARNESS_ENV.items() if isinstance(harness, dict) else ():
         v = harness.get(f)
         if not isinstance(v, str) or not v or (f == "harness_mode" and v == "none") \
                 or (f == "test_policy" and v == TEST_POLICY_DEFAULT):
             continue
         out.append((var, v))
+    if paper_check:
+        out.append(("RS_HARNESS_PAPER_CHECK", "1"))
     return out
 
 
@@ -3109,7 +3120,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              node: bool = False, folders: list[str] | None = None,
              history: dict | None = None,
              web: dict | None = None, share: bool = False,
-             harness: dict | None = None,
+             harness: dict | None = None, paper_check: bool = False,
              trusted_browser: bool = False, status_bar: bool = True,
              pinned_setup: bool = False,
              account_links_blocked: bool = True) -> list[dict]:
@@ -3276,7 +3287,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # The working mode and doer/checker models (from the STORED entry: env is
     # fixed at run). Set values only, so a box without them runs byte-identical;
     # the installer execs (here and the host's refresh) inherit them.
-    for var, v in _harness_env_pairs(harness, agent):
+    # The paper check rides the same way, from the box's type.
+    for var, v in _harness_env_pairs(harness, agent, paper_check=paper_check):
         model_env += ["-e", f"{var}={v}"]
     # Preset setup script rides env argv deliberately: it is user-VISIBLE
     # catalog data (the window shows it), never a field value.
@@ -3575,6 +3587,9 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
              # The working mode and doer/checker models, re-applied from the
              # STORED entry like the model pair (env is fixed at docker run).
              harness=entry.get("harness") if isinstance(entry.get("harness"), dict) else None,
+             # The paper check, from the box's type in the catalog read above
+             # (a type no longer resolvable gives none).
+             paper_check=_preset_paper_check(preset),
              # Same reasoning: the rs-fetch add-host + staging must re-apply
              # from the stored entry on every re-run.
              fetch=bool(entry.get("fetch")),
@@ -3942,6 +3957,7 @@ def cmd_create(args: argparse.Namespace) -> None:
                         effort=effort, fetch=fetch, node=node, folders=folders,
                         history=history, loopback_ports=loopback_ports,
                         web=web, share=share, harness=harness or None,
+                        paper_check=_preset_paper_check(preset),
                         status_bar=status_bar, trusted_browser=trusted_browser,
                         pinned_setup=pinned_setup,
                         account_links_blocked=account_links_blocked)
@@ -4098,7 +4114,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     # The working mode and doer/checker models ride the container's environment
     # (fixed at run): settings changed while parked re-run the box.
     if exists and (_container_harness_env(cname)
-                   != set(_harness_env_pairs(entry.get("harness"), entry.get("agent", "none")))):
+                   != set(_harness_env_pairs(
+                       entry.get("harness"), entry.get("agent", "none"),
+                       paper_check=_preset_paper_check(
+                           load_box_catalog().get(entry.get("preset") or "empty"))))):
         _print_warnings(args.name, _rerun_box(args.name, entry))
         print(f"box {args.name!r}: re-run at {entry['ip']} "
               f"(its working mode changed while parked)")
@@ -4515,8 +4534,9 @@ def cmd_settings(args: argparse.Namespace) -> None:
         new_h = _box_harness(args, agent)
     else:
         new_h = entry.get("harness") if isinstance(entry.get("harness"), dict) else {}
-    old_h = dict(_harness_env_pairs(entry.get("harness"), agent))
-    harness_changed = old_h != dict(_harness_env_pairs(new_h, agent))
+    paper_check = _preset_paper_check(load_box_catalog().get(entry.get("preset") or "empty"))
+    old_h = dict(_harness_env_pairs(entry.get("harness"), agent, paper_check=paper_check))
+    harness_changed = old_h != dict(_harness_env_pairs(new_h, agent, paper_check=paper_check))
     halves = [h for h, a, b in (("model", entry.get("model") or "", model),
                                 ("effort", entry.get("effort") or "", effort))
               if a != b or (write is not None and h in write)]

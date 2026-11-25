@@ -16,7 +16,9 @@ how it was looked up, whether it was found, and for a hit: the record's title,
 year, venue, first authors, DOI, whether it is retracted, its open-access
 status and URL, and its abstract rebuilt from OpenAlex's inverted index. A
 network or parse failure for one entry is reported in that entry's object (an
-`error` field) and the pass goes on with the next.
+`error` field) and the pass goes on with the next. When the index answers
+that it wants fewer requests and names a wait, the pass waits that long and
+asks once more.
 
 Standard library only; runs under any Python 3.9 or later. It sends a plain
 generic User-Agent and nothing about the person running it.
@@ -33,6 +35,7 @@ are dropped, accented letters keep their letter).
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -212,13 +215,22 @@ def norm_title(s):
 
 # --- OpenAlex ---------------------------------------------------------------
 
-def fetch(url):
-    """(record, None) or (None, why)."""
+def fetch(url, waited=False):
+    """(record, None) or (None, why). An answer that says to wait (HTTP 429
+    with a Retry-After in seconds) is waited out as long as the server asks,
+    once; a second one is reported."""
     req = urllib.request.Request(url, headers=HEADERS)
     try:
         with urllib.request.urlopen(req) as r:
             return json.loads(r.read().decode("utf-8")), None
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            after = (e.headers.get("Retry-After") or "").strip()
+            if not waited and after.isdigit():
+                time.sleep(int(after))
+                return fetch(url, waited=True)
+            return None, ("HTTP 429: the index asked for fewer requests (without a key it "
+                          "allows a limited number of searches a day for one network address)")
         return None, f"HTTP {e.code}"
     except (urllib.error.URLError, OSError) as e:
         return None, f"network: {getattr(e, 'reason', e)}"

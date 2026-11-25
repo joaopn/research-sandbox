@@ -65,11 +65,12 @@ Then post one review comment per problem with `add_comment`:
 - Anchor it on the citing sentence: a quote from the `.tex` file that occurs there once. On `ambiguous_anchor`, send it again with the `occurrence` the error names; on `stale_anchor`, read the file again and requote. For a wrong bibliography entry (it does not exist, it is retracted, its authors, year or venue are wrong), anchor on the entry's first line in the `.bib` file.
 - The comment is plain text: the verdict first, in plain words; what the source says, as a short verbatim quote with where it stands; how the source was read (full text, abstract only, someone else's description); the better source, if there is one, with its identifier.
 - When a rewording helps, give it as the `suggestion`: the replacement for exactly the quoted span.
+- A sentence the helper could not check (the source could not be read, or only its abstract, which does not state the point) gets a comment that says so and what would be needed, such as a copy of the source.
 - A citation the helper found supported gets no comment.
 
 ## 6. Write the record
 
-Write `/workspace/paper-check/<paper>/checks.md`: every citation and every marked place, each with its verdict, how the source was read and which copy was read. The user can send this file to co-authors, who cannot open this Aldine; a later run reads it to check only what changed.
+Write `/workspace/paper-check/<paper>/checks.md`: every citation and every marked place, each with its verdict, how the source was read and which copy was read, and for a verdict from an abstract the part of the sentence the abstract does not state. The user can send this file to co-authors, who cannot open this Aldine; a later run reads it to check only what changed.
 
 ## 7. Tell the user
 

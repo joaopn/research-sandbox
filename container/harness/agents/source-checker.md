@@ -14,7 +14,7 @@ Work down this ladder and stop at the first step that gives you enough to judge 
 3. Another legitimate full text.
 4. The abstract (the index record, the publisher's landing page).
 
-Legitimate copies are the publisher's page, a repository (arXiv, PubMed Central, SSRN, OSF, an institution's repository) and the author's own page or their institution's. Never use a site that hosts papers without permission, and never pose as a person's browser. A site that refuses you is not retried: note the refusal and go on down the ladder.
+Legitimate copies are the publisher's page, a repository (arXiv, PubMed Central, SSRN, OSF, an institution's repository) and the author's own page or their institution's. Never use a site that hosts papers without permission, and never pose as a person's browser. A site that refuses you is not retried: note the refusal and go on down the ladder. An answer that asks you to wait (HTTP 429 with a `Retry-After`) is not a refusal: wait as long as it says and ask once more.
 
 Download files only into the folder your brief names. Read a PDF with `pdftotext` or the file reader; where the work has an HTML version (arXiv and PubMed Central often do), prefer it.
 

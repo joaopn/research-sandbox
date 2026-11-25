@@ -12,6 +12,10 @@
 #       instruction writer has laid the role's part; else as before
 #     ~/.claude/agents/analyst.md, ~/.claude/agents/surveyor.md — the same way,
 #       only when RS_HARNESS_SUBAGENTS is 1
+#     ~/.claude/agents/source-checker.md and
+#       ~/.claude/skills/paper-check/{SKILL.md,bibpass.py} — only when
+#       RS_HARNESS_PAPER_CHECK is 1 (the role is never lean: its text is
+#       self-contained)
 #     ~/.claude/skills/rs-<role>-rules/SKILL.md — a link, made for a lean role;
 #     ~/.claude/skills/rs-project-instructions/SKILL.md and
 #       rs-workspace-instructions/SKILL.md — links, made when a role can be lean
@@ -21,7 +25,9 @@
 #   pi (pi in RS_HARNESS_AGENTS), under pi's agent dir:
 #     agents/doer.md, agents/checker.md, skills/harness/{…same…},
 #     skills/rs-test/{…same…}; agents/analyst.md only when RS_HARNESS_SUBAGENTS
-#     is 1 (pi has no surveyor yet: it has no web search of its own)
+#     is 1 (pi has no surveyor yet: it has no web search of its own);
+#     agents/source-checker.md and skills/paper-check/{SKILL.md,bibpass.py}
+#     only when RS_HARNESS_PAPER_CHECK is 1
 #     and beside RS's rules extension, ~/.local/share/pi-agent/rs/roles/<role>.md
 #       — a link to the role's part, which the extension reads for that child
 #   either (any agent): ~/.claude/rules/rs-harness.md — the standing mode, and
@@ -53,10 +59,16 @@
 #   RS_HARNESS_SUBAGENTS              1: also write the analyst and surveyor
 #                                     helper roles (the project's record asks
 #                                     for them); anything else: neither
+#   RS_HARNESS_PAPER_CHECK            1: also write the paper-check skill and its
+#                                     source-checker helper role (a researcher
+#                                     project's agent, a zotero box's agent);
+#                                     anything else: neither
 #   RS_HARNESS_ANALYST_MODEL          Claude tier for the analyst (empty: the session's)
 #   RS_HARNESS_ANALYST_EFFORT         Claude effort level for the analyst (empty: none)
-#   RS_HARNESS_SURVEYOR_MODEL         Claude tier for the surveyor
-#   RS_HARNESS_SURVEYOR_EFFORT        Claude effort level for the surveyor
+#   RS_HARNESS_SURVEYOR_MODEL         Claude tier for the surveyor (and the
+#                                     source-checker)
+#   RS_HARNESS_SURVEYOR_EFFORT        Claude effort level for the surveyor (and
+#                                     the source-checker)
 #   RS_HARNESS_PI_ANALYST_MODEL       pi provider/model for pi's analyst (empty: pi's default)
 #   RS_HARNESS_PI_ANALYST_THINKING    pi thinking level for pi's analyst
 #                                     (these six: the project's record, read
@@ -184,7 +196,8 @@ checked() {
 # Every source must be readable before anything is written: a missing one would
 # otherwise leave a frontmatter-only agent file that reads as a success. A
 # mode's own rule body, and a test policy's, is checked when it is chosen, below.
-for f in agents/doer.md agents/checker.md agents/analyst.md agents/surveyor.md skill/SKILL.md modes/LIST skill-test/SKILL.md policies/LIST; do
+for f in agents/doer.md agents/checker.md agents/analyst.md agents/surveyor.md skill/SKILL.md modes/LIST skill-test/SKILL.md policies/LIST \
+        agents/source-checker.md skill-paper-check/SKILL.md skill-paper-check/bibpass.py; do
     if [ ! -r "$SRC/$f" ]; then
         warn "the shipped file $f is missing; nothing installed"
         echo RS_HARNESS_INSTALL_FAILED
@@ -229,6 +242,10 @@ SURVEYOR_MODEL=$(checked RS_HARNESS_SURVEYOR_MODEL "${RS_HARNESS_SURVEYOR_MODEL:
 SURVEYOR_EFFORT=$(checked RS_HARNESS_SURVEYOR_EFFORT "${RS_HARNESS_SURVEYOR_EFFORT:-}" claude_effort_ok)
 PI_ANALYST_MODEL=$(checked RS_HARNESS_PI_ANALYST_MODEL "${RS_HARNESS_PI_ANALYST_MODEL:-}" pi_model_ok)
 PI_ANALYST_THINKING=$(checked RS_HARNESS_PI_ANALYST_THINKING "${RS_HARNESS_PI_ANALYST_THINKING:-}" pi_thinking_ok)
+# The paper check (its skill and the source-checker role): only when the host
+# says this agent gets it.
+PAPER_CHECK=0
+[ "${RS_HARNESS_PAPER_CHECK:-}" = 1 ] && PAPER_CHECK=1
 # The servers pi's analyst names, each re-checked against the server-name
 # charset the host validates (MIRROR of mcp_servers.NAME_RE: a lowercase
 # letter, then lowercase letters, digits and hyphens).
@@ -263,6 +280,7 @@ DOER_DESC="Implements one unit of work from a self-contained brief (shipped by R
 CHECKER_DESC="Reviews a change or a plan read-only - verifies against the code, asserts defects, flags forks (shipped by RS)."
 ANALYST_DESC="Carries out one analysis from a self-contained brief, in the background, and reports its result files (shipped by RS)."
 SURVEYOR_DESC="Answers one survey question from the web, in the background, with a written summary and its sources (shipped by RS)."
+SOURCE_CHECKER_DESC="Checks one cited source against the sentences that cite it, or finds references for one uncited sentence, in the background (shipped by RS)."
 
 # skill DIR — the mode-switch skill (named rs-mode; its folder keeps the name
 # harness, so nothing is ever removed) with its own copy of every staged mode's
@@ -283,6 +301,12 @@ skill_test() {
         [ -r "$p" ] || continue
         put "$1/policies/${p##*/}" < "$p" || FAILED=1
     done
+}
+
+# skill_paper_check DIR — the paper-check skill with its bibliography pass.
+skill_paper_check() {
+    put "$1/SKILL.md" < "$SRC/skill-paper-check/SKILL.md" || FAILED=1
+    put "$1/bibpass.py" < "$SRC/skill-paper-check/bibpass.py" || FAILED=1
 }
 
 # has_part ROLE — RS's instruction writer laid ROLE's part here: a regular,
@@ -375,6 +399,22 @@ if [ "$HAS_CLAUDE" = 1 ]; then
             cat "$SRC/agents/surveyor.md"
         } | put "$HOME/.claude/agents/surveyor.md" || FAILED=1
     fi
+    if [ "$PAPER_CHECK" = 1 ]; then
+        # The source-checker reads the web and the shell, always in the
+        # background, and starts without the session's instruction files
+        # where the deployed Claude Code honours that: its text is all it
+        # needs (no preloaded skills).
+        {
+            printf '%s\n' '---' 'name: source-checker' "description: $SOURCE_CHECKER_DESC" \
+                "model: \"${SURVEYOR_MODEL:-inherit}\""
+            [ -z "$SURVEYOR_EFFORT" ] || printf '%s\n' "effort: \"$SURVEYOR_EFFORT\""
+            printf '%s\n' 'tools: WebSearch, WebFetch, Bash, Read' 'background: true'
+            [ "$CLAUDE_LEAN" != 1 ] || printf '%s\n' 'omitClaudeMd: true'
+            printf '%s\n' '---' ''
+            cat "$SRC/agents/source-checker.md"
+        } | put "$HOME/.claude/agents/source-checker.md" || FAILED=1
+        skill_paper_check "$HOME/.claude/skills/paper-check"
+    fi
     skill "$HOME/.claude/skills/harness"
     skill_test "$HOME/.claude/skills/rs-test"
 fi
@@ -413,6 +453,19 @@ if [ "$HAS_PI" = 1 ]; then
             printf '%s\n' '---' ''
             cat "$SRC/agents/analyst.md"
         } | put "$PI_DIR/agents/analyst.md" || FAILED=1
+    fi
+    if [ "$PAPER_CHECK" = 1 ]; then
+        # pi's source-checker: pi's file reader and shell, no MCP server and
+        # no web search (pi has none), in the background, with pi's own
+        # project context off (its text is all it needs). RS's rules
+        # extension still hands a child of this name the session's rules:
+        # it builds a lean section for the doer, checker and analyst only.
+        {
+            printf '%s\n' '---' 'name: source-checker' "description: $SOURCE_CHECKER_DESC" \
+                'tools: read, bash' 'inheritProjectContext: false' 'async: true' '---' ''
+            cat "$SRC/agents/source-checker.md"
+        } | put "$PI_DIR/agents/source-checker.md" || FAILED=1
+        skill_paper_check "$PI_DIR/skills/paper-check"
     fi
     skill "$PI_DIR/skills/harness"
     skill_test "$PI_DIR/skills/rs-test"

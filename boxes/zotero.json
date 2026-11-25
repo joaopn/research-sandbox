@@ -3,6 +3,7 @@
   "image": "base",
   "agent_default": true,
   "clone": false,
+  "paper_check": true,
   "setup": "pip install --user 'zotero-mcp-server[pdf]==0.9.0'",
   "fields": [
     {"name": "ZOTERO_API_KEY", "label": "Zotero API key (from zotero.org/settings/keys)", "secret": true},

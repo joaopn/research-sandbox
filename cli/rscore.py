@@ -10349,7 +10349,9 @@ def _harness_old_warnings(stdout: "str | None", where: str) -> list[str]:
 # harness_suite_files(); the installer checks the names it needs before it
 # writes anything.
 HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md",
-                 "agents/analyst.md", "agents/surveyor.md")
+                 "agents/analyst.md", "agents/surveyor.md",
+                 "agents/source-checker.md", "skill-paper-check/SKILL.md",
+                 "skill-paper-check/bibpass.py")
 # The record key that gives a project the helper roles (`analyst` for both
 # agents, `surveyor` for Claude): `"subagents": true` in its
 # .orchestrator/project.json. Read where the kit is staged; a box, and every
@@ -10566,12 +10568,22 @@ def _harness_subagents_env(container: str, marker: dict) -> list[str]:
     return args
 
 
+def _harness_paper_check_env(marker: dict) -> list[str]:
+    """`-e` args that give the installer the paper check (its skill and the
+    source-checker role) when the project's record carries `"memory": true`
+    (the two researcher project types); none otherwise."""
+    if marker.get(MEMORY_RECORD_KEY) is not True:
+        return []
+    return ["-e", "RS_HARNESS_PAPER_CHECK=1"]
+
+
 def _run_harness_installer(container: str, local: "Sequence[str]",
                            workspace_path: "Path | None",
                            timeout: "float | None" = None) -> list[str]:
     """Run the staged installer in the project container as the agent user,
-    with the project's working mode, doer/checker models and helper roles from
-    its marker (`workspace_path`; none ⇒ mode none, no helper roles). Returns
+    with the project's working mode, doer/checker models, helper roles and
+    paper check from its marker (`workspace_path`; none ⇒ mode none, no
+    helper roles, no paper check). Returns
     the operator-facing warnings; never raises (a timeout is the warning)."""
     marker = _read_marker_dict(workspace_path) if workspace_path is not None else {}
     settings = _read_harness(workspace_path) if workspace_path is not None else {}
@@ -10579,6 +10591,7 @@ def _run_harness_installer(container: str, local: "Sequence[str]",
         r = run(["docker", "exec", "-u", "1000", "-e", "HOME=/home/research",
                  *_harness_env(local), *_harness_settings_env(settings),
                  *_harness_subagents_env(container, marker),
+                 *_harness_paper_check_env(marker),
                  container, "sh", HARNESS_INSTALLER],
                 capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:

@@ -135,7 +135,10 @@ _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
                  # share_default: the box window's "Share files" card starts
                  # ticked for this type (a default only — the operator sees and
                  # can untick it at creation; any type may carry it).
-                 "share_default"}
+                 "share_default",
+                 # paper_check: the box's agent gets RS's paper-check skill and
+                 # its source-checker helper (built-in presets only).
+                 "paper_check"}
 
 # The skill texts ride the catalog like `instructions` does: a sibling file per
 # key, folded at load, never inline in the JSON. The skill's slash-command name
@@ -362,6 +365,11 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
         out.append(p(f"gitea_history must be a boolean, got "
                      f"{m.get('gitea_history')!r}"))
 
+    # paper_check: the box's agent gets the paper-check skill and helper.
+    if "paper_check" in m and not isinstance(m["paper_check"], bool):
+        out.append(p(f"paper_check must be a boolean, got "
+                     f"{m.get('paper_check')!r}"))
+
     # share_default: pre-ticks "Share files" in the box window.
     if "share_default" in m and not isinstance(m["share_default"], bool):
         out.append(p(f"share_default must be a boolean, got "
@@ -569,6 +577,12 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
         if isinstance(m, dict) and m.get("gitea_history"):
             raise BoxCatalogError(
                 f"registry: entry {name!r}: gitea_history is reserved for the "
+                f"built-in box types")
+        # The paper check installs RS's own skill and helper role into the
+        # box's agent: built-in types only, like history.
+        if isinstance(m, dict) and m.get("paper_check"):
+            raise BoxCatalogError(
+                f"registry: entry {name!r}: paper_check is reserved for the "
                 f"built-in box types")
         # A web app runs a start command the box keeps alive and gets a tab
         # without being asked for one: built-in types only, like history.
