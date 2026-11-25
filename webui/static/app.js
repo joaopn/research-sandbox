@@ -10892,7 +10892,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     if (harnessClaude) claudePanel.appendChild(harnessClaude.node);
     if (harnessPi) piPanel.appendChild(harnessPi.node);
     // Claude's links to the operator's Anthropic account (claude.ai connectors,
-    // Remote Control, Claude in Chrome), blocked by default. In Claude's tab
+    // Remote Control, Claude in Chrome, claude.ai artifacts), blocked by
+    // default. In Claude's tab
     // only: pi has none of them. Changed later in the project's ⚙ window.
     const blockLinksCb = el("input", { type: "checkbox" });
     blockLinksCb.checked = true;
@@ -10906,7 +10907,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         el("div", { class: "box-opt-cards" }, [blockLinksCard]),
         el("div", { class: "hint" }, [
             "Claude sessions in this project get no claude.ai connectors, no Remote " +
-            "Control and no Claude in Chrome. Switch it off to allow all three.",
+            "Control, no Claude in Chrome and no claude.ai artifacts. Switch it off " +
+            "to allow all four.",
         ]),
     ]));
     syncHarnessRows(harnessSwitch ? harnessSwitch.value() : "none");
@@ -12077,7 +12079,8 @@ async function mgmtBoxAddDialog(project) {
         boxStatusBarCard.classList.toggle("selected", boxStatusBarCb.checked);
     };
     // Claude's links to the operator's Anthropic account (claude.ai connectors,
-    // Remote Control, Claude in Chrome), blocked by default; shown and sent
+    // Remote Control, Claude in Chrome, claude.ai artifacts), blocked by
+    // default; shown and sent
     // only while the box's agent is Claude (markAgent keeps it in step).
     // Changed later in the project's ⚙ window.
     const boxLinksOn = () => agentS.value === "claude";
@@ -12093,7 +12096,8 @@ async function mgmtBoxAddDialog(project) {
         el("div", { class: "box-opt-cards" }, [boxLinksCard]),
         el("div", { class: "hint" }, [
             "Claude sessions in this box get no claude.ai connectors, no Remote " +
-            "Control and no Claude in Chrome. Switch it off to allow all three.",
+            "Control, no Claude in Chrome and no claude.ai artifacts. Switch it off " +
+            "to allow all four.",
         ]),
     ]);
 
@@ -14909,10 +14913,10 @@ function agentsBoxContent(name, d, cat, staged) {
 }
 
 // The project container's block on Claude's links to the operator's Anthropic
-// account (claude.ai connectors, Remote Control, Claude in Chrome): the saved
-// choice, whether it is still to be written, and a note when Claude's own
-// settings say something else now. The switch goes through a dialog that
-// closes the window when it finishes, like the status bar's.
+// account (claude.ai connectors, Remote Control, Claude in Chrome, claude.ai
+// artifacts): the saved choice, whether it is still to be written, and a note
+// when Claude's own settings say something else now. The switch goes through a
+// dialog that closes the window when it finishes, like the status bar's.
 function accountLinksRow(name, al, running) {
     const blocked = al.blocked !== false;
     const pending = Array.isArray(al.pending) && al.pending.length > 0;
@@ -14927,9 +14931,10 @@ function accountLinksRow(name, al, running) {
             btn,
         ]),
         el("div", { class: "config-hint" }, [
-            "Blocked: Claude gets no claude.ai connectors, no Remote Control and no Claude " +
-            "in Chrome. A change applies to Claude sessions started afterwards; workers " +
-            "follow at their next spawn and role agents at the project's next start.",
+            "Blocked: Claude gets no claude.ai connectors, no Remote Control, no Claude " +
+            "in Chrome and no claude.ai artifacts. A change applies to Claude sessions " +
+            "started afterwards; workers follow at their next spawn and role agents at " +
+            "the project's next start.",
         ]),
     ]);
     // What Claude's own settings say now, when it is not the saved choice.
@@ -15066,10 +15071,10 @@ function boxAgentsSection(name, d, cat) {
 }
 
 // A Claude box's block on its links to the operator's Anthropic account
-// (claude.ai connectors, Remote Control, Claude in Chrome): the saved choice,
-// whether it is still to be written, a note when Claude's own settings in the
-// box say something else now, and the switch, which repaints the row in place
-// like a box's status-bar switch.
+// (claude.ai connectors, Remote Control, Claude in Chrome, claude.ai
+// artifacts): the saved choice, whether it is still to be written, a note when
+// Claude's own settings in the box say something else now, and the switch,
+// which repaints the row in place like a box's status-bar switch.
 function boxAccountLinksRow(name, b) {
     const al = b.account_links;
     let blocked = al.blocked !== false;
@@ -15147,8 +15152,9 @@ function boxAccountLinksRow(name, b) {
             btn,
         ]),
         el("div", { class: "config-hint" }, [
-            "Blocked: Claude in the box gets no claude.ai connectors, no Remote Control and " +
-            "no Claude in Chrome. A change applies to Claude sessions started afterwards.",
+            "Blocked: Claude in the box gets no claude.ai connectors, no Remote Control, " +
+            "no Claude in Chrome and no claude.ai artifacts. A change applies to Claude " +
+            "sessions started afterwards.",
         ]),
         warnEl,
         status,
@@ -16782,10 +16788,10 @@ function mgmtAccountLinksToggle(name, blocked, running) {
         confirmLabel: word,
         body: [el("p", {}, [
             (blocked
-                ? `Allow Claude in "${name}" to use claude.ai connectors, Remote Control and ` +
-                  "Claude in Chrome. "
-                : `Block Claude in "${name}" from claude.ai connectors, Remote Control and ` +
-                  "Claude in Chrome. ") +
+                ? `Allow Claude in "${name}" to use claude.ai connectors, Remote Control, ` +
+                  "Claude in Chrome and claude.ai artifacts. "
+                : `Block Claude in "${name}" from claude.ai connectors, Remote Control, ` +
+                  "Claude in Chrome and claude.ai artifacts. ") +
             (running
                 ? "Nothing restarts; Claude sessions started afterwards follow it, workers at " +
                   "their next spawn and role agents at the project's next start."

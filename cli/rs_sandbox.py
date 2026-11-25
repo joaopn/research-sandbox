@@ -2809,10 +2809,12 @@ def _status_bar_warnings(states: "dict | str", on: bool) -> list[dict]:
 
 # ---------------------------------------------------------------------------
 # Claude's links to the operator's Anthropic account in a Claude box: claude.ai
-# connectors, Remote Control and Claude in Chrome. One switch per box, blocked
-# by default, held in the box record (`account_links_blocked`; a record without
-# the key — a box from before the switch — reads as blocked) and written into
-# the box's own Claude settings: two booleans and one `deniedMcpServers` entry.
+# connectors, Remote Control, Claude in Chrome and claude.ai artifacts. One
+# switch per box, blocked by default, held in the box record
+# (`account_links_blocked`; a record without the key — a box from before the
+# switch — reads as blocked) and written into the box's own Claude settings:
+# three booleans (`enableArtifact` false, the other two true) and one
+# `deniedMcpServers` entry.
 # While the record says blocked, every run (a fresh home) and every plain start
 # writes the block, so an entry removed inside the box comes back at its next
 # start; allowing is written once (`account_links_pending` marks it owed for a
@@ -2831,11 +2833,12 @@ BOX_ACCOUNT_LINKS_DENIED_SERVER = "claude-in-chrome"
 BOX_ACCOUNT_LINKS_JQ = (
     '{"serverName": $srv} as $e'
     ' | if $op == "on" then .disableClaudeAiConnectors = true | .disableRemoteControl = true'
+    ' | .enableArtifact = false'
     ' | if (has("deniedMcpServers") | not) then .deniedMcpServers = [$e]'
     ' elif (.deniedMcpServers | type) != "array" then error("deniedMcpServers is not a list")'
     ' elif any(.deniedMcpServers[]; . == $e) then .'
     ' else .deniedMcpServers += [$e] end'
-    ' elif $op == "off" then del(.disableClaudeAiConnectors, .disableRemoteControl)'
+    ' elif $op == "off" then del(.disableClaudeAiConnectors, .disableRemoteControl, .enableArtifact)'
     ' | if (.deniedMcpServers | type) == "array" and any(.deniedMcpServers[]; . == $e)'
     ' then .deniedMcpServers |= map(select(. != $e))'
     ' | if .deniedMcpServers == [] then del(.deniedMcpServers) else . end'
@@ -2844,6 +2847,7 @@ BOX_ACCOUNT_LINKS_JQ = (
 BOX_ACCOUNT_LINKS_STATE_JQ = (
     '{"serverName": $srv} as $e'
     ' | [.disableClaudeAiConnectors == true, .disableRemoteControl == true,'
+    ' .enableArtifact == false,'
     ' ((.deniedMcpServers | type) == "array" and any(.deniedMcpServers[]; . == $e))]'
     ' | if all then "blocked" elif any then "partial" else "allowed" end')
 # $1 the operation ("on", "off", "read"), then the agents; prints
@@ -4992,8 +4996,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--block-account-links", dest="block_account_links",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="block a Claude box's links to the operator's Anthropic "
-                        "account: claude.ai connectors, Remote Control and Claude in "
-                        "Chrome (default on); changed later with `settings "
+                        "account: claude.ai connectors, Remote Control, Claude in "
+                        "Chrome and claude.ai artifacts (default on); changed later "
+                        "with `settings "
                         "--block-account-links`")
     c.set_defaults(func=cmd_create)
 

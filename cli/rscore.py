@@ -1486,8 +1486,9 @@ class CreateRequest:
     # default, the New Project Extensions card. In-box (broker-openable).
     status_bar: bool = True
     # Claude's links to the operator's Anthropic account (claude.ai
-    # connectors, Remote Control, Claude in Chrome) blocked in the project
-    # container's Claude: on by default, the New Project Claude tab. In-box.
+    # connectors, Remote Control, Claude in Chrome, claude.ai artifacts)
+    # blocked in the project container's Claude: on by default, the New
+    # Project Claude tab. In-box.
     block_account_links: bool = True
 
     @classmethod
@@ -2762,8 +2763,8 @@ class BoxAddRequest:
     # RS's status bar in the box's agents (#524): on by default.
     status_bar: bool = True
     # Claude's links to the operator's Anthropic account (claude.ai connectors,
-    # Remote Control, Claude in Chrome) blocked in a Claude box: on by default,
-    # the Add box window's switch. In-box.
+    # Remote Control, Claude in Chrome, claude.ai artifacts) blocked in a
+    # Claude box: on by default, the Add box window's switch. In-box.
     block_account_links: bool = True
 
     @classmethod
@@ -18624,11 +18625,13 @@ def _status_bar_view(states: "dict[str, str]") -> dict:
 # Claude's links to the operator's Anthropic account: a Claude Code session
 # signed in with the operator's account reaches claude.ai connectors (they
 # appear as tools, headless sessions included), Remote Control (the session
-# driven from claude.ai or a phone) and Claude in Chrome (the operator's
-# browser). One switch per project, on (blocked) by default, held in the
-# record's `account_links` block and written into Claude's own user settings
-# in the project container: the two booleans below plus one entry in
-# `deniedMcpServers`. Living in that file, the three reach the research
+# driven from claude.ai or a phone), Claude in Chrome (the operator's
+# browser) and claude.ai artifacts (pages Claude publishes to the account,
+# Claude Code's Artifact tool). One switch per project, on (blocked) by
+# default, held in the record's `account_links` block and written into
+# Claude's own user settings in the project container: the three booleans
+# below (`enableArtifact` set false, the other two true) plus one entry in
+# `deniedMcpServers`. Living in that file, the four reach the research
 # workers and role services, which copy those settings at their start. A
 # default, not a wall: the agent is root in its container. While the switch
 # says blocked, the block is written at create, at every start and when the
@@ -18649,28 +18652,31 @@ ACCOUNT_LINKS_KEY = "account_links"
 ACCOUNT_LINKS_AGENTS = ("claude",)
 # The MCP server name Claude Code gives Claude in Chrome.
 ACCOUNT_LINKS_DENIED_SERVER = "claude-in-chrome"
-# Block ("on": both booleans true, the deny entry added unless an equal one is
-# there) or allow ("off": both booleans deleted, exactly that entry removed,
-# the list deleted when that left it empty). Every other key and list entry is
-# left as it is; a `deniedMcpServers` that is not a list is an error (the
-# write fails and says so), never replaced.
+# Block ("on": the two disable booleans true and `enableArtifact` false, the
+# deny entry added unless an equal one is there) or allow ("off": the three
+# booleans deleted, exactly that entry removed, the list deleted when that
+# left it empty). Every other key and list entry is left as it is; a
+# `deniedMcpServers` that is not a list is an error (the write fails and says
+# so), never replaced.
 ACCOUNT_LINKS_JQ = (
     '{"serverName": $srv} as $e'
     ' | if $op == "on" then .disableClaudeAiConnectors = true | .disableRemoteControl = true'
+    ' | .enableArtifact = false'
     ' | if (has("deniedMcpServers") | not) then .deniedMcpServers = [$e]'
     ' elif (.deniedMcpServers | type) != "array" then error("deniedMcpServers is not a list")'
     ' elif any(.deniedMcpServers[]; . == $e) then .'
     ' else .deniedMcpServers += [$e] end'
-    ' elif $op == "off" then del(.disableClaudeAiConnectors, .disableRemoteControl)'
+    ' elif $op == "off" then del(.disableClaudeAiConnectors, .disableRemoteControl, .enableArtifact)'
     ' | if (.deniedMcpServers | type) == "array" and any(.deniedMcpServers[]; . == $e)'
     ' then .deniedMcpServers |= map(select(. != $e))'
     ' | if .deniedMcpServers == [] then del(.deniedMcpServers) else . end'
     ' else . end'
     ' else . end')
-# What the file says: all three entries (blocked), none (allowed), some.
+# What the file says: all four entries (blocked), none (allowed), some.
 ACCOUNT_LINKS_STATE_JQ = (
     '{"serverName": $srv} as $e'
     ' | [.disableClaudeAiConnectors == true, .disableRemoteControl == true,'
+    ' .enableArtifact == false,'
     ' ((.deniedMcpServers | type) == "array" and any(.deniedMcpServers[]; . == $e))]'
     ' | if all then "blocked" elif any then "partial" else "allowed" end')
 # Run as the agent user with HOME set: $1 the operation ("on", "off",

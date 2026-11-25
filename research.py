@@ -3051,7 +3051,8 @@ def build_parser() -> argparse.ArgumentParser:
                    action=argparse.BooleanOptionalAction, default=True,
                    help="block the project container's Claude from the links to the "
                         "operator's Anthropic account: claude.ai connectors, Remote "
-                        "Control and Claude in Chrome (default on)")
+                        "Control, Claude in Chrome and claude.ai artifacts (default "
+                        "on)")
     _add_harness_args(c, "project")
     c.add_argument("--dev-repo", dest="dev_repo", metavar="REPO",
                    help="REQUIRED with a dev workflow (--workflow dev): the name "
@@ -3176,9 +3177,9 @@ def build_parser() -> argparse.ArgumentParser:
                    action=argparse.BooleanOptionalAction, default=None,
                    help="block or allow the project container's Claude's links to the "
                         "operator's Anthropic account (claude.ai connectors, Remote "
-                        "Control, Claude in Chrome) for Claude sessions started "
-                        "afterwards; a stopped project gets it at its next start "
-                        "(on its own)")
+                        "Control, Claude in Chrome, claude.ai artifacts) for Claude "
+                        "sessions started afterwards; a stopped project gets it at "
+                        "its next start (on its own)")
     _add_harness_args(u, "project")
     u.add_argument("--reset", action="append", metavar="FIELD",
                    choices=rscore.UPDATE_RESETTABLE,

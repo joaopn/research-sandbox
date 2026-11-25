@@ -58,7 +58,7 @@ The box window takes a name (default `box-N`), a type, and the options below. Th
 | Option | Effect | Limits |
 |---|---|---|
 | Agent | None, or an agent the project carries (Claude, pi); model and effort for a Claude box | MCP tools need an agent |
-| Block links to the Anthropic account | On by default: Claude in the box gets no claude.ai connectors, no Remote Control and no Claude in Chrome | Claude boxes; changeable later in ⚙ |
+| Block links to the Anthropic account | On by default: Claude in the box gets no claude.ai connectors, no Remote Control, no Claude in Chrome and no claude.ai artifacts | Claude boxes; changeable later in ⚙ |
 | Working mode | The dev box agent's working mode and Doer/Checker models | Dev boxes with an agent, outside research projects |
 | Test policy | Light (default) or Full, see [Dev lane](Dev-lane.md) | Same as the working mode |
 | MCP tools | The project's allowed MCP servers, through the project's MCP proxy | Not on dev boxes |
