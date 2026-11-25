@@ -4193,10 +4193,11 @@ async def _proxy_http(request: web.Request, upstream_url: str,
 
     # Stream the body upstream rather than buffering — code-server's
     # editor saves (an .ipynb, a large prose file) need to flow through
-    # without an intermediate read into memory. GET/HEAD have no body.
-    data = None
-    if request.method not in ("GET", "HEAD"):
-        data = request.content
+    # without an intermediate read into memory. A request the browser sent
+    # without a body (GET/HEAD, a bare DELETE) goes upstream without one:
+    # passing the empty stream would make aiohttp send an empty chunked body
+    # typed application/octet-stream, which some apps refuse (Aldine: 415).
+    data = request.content if request.body_exists else None
 
     # No request timeout — code-server's WS workbench traffic and long polls
     # need to live as long as the user holds the tab. Connection close is
