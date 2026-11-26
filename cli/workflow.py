@@ -75,7 +75,8 @@ PORT_MIN, PORT_MAX = 1, 65535
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
                  "tabs", "mcp_exports", "resources", "services", "description",
                  "greeting", "title", "group", "tags", "agents", "dev", "web",
-                 "instructions", "gitea_history", "memory", "subagents"}
+                 "instructions", "gitea_history", "memory", "subagents",
+                 "companion"}
 _WEB_KEYS = {"port", "label", "start"}
 # MIRROR of rscore's top-level exported-port rule (_EXPORT_RESERVED_PORTS and
 # the box editor + box loopback bands, _EXPORT_BOX_EDITOR_PORT_LO ..
@@ -352,6 +353,19 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
         elif m["subagents"] and m.get("memory") is not True:
             out.append(p("subagents requires memory"))
 
+    # companion — the researcher for one-off and mixed tasks (one folder per
+    # task, standing preferences instead of a line of inquiry and beliefs,
+    # claims only when the PI asks): the companion project type. It shapes
+    # the memory, so it needs it, and it has no helpers or checks.
+    if "companion" in m:
+        if not isinstance(m["companion"], bool):
+            out.append(p(f"companion must be a boolean, got {m.get('companion')!r}"))
+        elif m["companion"]:
+            if m.get("memory") is not True:
+                out.append(p("companion requires memory"))
+            if m.get("subagents") is True:
+                out.append(p("companion and subagents cannot be set together"))
+
     extras = set(m) - _ALLOWED_KEYS
     if extras:
         out.append(p(f"unknown keys: {sorted(extras)}"))
@@ -450,7 +464,7 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
         # RS-owned Gitea account in: built-in workflows only (the loader is the
         # one place that knows the source).
         for k in ("web", "instructions", "gitea_history", "memory",
-                  "subagents"):
+                  "subagents", "companion"):
             if isinstance(m, dict) and k in m:
                 raise WorkflowError(
                     f"registry: entry {name!r}: {k} is reserved for the "

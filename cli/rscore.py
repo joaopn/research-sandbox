@@ -1422,6 +1422,12 @@ class CreateRequest:
     # (which requires `memory: true`), written into the record as
     # SUBAGENTS_RECORD_KEY beside the memory key and read from there.
     research_subagents: bool = False
+    # The researcher for one-off and mixed tasks (the companion type: one
+    # folder per task, standing preferences, claims only when the PI asks),
+    # DERIVED from the manifest's `companion: true` (which requires
+    # `memory: true`), written into the record as COMPANION_RECORD_KEY beside
+    # the memory key and read from there by rs-memory.
+    research_companion: bool = False
     dev_repo: str = ""
     # The base branch the project's agent works. "" ⇒ the host resolves the
     # mirror's default at create (_resolve_dev_branch) — the resolved CONCRETE
@@ -1658,6 +1664,7 @@ class CreateRequest:
         dev_lane = bool(manifest.get("dev"))
         research_memory = manifest.get("memory") is True
         research_subagents = manifest.get("subagents") is True
+        research_companion = manifest.get("companion") is True
         dev_repo = (kw.get("dev_repo") or "").strip()
         if dev_lane:
             if (project_type is not ProjectType.SANDBOX_DIND
@@ -1867,6 +1874,7 @@ class CreateRequest:
             dev_lane=dev_lane,
             research_memory=research_memory,
             research_subagents=research_subagents,
+            research_companion=research_companion,
             dev_repo=dev_repo,
             dev_branch=dev_branch,
             fetch=fetch,
@@ -5261,6 +5269,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # rs-memory's finding checks, key on it. Only written when set, so a
         # researcher project's record is exactly as before.
         marker[SUBAGENTS_RECORD_KEY] = True
+    if req.research_companion:
+        # The companion type: rs-memory's companion mode keys on it. Only
+        # written when set, so a researcher project's record is exactly as
+        # before.
+        marker[COMPANION_RECORD_KEY] = True
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
         # The project container's own ~/.local gets EXACTLY the recorded agents
         # (_dind_agent_sets); a marker without this key is from before that and
@@ -10357,6 +10370,11 @@ HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md",
 # .orchestrator/project.json. Read where the kit is staged; a box, and every
 # project without the key, gets neither.
 SUBAGENTS_RECORD_KEY = "subagents"
+# The record key that makes a project's agent a companion: `"companion": true`
+# in its .orchestrator/project.json. rs-memory reads it (standing preferences
+# on the front page, no claims from the consolidation, the task folders on the
+# PI's page); never set together with SUBAGENTS_RECORD_KEY.
+COMPANION_RECORD_KEY = "companion"
 # The model-catalog types of the Claude helper roles of such a project: each
 # resolved into the record's `models` block at create (models.analyst,
 # models.surveyor), changed per project in its ⚙ Agents box, and written by the
@@ -18317,7 +18335,11 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # reads, which rs-memory writes beside the memory folder, list claims by it).
 # Version 7: the instructions name `rs-memory log` (a logbook entry, filed
 # from the agent's draft by the /log command the kit writes).
-MEMORY_KIT_VERSION = "7"
+# Version 8: the companion's instructions rely on rs-memory's companion mode
+# (the record's `companion` key: standing preferences instead of a line of
+# inquiry and beliefs, no claims from the consolidation, the task folders on
+# the PI's page).
+MEMORY_KIT_VERSION = "8"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")

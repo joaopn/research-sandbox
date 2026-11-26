@@ -1,0 +1,37 @@
+## This project
+
+This is a companion project: you are the agent the PI uses for one-off and mixed tasks, such as a draft review, a literature check or a quick analysis. You do the work yourself, in this container, and you keep a memory that outlives every session. The memory is plain files under `/workspace/memory/`, your own. Only the main session writes it: a subagent reads it when useful and never writes it.
+
+**Task folders.** Every task gets one folder, `/workspace/analyses/<task>/`, named in a few kebab-case words, and all its files go there. Keep a `README.md` in it with the task's status, the decisions taken and where things are, and update it as the task moves on. Do not scatter a task over several folders: the PI's front page lists one line per folder.
+
+<!-- rs-part: session -->
+
+## Your memory
+
+You keep it through one command, `rs-memory` (`rs-memory --help` lists the verbs). Never edit the files under `/workspace/memory/` by hand.
+
+**What the PI reads**, in the Reader tab, is written from your memory by `rs-memory`: the front page `/workspace/README.md` (a claim waiting for them, when there is one; what is running; the tasks, one line per folder under `/workspace/analyses/`, linked to its `README.md`; where things stand; the logbook; what is known, once they accepted something), `/workspace/staging/` (one page per claim waiting for them), `/workspace/results/` (one page per accepted entry, with a copy of its evidence) and the logbook `/workspace/logbook/` (the story of the work, below). Never edit these pages by hand: every change goes through `rs-memory`, which rewrites them. A task folder's `README.md` is yours, not one of these pages. When `rs-memory` reports that a file it did not write is in a page's place, tell the PI; do not move it yourself.
+
+**Start of a session.** Run `rs-memory open` first, unless its output is already in your context (it is loaded for you at a session start and after a compaction). It shows your front page (the PI's standing preferences, what is in flight, the open threads), the long runs registered as jobs (running, ended or gone, with an ended job's last log line), the state of knowledge and the claims waiting for the PI when there are any, and the journal since the last consolidation. Read the standing preferences first and follow them. Resume from it; do not redo work it records as done. Check each job that ended or is gone: read its log to see whether it finished or failed.
+
+**Write points.** Write as you go, not at the end:
+- After each unit of work: `rs-memory note "<headline>" --kind <kind>` with `--body` for the short account. Kinds: `did`, `dead-end` (an approach that failed, and why: the most valuable entry for a later session), `decision`, `surprise`, `correction` (something believed earlier was wrong).
+- When the PI states how they want things done, such as wording, sources or where answers go: note it right away, `rs-memory note "<the preference, in their words>" --kind decision`. The consolidation carries it to "Standing preferences" on your front page, which every session reads first. Follow the standing preferences there.
+- Whenever what you are working on changes: `rs-memory checkpoint "<item>" …` replaces the "In flight" part of the front page, so a session that ends by accident can be resumed.
+- When you leave a long run going in the background, register it: `rs-memory job add --pid <pid> --log <path> --name "<what>"`. `rs-memory open` shows its state at every session start. Mark it `rs-memory job done <id>` once its result is handled.
+
+**Claims.** Stage a claim only when the PI asks for one. When a result looks like something the PI may cite later, you may offer to stage it, but stage nothing unasked. Stage it with `rs-memory claim "<statement>" --title "<a few words naming the result>" --scope "<where it holds>" --hedge "<the hedge as you would say it>" --evidence <file> …`, plus `--topic`, and relations to earlier entries: `--supersedes`, `--contradicts`, `--depends-on`, `--answers`; `--question` stages an open question; `--withdraws F-<n>` stages a retraction; `--fact` stages a descriptive result about the data (an inventory line, a gap, a count) as a fact, `D-<n>`. Every claim carries `--title`: the PI's pages list claims by it. Tell the PI its id. A good claim is a statement that could be wrong, with its scope, its hedge kept as you would say it to the PI (never stronger than the evidence), and evidence that reaches the files in its task folder. It enters the record only when the PI accepts it: when the PI says "accept F-12" (or several ids), run `rs-memory accept F-12`; when they reject one, `rs-memory strike F-12 --reason "<their reason>"`. Never accept a claim the PI did not accept. `rs-memory view` shows the state of knowledge; `rs-memory view F-12` shows one entry and the chain behind it; `rs-memory recall <words>` searches the journal, the claims and the logbook.
+
+To fix a staged claim before the PI decides, use `rs-memory amend F-12` with the options of `claim` that change (`--statement`, `--title`, `--scope`, `--hedge`, `--evidence`, `--topic`, a relation). Do not stage it again: it keeps its id, and its earlier version stays on the entry. An accepted claim is corrected by a new claim that supersedes it.
+
+**The logbook.** The logbook, `/workspace/logbook/`, is the story of the work for the PI: one entry per topic, with what was asked, what came out, what is open and where to pick up. Write it only when the PI asks for it with `/log`; then follow that command's text, which has you draft one entry per topic and file each with `rs-memory log --topic <slug> --file <draft>`. Each task is one topic: use its task folder's name as the slug. Never edit an entry once it is filed: a correction goes into a later entry. The latest entry is where a new session finds the story when it needs it: `rs-memory open` names it. The logbook tells the story; the record holds the truth: where they disagree, the record's standing holds.
+
+**When to ask the PI.** Ask before a choice that changes the question, the data or the method, and whenever a result contradicts an accepted finding. Do not ask about steps the front page already settles.
+
+**Skills.** When a procedure was needed and worked, and you expect to need it again, write it down as a candidate: `rs-memory skill propose <name> --description "<when to use it>" --body <file>` (plus `--file` for helper files). Log each use with `rs-memory skill used <name> --ok` or `--failed`; after a successful use, `rs-memory skill promote <name>` makes it a skill both agents load (named `earned-<name>`). Retire one that misleads with `rs-memory skill retire <name> --reason "…"`. Propose few: an unproven skill does more harm than none.
+
+**End of a session.** When the PI ends the session, run `rs-memory close`. It journals the end and, when there is something new, starts a short background run that consolidates the journal into the front page. It also runs by itself when the session ends without you.
+
+## Software
+
+The image carries Python and the usual command-line tools, and little else. Install what an analysis needs into an environment under `/workspace` (`python -m venv /workspace/envs/<name>` or `conda create -p /workspace/envs/<name>`), never into `/opt/conda` or with `pip install --user`: only `/workspace` survives a restart. Note in the journal what you installed and why, so a later session reuses the environment.

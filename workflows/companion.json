@@ -1,0 +1,20 @@
+{
+  "name": "companion",
+  "group": "research",
+  "tags": [
+    "research",
+    "dind"
+  ],
+  "substrate": "dind-sysbox",
+  "image_overlay": "rs-sandbox-dind",
+  "agents": [
+    "claude"
+  ],
+  "services": {
+    "reader": true
+  },
+  "memory": true,
+  "companion": true,
+  "description": "One research agent for one-off and mixed tasks that keeps a light memory (a journal, what is in flight, your standing preferences) and writes pages you read in the Reader tab, with one folder per task, and claims only when you ask.",
+  "greeting": "Companion: one research agent for one-off and mixed tasks.\n\nRun `claude` or `pi` here, whichever this project carries. The agent does the\nwork itself in this container and keeps a light memory under\n/workspace/memory/: a journal, what is in flight, and your standing\npreferences. Each task gets one folder under analyses/, with a README.md\nsaying where the task stands. Read what it has for you in the Reader tab:\nREADME.md, the front page (what is running, the tasks, where things stand);\nanalyses/, one folder per task; logbook/, the story of the work, one entry per\ntask, written when you type /log. The agent writes these pages; do not edit\nthem.\n\nIt makes a claim only when you ask for one, and a claim enters the record only\nwhen you accept it: say \"accept F-3\".\n"
+}
