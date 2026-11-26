@@ -1048,13 +1048,40 @@ async def broker_search_token_handler(request: web.Request) -> web.Response:
 
 
 def _search_plain_post(verb: str):
-    """A POST that carries no field (token-clear, off, clear)."""
+    """A POST that carries no field (token-clear, off, clear, test)."""
     async def handler(request: web.Request) -> web.Response:
         if not origin_ok(request):
             return web.Response(status=403, text="origin rejected")
         status, reply = await _relay(request, verb)
         return web.json_response(reply, status=status)
     return handler
+
+
+async def broker_search_list_handler(request: web.Request) -> web.Response:
+    """GET /broker/search/list — the waiting and running searches, each with
+    its asker, shortened question, searcher, state, times and tokens."""
+    status, body = await _relay(request, "search_list")
+    return web.json_response(body, status=status)
+
+
+async def broker_search_view_handler(request: web.Request) -> web.Response:
+    """GET /broker/search/view?id=<id> — one search's full question, state,
+    counts and work so far (read-only). The broker validates the id; an absent
+    one is sent as absent, so the broker refuses it cleanly."""
+    sid = request.query.get("id")
+    args = {"id": sid} if sid is not None else {}
+    status, body = await _relay(request, "search_view", args)
+    return web.json_response(body, status=status)
+
+
+async def broker_search_stop_handler(request: web.Request) -> web.Response:
+    """POST /broker/search/stop {id} — stop a waiting or running search."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _search_body(request)
+    args = {"id": body["id"]} if "id" in body else {}
+    status, reply = await _relay(request, "search_stop", args)
+    return web.json_response(reply, status=status)
 
 
 def _aldine_tab_listed(project: str, path: Path | None = None) -> bool:
@@ -4829,6 +4856,10 @@ def main() -> None:
     app.router.add_post("/broker/search/token-clear", _search_plain_post("search_token_clear"))
     app.router.add_post("/broker/search/off", _search_plain_post("search_off"))
     app.router.add_post("/broker/search/clear", _search_plain_post("search_clear"))
+    app.router.add_get("/broker/search/list", broker_search_list_handler)
+    app.router.add_get("/broker/search/view", broker_search_view_handler)
+    app.router.add_post("/broker/search/stop", broker_search_stop_handler)
+    app.router.add_post("/broker/search/test", _search_plain_post("search_test"))
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)

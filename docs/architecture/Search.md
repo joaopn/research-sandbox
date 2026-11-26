@@ -7,7 +7,7 @@ nav_order: 9
 
 RS can run one search service for the whole installation. An agent hands it a question and goes on working; the search runs elsewhere, and the agent later collects a written summary with every source, the files the search downloaded (reports, PDFs) and an account of what was tried and what failed. Any agent can use it, under Claude Code and pi alike: a project's agent, a box, or a research project's analysis workers.
 
-It is off until the operator turns it on, in the Search tab of the Services page. Turn on builds the service's images, starts its container and stages the search images into it (minutes the first time), and lists it on the [MCP gateway](MCP-servers.md) as the server `search`. The same tab signs the service in (a long-lived token, below), sets the one searcher (its name, model and effort, and how many searches run at once) and an optional contact address, shows how many searches are waiting, running or ended and not collected, clears the ended ones, and turns the service off. `research search on | off | status | token | token-clear | settings | clear` does the same from the host.
+It is off until the operator turns it on, in the Search tab of the Services page. Turn on builds the service's images, starts its container and stages the search images into it (minutes the first time), and lists it on the [MCP gateway](MCP-servers.md) as the server `search`. The same tab signs the service in (a long-lived token, below), sets the one searcher (its name, model and effort, and how many searches run at once) and an optional contact address, shows how many searches are waiting, running or ended and not collected, lists the waiting and running ones with their work so far and a Stop button (below), clears the ended ones, and turns the service off. `research search on | off | status | token | token-clear | settings | clear` does the same from the host.
 
 An agent gets the service when the operator ticks `search` for it on Services → MCP, like any MCP server. It then has three tools: submit a question (the answer is a search id, at once), check a search (waiting, running and what it is doing, or ended with its files), and collect the result. Files are downloaded through the gateway, from the server's own address plus `/files/<search id>/<name>`, with the agent's usual token. Collecting ends the search and removes everything it left, unless the agent asks to keep it.
 
@@ -60,6 +60,16 @@ The gateway knows each caller from its token: the project and the consumer (the 
 
 Every search uses the service's one Claude sign-in, whichever project asked. It is a long-lived token: run `claude setup-token` in any project's terminal tab, signed in to the Claude account the searches should use, and paste what it prints on the Search tab. The token is kept on the host in a file only the operator can read, reaches only the service (and from there each search agent), and is never shown again: the page says only whether one is stored.
 
+While a sign-in is stored and the service is running, **Test** checks it: the service makes one tiny model call with the stored token (it costs a fraction of a cent) and the page says whether the sign-in works or why it was refused.
+
+## Watching and stopping searches
+
+While the service is running, the Search tab has a table of the searches that are waiting or running, one row each: who asked (the project and its agent, box or workers), the question (shortened; the whole of it on hover), the searcher, the state, the time and the tokens. The time is how long the search has run, or how long it has waited while it waits for its turn; it counts up every second. The tokens are the input, output and cache tokens the search agent has used so far. The page re-reads the table every few seconds while it is on screen, and stops when you leave it.
+
+Clicking a row opens the search's work, read-only: its whole question, its state, time and tokens, then what it has done so far, oldest first. A tool call is one line (when, the tier and the tool, what it was aimed at, and what came of it); what the search agent wrote between calls is a paragraph. The box follows the search while it runs; once the search has ended it shows why and stops. The work carries text from the pages the search read, so the page shows all of it as plain text and never as part of the page itself. When the work is too long, the box says only part of it is shown.
+
+**Stop** ends a waiting or running search at once. The agent that asked sees, at its next check, that the operator stopped it; the search's files go when that agent collects it, or when you clear ended searches.
+
 ## Turning it off, and the version
 
 | Event | Effect |
@@ -81,6 +91,7 @@ Browser tiers (an ordinary automated browser, then one built to look like a pers
 - **Disposable searches.** A private network, a container and a volume per search, removed by name when collected. A page that fools a search agent finds no project data and no notes to poison for later searches. The cost: a search's files are gone once it is collected, so the caller downloads them first.
 - **SearXNG for the plain web search, with measured engines.** It runs inside the service, needs no key, and reports which engines did not answer. The cost: every search leaves from the host's one address, where engines throttle a caller that asks too often.
 - **The gateway names the caller, for RS's own service only.** The service trusts the header because only the gateway can set it; any other server never sees who called. A project collects only its own searches.
+- **The operator watches searches as plain text.** The table and the work view are read-only and carry page text, so the browser shows every value as text, never as markup.
 - **One long-lived token for every search.** One sign-in, set once by the operator. The cost: no billing per project, the account's rate limit caps all searches together, and the search agent holds the token while it reads hostile pages with internet access.
 - **The Claude search agent first; a pi search agent later, with an API key.** The service's tools are built so that a pi search agent gets the same ones; callers are Claude Code and pi from the start.
 - **The `research` workflow keeps its own websearcher unchanged.** It is the benchmark the other workflows are compared against, so RS has two web search paths for now. A research project's workers can still be given `search` like any gateway server.

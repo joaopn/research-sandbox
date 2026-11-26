@@ -8669,6 +8669,22 @@ const SEARCH_CREDENTIAL_TEXT = {
     absent: "no sign-in stored: searches cannot start",
     damaged: "the stored sign-in cannot be used: save the token again",
 };
+// Beside the sign-in's Test button.
+const SEARCH_TEST_HINT =
+    "A test makes one tiny model call with the stored sign-in; it costs a fraction of a cent.";
+// A search's state as the table and the work box say it.
+const SEARCH_RUN_STATE_TEXT = {
+    queued: "waiting", starting: "starting", running: "running", done: "done", failed: "failed",
+};
+// How often the open Search page re-reads its searches table (and an open
+// work box its search). Token counts move once per model turn, seconds apart,
+// so a read every five seconds shows each move soon after it happens: half
+// the value doubles the broker calls for no change anyone sees, ten times
+// makes the count look stuck between turns. The time column does not wait
+// for it: it counts up locally (SEARCH_CLOCK_TICK_MS).
+const SEARCH_LIST_POLL_MS = 5000;
+// The time column shows whole seconds, so it moves once a second.
+const SEARCH_CLOCK_TICK_MS = 1000;
 // What the last change on the page reported, shown once by the render that
 // follows it (every change re-reads the page). {where: "bar" | "token" |
 // "searcher", text, bad}.
@@ -8856,6 +8872,11 @@ function renderSearchScreen(view, a, settings, settingsErr) {
     const barFlash = searchFlashEl("bar", flash);
     if (barFlash) view.appendChild(barFlash);
     view.appendChild(el("div", { class: "hint searchsvc-hint" }, [SEARCH_HINT]));
+    if (a.container === "running") {
+        const runs = searchRunsSection(view);
+        view.appendChild(runs.wrap);
+        runs.start();
+    }
     view.appendChild(searchSignInSection(view, a, flash));
     view.appendChild(searchSearcherSection(view, settings, settingsErr, flash));
     paintSoftwareLabels();
@@ -8922,7 +8943,37 @@ function searchSignInSection(view, a, flash) {
         el("h3", { class: "mgmt-infra-title" }, ["Sign-in"]),
         row,
         searchFlashEl("token", flash),
+        a.credential === "set" && a.container === "running" ? searchTestRow(view) : null,
         el("div", { class: "mgmt-settings-hint" }, [SEARCH_TOKEN_HINT]),
+    ]);
+}
+
+// Test: one tiny model call with the stored sign-in, its answer on a line
+// under the button. A session that ended lands on the sign-in; every other
+// failure is that line, never the page-wide card.
+function searchTestRow(view) {
+    const landing = view.__rsRender || renderSearchInto;
+    const out = el("span", { class: "mcp-test" }, []);
+    const test = el("button", { class: "btn-small" }, ["Test"]);
+    test.onclick = async () => {
+        if (test.disabled) return;
+        test.disabled = true;
+        out.className = "mcp-test";
+        out.textContent = "Testing the sign-in…";
+        const { status, body } = await mcpPost("/broker/search/test", {});
+        test.disabled = false;
+        if (status === 401) return view.isConnected ? renderMgmtLogin(view, landing) : undefined;
+        let text, bad = true;
+        if (status !== 200) text = "Connection failed.";
+        else if (!body.ok || !body.result) text = mgmtErrText(body);
+        else if (body.result.ok === true) { text = "The sign-in works."; bad = false; }
+        else text = "The sign-in was refused: " + String(body.result.text || "");
+        out.className = "mcp-test " + (bad ? "mcp-test-bad" : "mcp-test-ok");
+        out.textContent = text;
+        return undefined;
+    };
+    return el("div", { class: "mgmt-row mgmt-infra-row mgmt-settings-row" }, [
+        test, el("span", { class: "mgmt-settings-note" }, [SEARCH_TEST_HINT]), out,
     ]);
 }
 
@@ -9016,6 +9067,259 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         "Agents name the searcher when they submit a question; with one searcher "
         + "they can leave it out. More searches than this wait their turn."]));
     return wrap;
+}
+
+// Seconds as m:ss ("—" when the broker gave none).
+function searchClock(sec) {
+    if (typeof sec !== "number" || !Number.isFinite(sec) || sec < 0) return "—";
+    const s = Math.floor(sec);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// A token count with thousands separators ("—" when the broker gave none).
+function searchTokens(n) {
+    if (!Number.isSafeInteger(n) || n < 0) return "—";
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+// The seconds a search's Time shows: its running time once it runs, its
+// waiting time before that.
+function searchElapsed(s) {
+    if (s.state === "queued" || s.state === "starting") return s.waited_s;
+    return typeof s.ran_s === "number" ? s.ran_s : s.waited_s;
+}
+
+// A work entry's moment (epoch seconds) as the browser's local HH:MM:SS.
+function searchTimeOfDay(ts) {
+    const d = new Date(typeof ts === "number" ? ts * 1000 : String(ts));
+    if (Number.isNaN(d.getTime())) return "--:--:--";
+    return [d.getHours(), d.getMinutes(), d.getSeconds()]
+        .map((n) => String(n).padStart(2, "0")).join(":");
+}
+
+// A GET that answers {status, body}; status 0 = the request itself failed.
+async function searchGet(path) {
+    let res;
+    try { res = await fetch(path); } catch (e) { return { status: 0, body: {} }; }
+    let body; try { body = await res.json(); } catch (e) { body = {}; }
+    return { status: res.status, body };
+}
+
+// The searches table: every waiting or running search, re-read every
+// SEARCH_LIST_POLL_MS while the page is on screen, its Time counting up
+// locally in between. A read that fails keeps the last table under a short
+// note; a session that ended lands on the sign-in. Every timer stops once the
+// page is left or re-rendered. Returns {wrap, start}: start runs after wrap is
+// on the page.
+function searchRunsSection(view) {
+    const landing = view.__rsRender || renderSearchInto;
+    const body = el("div", { class: "searchsvc-runs-wrap" }, [
+        el("div", { class: "searchsvc-flash" }, ["Reading the searches…"])]);
+    const note = el("div", { class: "searchsvc-flash mcp-test-bad" }, []);
+    const wrap = el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Searches"]), body, note,
+    ]);
+    const stopping = new Set();    // ids whose Stop was sent
+    const rowErr = new Map();      // id → the text of a refused Stop
+    let last = [];
+    let clocks = [];
+    let poll = null, tick = null, reading = false;
+    const live = () => view.isConnected && wrap.isConnected;
+    // A host page left for a project tab stays in the document, hidden: no
+    // reads then (an element under a display:none ancestor has no boxes).
+    const shown = () => !document.hidden
+        && !(typeof wrap.getClientRects === "function" && !wrap.getClientRects().length);
+    const halt = () => {
+        clearInterval(poll); clearInterval(tick);
+        poll = null; tick = null;
+    };
+    const read = async () => {
+        if (!live()) return halt();
+        if (!shown() || reading) return undefined;
+        reading = true;
+        const { status, body: reply } = await searchGet("/broker/search/list");
+        reading = false;
+        if (!live()) return halt();
+        if (status === 401) { halt(); return renderMgmtLogin(view, landing); }
+        if (status !== 200) {
+            note.textContent = "Could not refresh the searches: the host did not answer.";
+            return undefined;
+        }
+        if (!reply.ok || !reply.result) {
+            note.textContent = "Could not refresh the searches: " + mgmtErrText(reply);
+            return undefined;
+        }
+        note.textContent = "";
+        paint(Array.isArray(reply.result.searches) ? reply.result.searches : []);
+        return undefined;
+    };
+    const stopOne = async (s) => {
+        if (stopping.has(s.id)) return undefined;
+        stopping.add(s.id);
+        rowErr.delete(s.id);
+        paint(last);
+        const { status, body: reply } = await mcpPost("/broker/search/stop", { id: s.id });
+        if (!live()) return halt();
+        if (status === 401) { halt(); return renderMgmtLogin(view, landing); }
+        if (status !== 200 || !reply.ok) {
+            stopping.delete(s.id);
+            rowErr.set(s.id, status === 200 ? mgmtErrText(reply) : "Connection failed.");
+            paint(last);
+            return undefined;
+        }
+        return read();
+    };
+    const row = (s, at) => {
+        const q = String(s.question || "");
+        const base = searchElapsed(s);
+        const time = el("td", { class: "searchsvc-num" }, [searchClock(base)]);
+        if (typeof base === "number") clocks.push({ cell: time, base, at });
+        const busy = stopping.has(s.id);
+        const stop = el("button", { class: "btn-small" }, [busy ? "Stopping…" : "Stop"]);
+        stop.disabled = busy;
+        stop.onclick = (ev) => {
+            // The row's own click opens the work box; Stop does not.
+            if (ev) ev.stopPropagation();
+            return stopOne(s);
+        };
+        const tr = el("tr", { class: "searchsvc-run" }, [
+            el("td", {}, [`${String(s.project || "")}/${String(s.consumer || "")}`]),
+            el("td", { class: "searchsvc-q", title: q }, [q]),
+            el("td", {}, [String(s.searcher || "")]),
+            el("td", {}, [SEARCH_RUN_STATE_TEXT[s.state] || String(s.state || "")]),
+            time,
+            el("td", { class: "searchsvc-num" }, [searchTokens(s.tokens)]),
+            el("td", {}, [stop,
+                          el("div", { class: "mgmt-reviewer-err" }, [rowErr.get(s.id) || ""])]),
+        ]);
+        tr.onclick = () => searchWorkBox(view, s.id);
+        return tr;
+    };
+    const paint = (list) => {
+        last = list;
+        const ids = new Set(list.map((s) => s.id));
+        for (const id of [...stopping]) if (!ids.has(id)) stopping.delete(id);
+        for (const id of [...rowErr.keys()]) if (!ids.has(id)) rowErr.delete(id);
+        clocks = [];
+        if (!list.length) {
+            body.replaceChildren(el("div", { class: "searchsvc-flash" },
+                                    ["No searches are waiting or running."]));
+            return;
+        }
+        const at = Date.now();
+        const head = ["Asked by", "Question", "Searcher", "State", "Time", "Tokens", ""];
+        body.replaceChildren(el("table", { class: "searchsvc-runs" }, [
+            el("thead", {}, [el("tr", {}, head.map((h) => el("th", {}, [h])))]),
+            el("tbody", {}, list.map((s) => row(s, at))),
+        ]));
+    };
+    const start = () => {
+        poll = setInterval(read, SEARCH_LIST_POLL_MS);
+        tick = setInterval(() => {
+            if (!live()) return halt();
+            if (!shown()) return undefined;
+            const now = Date.now();
+            for (const c of clocks) {
+                c.cell.textContent = searchClock(c.base + (now - c.at) / 1000);
+            }
+            return undefined;
+        }, SEARCH_CLOCK_TICK_MS);
+        read();
+    };
+    return { wrap, start };
+}
+
+// One work entry, as plain text (it carries text from the pages the search
+// read): a tool call on one line, a piece of the agent's writing as a block.
+function searchWorkEntry(w) {
+    if (w && w.kind === "text") {
+        return el("div", { class: "searchsvc-work-text" }, [String(w.text || "")]);
+    }
+    const o = w || {};
+    const f = (v) => (v === null || v === undefined ? "" : String(v));
+    const line = `${searchTimeOfDay(o.ts)}  ${f(o.tier)} · ${f(o.tool)}  ${f(o.target)}`
+        + ` → ${f(o.outcome)}${o.detail ? " " + f(o.detail) : ""}`;
+    return el("div", { class: "searchsvc-work-tool" }, [line]);
+}
+
+// A search's work, read-only, in a box over the page: its full question,
+// state, time and tokens, then what it did so far, oldest first. Re-read every
+// SEARCH_LIST_POLL_MS while it is open and the search has not ended.
+function searchWorkBox(view, id) {
+    if (document.querySelector(".modal-backdrop")) return null;
+    const landing = view.__rsRender || renderSearchInto;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const head = el("div", { class: "searchsvc-work-head" }, [
+        el("div", { class: "searchsvc-flash" }, ["Reading the search…"])]);
+    const work = el("div", { class: "searchsvc-work" }, []);
+    const note = el("div", { class: "searchsvc-flash mcp-test-bad" }, []);
+    const close = el("button", { class: "btn btn-secondary" }, ["Close"]);
+    let timer = null, reading = false;
+    const halt = () => { clearInterval(timer); timer = null; };
+    close.onclick = () => { halt(); backdrop.remove(); };
+    backdrop.appendChild(el("div", { class: "card searchsvc-work-card" }, [
+        el("h2", {}, ["A search’s work"]), head, work, note,
+        el("div", { class: "btn-row" }, [close]),
+    ]));
+    document.body.appendChild(backdrop);
+    const paint = (r) => {
+        const ended = r.state === "done" || r.state === "failed";
+        const facts = [
+            SEARCH_RUN_STATE_TEXT[r.state] || String(r.state || ""),
+            "searcher " + String(r.searcher || ""),
+            "time " + searchClock(searchElapsed(r)),
+            "tokens " + searchTokens(r.tokens),
+        ].join(" · ");
+        head.replaceChildren(
+            el("div", { class: "searchsvc-work-q" }, [String(r.question || "")]),
+            el("div", { class: "searchsvc-flash" }, [facts]));
+        if (ended && r.reason) {
+            head.appendChild(el("div", { class: "searchsvc-flash" },
+                                ["Ended: " + String(r.reason)]));
+        }
+        const entries = (Array.isArray(r.work) ? r.work : []).slice()
+            .sort((x, y) => (Number(x && x.ts) || 0) - (Number(y && y.ts) || 0));
+        work.replaceChildren(...entries.map(searchWorkEntry));
+        if (!entries.length) {
+            work.appendChild(el("div", { class: "searchsvc-flash" }, ["Nothing done yet."]));
+        }
+        if (r.truncated) {
+            work.prepend(el("div", { class: "searchsvc-flash" },
+                            ["Only part of the work is shown: it is too long to show in full."]));
+        }
+        return ended;
+    };
+    const read = async () => {
+        if (!backdrop.isConnected || !view.isConnected) { halt(); backdrop.remove(); return undefined; }
+        if (document.hidden || reading) return undefined;
+        reading = true;
+        const { status, body } = await searchGet(
+            "/broker/search/view?id=" + encodeURIComponent(id));
+        reading = false;
+        if (!backdrop.isConnected) return halt();
+        if (status === 401) {
+            halt(); backdrop.remove();
+            return view.isConnected ? renderMgmtLogin(view, landing) : undefined;
+        }
+        if (status !== 200) {
+            note.textContent = "Could not refresh: the host did not answer.";
+            return undefined;
+        }
+        note.textContent = "";
+        if (!body.ok || !body.result) {
+            halt();
+            head.replaceChildren(
+                el("div", { class: "searchsvc-work-q" }, ["This search is no longer in the service."]),
+                el("div", { class: "searchsvc-flash" }, [mgmtErrText(body)]));
+            work.replaceChildren();
+            return undefined;
+        }
+        if (paint(body.result)) halt();
+        return undefined;
+    };
+    timer = setInterval(read, SEARCH_LIST_POLL_MS);
+    read();
+    return backdrop;
 }
 
 // True when dotted-number version a is older than b ("1.25.1" < "28.2.0").

@@ -2570,6 +2570,55 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
     cursor: help;
 }
 .searchsvc-help:hover, .searchsvc-help:focus { color: var(--fg-base); outline: none; border-color: var(--bg-input-focus-border); }
+/* The searches table (waiting and running searches; a row opens its work)
+   and the work box. Self-scoped: no bare table, td or p rule. */
+.searchsvc-runs-wrap { max-width: 100%; overflow-x: auto; margin: 0 10px; }
+.searchsvc-runs { border-collapse: separate; border-spacing: 0 1px; font-size: 13px; }
+.searchsvc-runs th,
+.searchsvc-runs td {
+    padding: 6px 10px;
+    text-align: left;
+    white-space: nowrap;
+    vertical-align: middle;
+}
+.searchsvc-runs th {
+    color: var(--fg-faint);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.searchsvc-runs td { background: var(--bg-card); }
+.searchsvc-run { cursor: pointer; }
+.searchsvc-run:hover td { background: var(--btn-secondary-bg); }
+.searchsvc-runs .searchsvc-q { max-width: 28em; overflow: hidden; text-overflow: ellipsis; }
+.searchsvc-runs .searchsvc-num {
+    text-align: right;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+}
+.modal-backdrop .card.searchsvc-work-card { width: min(760px, 94vw); max-width: min(760px, 94vw); }
+.searchsvc-work-q { color: var(--fg-base); font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.searchsvc-work-head .searchsvc-flash { margin: 6px 0 0; }
+.searchsvc-work {
+    margin: 12px 0;
+    max-height: 50vh;
+    overflow-y: auto;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-input);
+    font-size: 12px;
+}
+.searchsvc-work:empty { display: none; }
+.searchsvc-work .searchsvc-flash { margin: 0 0 6px; }
+.searchsvc-work-tool {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    color: var(--fg-muted);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+.searchsvc-work-text { margin: 6px 0; color: var(--fg-base); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* Services → MCP (the gateway's server list). Self-scoped classes only. */
 .mcp-server-row { flex-wrap: wrap; }
