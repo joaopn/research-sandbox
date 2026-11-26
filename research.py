@@ -53,6 +53,7 @@ import extension  # noqa: E402  (per-project box surface)
 import workflow  # noqa: E402  (workflow manifest schema + store catalog; read-only here)
 import gitea  # noqa: E402  (STAGE_DEV_GITEA: dev-lane host state paths for the CLI shims)
 import aldine  # noqa: E402  (the shared Aldine editor: container names for the fleet stop)
+import search  # noqa: E402  (the search service: its container name for the fleet stop)
 import broker  # noqa: E402  (host-side lifecycle-verb daemon over a unix socket; opt-in)
 
 # --- lifecycle core ---------------------------------------------------------
@@ -210,6 +211,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     # the installation's pinned images (data kept). Never blocks the fleet: a
     # failure warns.
     rscore.resume_aldine_with_fleet()
+    # The search service, only when the operator turned it on: rebuilt from
+    # this tree (cached), re-created when its code or pins changed (the staged
+    # images are kept), its route re-injected. A failure warns.
+    rscore.resume_search_with_fleet()
     # A webui from before the narrowed listen address that _resume_webui could
     # not stop still answers every project: the fleet is otherwise up, but the
     # start must not report success over an open hole (B156). Re-read here
@@ -267,7 +272,7 @@ def cmd_stop(_: argparse.Namespace) -> None:
     if not _stop_infra_container(rscore.MCP_GATEWAY_CONTAINER):
         failed.append(rscore.MCP_GATEWAY_CONTAINER)
     for cname in (aldine.APP_CONTAINER, aldine.COMPILER_CONTAINER,
-                  gitea.GITEA_CONTAINER, REGISTRY_PUSH_CONTAINER, REGISTRY_CONTAINER):
+                  search.SERVICE_CONTAINER, gitea.GITEA_CONTAINER, REGISTRY_PUSH_CONTAINER, REGISTRY_CONTAINER):
         if not _stop_infra_container(cname):
             failed.append(cname)
     # The router leg keeps its return inspected so a compose-level refusal is
@@ -1577,6 +1582,85 @@ def cmd_aldine_status(args: argparse.Namespace) -> None:
     print(f"  MCP gateway entry: {out['mcp_entry']}")
     if out["error"]:
         print(f"warning: {out['error']}", file=sys.stderr)
+
+
+def cmd_search_on(_args: argparse.Namespace) -> None:
+    rscore.search_on()
+
+
+def cmd_search_off(_args: argparse.Namespace) -> None:
+    _call(rscore.search_off)
+    print("the search service is off (its settings, sign-in and staged images "
+          "are kept for when it is turned on again)")
+
+
+def cmd_search_status(args: argparse.Namespace) -> None:
+    out = rscore.search_status()
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    print(f"search: {'on' if out['on'] else 'off'}")
+    print(f"  container: {out['container']}   current: {'yes' if out['current'] else 'no'}"
+          f"   SearXNG pin: {out['searxng_version'] or '?'}")
+    if out["answering"] is not None:
+        print(f"  answering: {'yes' if out['answering'] else 'no'}")
+    if out["images"] is not None:
+        print(f"  images staged: agent {'yes' if out['images']['agent'] else 'no'}, "
+              f"SearXNG {'yes' if out['images']['searxng'] else 'no'}   SearXNG: {out['searxng']}")
+    if out["searches"] is not None:
+        print("  searches: " + ", ".join(f"{k} {v}" for k, v in out["searches"].items()))
+    print(f"  sign-in: {out['credential']}   MCP gateway entry: {out['mcp_entry']}")
+    if out["settings"]:
+        sr = out["settings"]["searcher"]
+        print(f"  searcher: {sr['name']} ({sr['model']}"
+              + (f" {sr['effort']}" if sr["effort"] else "")
+              + f", {sr['at_once']} at once)   contact: "
+              + (out["settings"]["contact"] or f"(generic: {search.GENERIC_CONTACT})"))
+    if out["error"]:
+        print(f"warning: {out['error']}", file=sys.stderr)
+
+
+def cmd_search_token(_args: argparse.Namespace) -> None:
+    """Store the service's long-lived token (mint it with `claude setup-token`):
+    from stdin (piped) or a hidden prompt — never argv."""
+    import getpass
+    tok = sys.stdin.readline().strip() if not sys.stdin.isatty() \
+        else getpass.getpass("Search service setup-token (input hidden): ").strip()
+    req = _build(rscore.SearchTokenRequest, token=tok)
+    out = _call(rscore.search_token_set, req)
+    print("token stored" + ("" if out.get("delivered") else f" ({out.get('note')})"))
+
+
+def cmd_search_token_clear(_args: argparse.Namespace) -> None:
+    _call(rscore.search_token_clear)
+    print("token removed")
+
+
+def cmd_search_settings(args: argparse.Namespace) -> None:
+    cur = _call(rscore.search_settings_get)
+    if not any(v is not None for v in (args.name, args.model, args.effort,
+                                         args.at_once, args.contact)):
+        print(json.dumps(cur["settings"], indent=2, sort_keys=True))
+        if cur["error"]:
+            die(cur["error"])
+        return
+    base = (cur["settings"] or search.default_settings())
+    sr = base["searcher"]
+    req = _build(rscore.SearchSettingsRequest,
+                 name=sr["name"] if args.name is None else args.name,
+                 model=sr["model"] if args.model is None else args.model,
+                 effort=sr["effort"] if args.effort is None else args.effort,
+                 at_once=sr["at_once"] if args.at_once is None else args.at_once,
+                 contact=base["contact"] if args.contact is None else args.contact)
+    out = _call(rscore.search_settings_set, req)
+    print(json.dumps(out["settings"], indent=2, sort_keys=True))
+
+
+def cmd_search_clear(_args: argparse.Namespace) -> None:
+    out = _call(rscore.search_clear)
+    print(f"cleared {out['cleared']} ended search(es)")
+    for p in out["problems"]:
+        print(f"warning: {p}", file=sys.stderr)
 
 
 def cmd_worker_list(args: argparse.Namespace) -> None:
@@ -3763,6 +3847,33 @@ def build_parser() -> argparse.ArgumentParser:
     als = ald_sub.add_parser("status", help="on/off, containers, version and health")
     als.add_argument("--json", action="store_true")
     als.set_defaults(func=cmd_aldine_status)
+
+    srch = sub.add_parser("search", help="the search service (one for the whole "
+                                         "installation, offered to agents as the MCP "
+                                         "gateway server `search`)")
+    srch_sub = srch.add_subparsers(dest="subcommand", required=True)
+    srch_sub.add_parser("on", help="build, start and stage the search service and list "
+                                   "it on the MCP gateway").set_defaults(func=cmd_search_on)
+    srch_sub.add_parser("off", help="remove the service's container, networks and gateway "
+                                    "entry; settings, sign-in and staged images are kept"
+                        ).set_defaults(func=cmd_search_off)
+    sst = srch_sub.add_parser("status", help="on/off, container, sign-in, images, searches")
+    sst.add_argument("--json", action="store_true")
+    sst.set_defaults(func=cmd_search_status)
+    srch_sub.add_parser("token", help="store the long-lived token `claude setup-token` "
+                                      "prints (stdin or hidden prompt, never argv)"
+                        ).set_defaults(func=cmd_search_token)
+    srch_sub.add_parser("token-clear", help="remove the stored token"
+                        ).set_defaults(func=cmd_search_token_clear)
+    sse = srch_sub.add_parser("settings", help="show the searcher, or change fields of it")
+    sse.add_argument("--name")
+    sse.add_argument("--model")
+    sse.add_argument("--effort", help='an effort level, or "" for none')
+    sse.add_argument("--at-once", type=int, dest="at_once")
+    sse.add_argument("--contact", help='an email address, or "" for the generic one')
+    sse.set_defaults(func=cmd_search_settings)
+    srch_sub.add_parser("clear", help="remove every ended search nobody collected"
+                        ).set_defaults(func=cmd_search_clear)
 
     mw = mcp_sub.add_parser(
         "wire", help="give a project's agent, one of its boxes, or a research "

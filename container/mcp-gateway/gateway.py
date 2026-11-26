@@ -80,8 +80,16 @@ SERVER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailer", "trailers", "transfer-encoding", "upgrade",
               "content-length"}
-# Never sent to a server: the caller's token, its Host, and RS's ownership mark.
-CALLER_ONLY = {"authorization", "host", "x-rs-mcp"}
+# The caller's identity (`<project>/<consumer>`), set by the gateway itself on
+# requests to an entry the host's rendering marks with PASS_CALLER_KEY (RS's
+# own search service) and on no other. MIRROR of cli/search.py CALLER_HEADER /
+# PASS_CALLER_KEY (this image carries no cli/).
+CALLER_HEADER = "X-RS-Caller"
+PASS_CALLER_KEY = "pass_caller"
+# Never sent to a server as the caller wrote it: the caller's token, its Host,
+# RS's ownership mark, and the caller-identity header (a caller cannot claim
+# to be another project; only the gateway sets it, and only for RS's own).
+CALLER_ONLY = {"authorization", "host", "x-rs-mcp", CALLER_HEADER.lower()}
 
 # Rebound whole, never mutated: one atomic store each, so the SIGHUP handler
 # needs no lock (a lock here could be re-entered by a second HUP and never
@@ -301,6 +309,11 @@ class Relay(BaseHTTPRequestHandler):
         secret = {h.lower() for h in (entry.get("headers") or {})}
         headers = {h: v for h, v in headers.items() if h.lower() not in secret}
         headers.update(entry.get("headers") or {})
+        # After the entry's own headers: for RS's own server the identity is
+        # always the gateway's, whatever the list holds.
+        headers = {h: v for h, v in headers.items() if h.lower() != CALLER_HEADER.lower()}
+        if entry.get(PASS_CALLER_KEY) is True:
+            headers[CALLER_HEADER] = f"{who['project']}/{who['consumer']}"
         if length is not None:
             headers["Content-Length"] = str(length)
         conn = None

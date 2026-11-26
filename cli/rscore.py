@@ -92,6 +92,7 @@ import extension  # noqa: E402
 import workflow  # noqa: E402  (manifest store catalog; from_kwargs resolves --workflow)
 import gitea  # noqa: E402  (STAGE_DEV_GITEA: shared rs-gitea client + dev-lane host state)
 import aldine  # noqa: E402  (the shared Aldine LaTeX editor: names, pins, pure helpers)
+import search  # noqa: E402  (the search service: names, pins, settings, pure helpers)
 import orch_files  # noqa: E402  (no-follow access to <workspace>/.orchestrator; host-only)
 from broker_auth import MIN_PASSWORD_LENGTH  # noqa: E402  (single password-length floor: broker passwd + gitea passwd + the app.js mirror)
 
@@ -20077,6 +20078,7 @@ def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
     if state == "running":
         _mcp_docker(["docker", "kill", "-s", "HUP", MCP_GATEWAY_CONTAINER], deadline)
         _mcp_gateway_aldine_front(deadline)
+        _mcp_gateway_search_front(deadline)
         _mcp_gateway_run_networks(deadline)
         return True, "the MCP gateway is running"
     if state == "stopped":
@@ -20110,6 +20112,8 @@ def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
     # A created gateway is on rs-sandbox only: back onto Aldine's front
     # network when Aldine is on (every gateway (re)creation passes here).
     _mcp_gateway_aldine_front(deadline)
+    # ... onto the search service's front network when the service is on ...
+    _mcp_gateway_search_front(deadline)
     # ... and onto the network of every MCP server RS runs.
     _mcp_gateway_run_networks(deadline)
     return True, "the MCP gateway was started"
@@ -22940,6 +22944,775 @@ def resume_aldine_with_fleet() -> None:
         _aldine_write_tab_record()
     except aldine.AldineError as e:
         print(f"warning: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# The search service (rs-search)
+# ---------------------------------------------------------------------------
+# One search service for the whole installation, turned on by the operator
+# (Services → Search or `research search on`), resumed by `research start`
+# only when it was turned on, and offered to agents as the MCP gateway server
+# `search`. Names, the container's exact shape and the host files are in
+# cli/search.py; the service program is container/search/service.py.
+
+# How long Turn on / start waits for the service to answer after (re)creating
+# or starting its container: the dind image's boot (its inner daemon was up in
+# 1.9 s, measured) plus the service's own start (leftovers removed, SearXNG
+# started when staged: seconds). Measured in the private runner: about four
+# seconds from creating the container to its first answer; thirty times that
+# is room for a loaded host. Too long only
+# delays the report of a container that cannot come up; too short fails a
+# healthy service on a busy machine.
+SEARCH_BOOT_WAIT_S = 120
+# Between two readiness checks: each is one `docker exec` (~0.1 s).
+SEARCH_POLL_S = 1
+
+SEARCH_TURNING_ON = ("the search service is being turned on; try again when that "
+                     "has finished")
+SEARCH_NOT_RUNNING = ("the search service is not running (turn it on under "
+                      "Services → Search); the change is saved and reaches it "
+                      "when it starts")
+SEARCH_BUSY = "the search settings are being changed, try again"
+_SEARCH_PY = ["/opt/conda/bin/python3", "/opt/rs-search/service.py"]
+# The two RS containers each search network may hold besides the service.
+_SEARCH_NET_PEERS = {search.EGRESS_NETWORK: (search.SERVICE_CONTAINER, ROUTER_CONTAINER),
+                     search.FRONT_NETWORK: (search.SERVICE_CONTAINER, MCP_GATEWAY_CONTAINER)}
+
+
+def _search_pins() -> dict[str, str]:
+    try:
+        versions = load_versions()
+    except (OSError, ValueError):
+        raise search.SearchError(_VERSIONS_NOT_TEXT) from None
+    return search.pins_from(versions)
+
+
+def _search_docker(cmd: list[str], deadline: float | None,
+                   input: str | None = None) -> subprocess.CompletedProcess:
+    """One docker call under the verb's deadline, its refusals as SearchError."""
+    try:
+        return _mcp_docker(cmd, deadline, input=input)
+    except ValidationError as e:
+        raise search.SearchError(str(e)) from None
+
+
+def _search_failed(what: str, r: subprocess.CompletedProcess) -> search.SearchError:
+    """The refusal for a docker step that failed: its FIRST line is the cause."""
+    err = [l for l in (r.stderr or r.stdout or "").splitlines() if l.strip()]
+    return search.SearchError(what + (f" ({err[0].strip()[:200]})" if err else ""))
+
+
+def _search_container(deadline: float | None) -> tuple[str, dict]:
+    """(running | stopped | absent, labels) of the service container."""
+    r = _search_docker(["docker", "container", "inspect", "-f",
+                        "{{.State.Running}} {{json .Config.Labels}}",
+                        search.SERVICE_CONTAINER], deadline)
+    if r.returncode != 0:
+        return "absent", {}
+    running, _, raw = r.stdout.strip().partition(" ")
+    try:
+        labels = json.loads(raw)
+    except (ValueError, RecursionError):
+        labels = {}
+    return ("running" if running == "true" else "stopped"), (
+        labels if isinstance(labels, dict) else {})
+
+
+def _search_foreign(kind: str, name: str) -> search.SearchError:
+    return search.SearchError(
+        f"a {kind} named {name} exists that RS did not make for the search "
+        "service, so nothing was changed; RS neither uses nor removes it: it has "
+        "to be removed or renamed on the host before the search service can run")
+
+
+def _search_network(name: str, deadline: float | None) -> dict | None:
+    """{internal, ours, members, subnet} of one of the service's networks, or None."""
+    r = _search_docker(["docker", "network", "inspect", "-f",
+                        "{{json .Internal}}|{{json .Labels}}|{{json .Containers}}|"
+                        "{{range .IPAM.Config}}{{.Subnet}} {{end}}", name], deadline)
+    if r.returncode != 0:
+        return None
+    internal, labels, members, subnets = (r.stdout.strip().split("|") + ["", "", ""])[:4]
+    try:
+        found = json.loads(members or "null")
+    except (ValueError, RecursionError):
+        found = None
+    names = sorted(c.get("Name", "") for c in found.values()
+                   if isinstance(c, dict)) if isinstance(found, dict) else []
+    return {"internal": internal.strip() == "true",
+            "ours": _mcp_run_labels(labels).get(search.OWNER_LABEL) == search.OWNER_VALUE,
+            "members": names, "subnet": (subnets.split() or [""])[0]}
+
+
+def _search_check_network(name: str, info: dict) -> None:
+    """Refuse a network of the service's name that RS did not make for it,
+    one with a route out, or one holding anything RS never connects to it."""
+    if not info["ours"] or not info["internal"]:
+        raise _search_foreign("network", name)
+    others = [m for m in info["members"] if m not in _SEARCH_NET_PEERS[name]]
+    if others:
+        raise search.SearchError(
+            f"the search service's network {name} also holds {', '.join(others)}, "
+            "which RS never connects to it, so nothing was changed; it has to be "
+            "disconnected on the host before the search service can run")
+
+
+def _search_model_ok(model: str, effort: str) -> str | None:
+    """Why (model, effort) is not a pair the model catalog offers, or None."""
+    try:
+        catalog = model_catalog.load_catalog()
+    except model_catalog.ModelCatalogError:
+        return "the model catalog of this installation cannot be read"
+    aliases = model_catalog.aliases(catalog)
+    if model not in aliases:
+        return f"the model must be one of {', '.join(aliases)}"
+    if effort and effort not in catalog["efforts"]:
+        return f"the effort must be one of {', '.join(catalog['efforts'])}, or none"
+    if not model_catalog.supports_effort(model, effort, catalog):
+        return f"the model {model} takes no effort level; choose none"
+    return None
+
+
+def _search_settings() -> dict:
+    return search.read_settings(_search_model_ok)
+
+
+@contextlib.contextmanager
+def _search_lock(blocking: bool):
+    """Serialize the writers of the host files (settings, token). Holders do
+    FILE work only. On the broker one non-blocking attempt; every OSError of
+    the lock itself is a refusal that names no path."""
+    try:
+        search.STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(search.LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        raise search.SearchError("the search settings on the host cannot be locked "
+                                 f"({e.strerror or 'open failed'})") from None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise search.SearchError(SEARCH_BUSY) from None
+        except OSError as e:
+            raise search.SearchError("the search settings on the host cannot be "
+                                     f"locked ({e.strerror or 'lock failed'})") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def search_connect_front(deadline: float | None = None) -> list[str]:
+    """Connect the MCP gateway to the service's front network when both exist
+    and it is not connected yet. Idempotent and cheap when the service is off
+    (one network inspect). Called at Turn on / start and at the end of every
+    gateway (re)creation. Never raises; returns the problems as sentences."""
+    problems: list[str] = []
+    try:
+        info = _search_network(search.FRONT_NETWORK, deadline)
+        if info is None or not info["ours"] or MCP_GATEWAY_CONTAINER in info["members"]:
+            return problems
+        if _mcp_gateway_container(deadline)[0] == "absent":
+            return problems
+        c = _search_docker(["docker", "network", "connect", search.FRONT_NETWORK,
+                            MCP_GATEWAY_CONTAINER], deadline)
+        if c.returncode != 0:
+            problems.append(str(_search_failed(
+                "the MCP gateway could not be connected to the search service's network", c)))
+    except (search.SearchError, ValidationError) as e:
+        problems.append(str(e))
+    return problems
+
+
+def _mcp_gateway_search_front(deadline: float | None) -> None:
+    for problem in search_connect_front(deadline):
+        print(f"warning: {problem}", file=sys.stderr)
+
+
+def _search_list_ready() -> None:
+    """Refuse before any long step when the server list cannot take RS's
+    entry: unreadable, written by a newer RS, or holding another `search`."""
+    try:
+        data = mcp_servers.load()
+    except mcp_servers.ServerListError as e:
+        raise search.SearchError(str(e)) from None
+    if search.gateway_entry_conflict(data):
+        raise search.SearchError(search.CONFLICT_TEXT.format(name=search.MCP_SERVER_NAME))
+
+
+def _search_image_id(ref: str, deadline: float | None = None) -> str:
+    r = _search_docker(["docker", "image", "inspect", "-f", "{{.Id}}", ref], deadline)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _search_image_content(ref: str, deadline: float | None = None) -> str:
+    """The content identity of a host image (its layers and config, the
+    identity servers RS runs record for their runner): on the containerd
+    image store a build that changed nothing still mints a new image Id, so
+    the Id would re-create the service and re-stage its images at every
+    start. "" when the image is not there."""
+    r = _search_docker(["docker", "image", "inspect", "-f", mcp_run.RUNNER_INSPECT_FORMAT,
+                        ref], deadline)
+    return mcp_run.runner_identity(r.stdout or "")[1] if r.returncode == 0 else ""
+
+
+def _search_build_images() -> None:
+    """Build the service and the search agent's images from this tree
+    (cached: seconds when nothing changed). Unbounded: the build lane, the
+    host command and `research start`."""
+    if not _search_image_id(SANDBOX_DIND_IMAGE):
+        raise search.SearchError(
+            "the project images are not built on this computer, and the search "
+            "service is built on one of them: Rebuild all on Host → Software, "
+            "then turn the search service on")
+    for dockerfile, image in (("Dockerfile.service", search.SERVICE_IMAGE),
+                              ("Dockerfile.agent", search.AGENT_IMAGE)):
+        print(f"building {image} ...", flush=True)
+        try:
+            r = run(["docker", "build", "-f",
+                     str(SCRIPT_DIR / "container" / "search" / dockerfile),
+                     "-t", image, str(SCRIPT_DIR)])
+        except OSError:
+            raise search.SearchError(_MCP_HOST_DOWN) from None
+        if r.returncode != 0:
+            raise search.SearchError(f"the image {image} could not be built (the "
+                                     "operation's log has docker's reason)")
+
+
+def _search_pull_searxng(pins: dict) -> None:
+    image = search.searxng_image(pins)
+    if _search_image_id(image):
+        return
+    print(f"pulling {image} ...", flush=True)
+    try:
+        r = run(["docker", "pull", image])
+    except OSError:
+        raise search.SearchError(_MCP_HOST_DOWN) from None
+    if r.returncode != 0:
+        raise search.SearchError(f"the SearXNG image {image} could not be downloaded "
+                                 "(the operation's log has docker's reason)")
+
+
+def _search_networks_up() -> bool:
+    """Both networks made (or checked to be RS's own); the router on the
+    egress one with a locked project's rules. True when one was created
+    (a container made against an earlier network could not start)."""
+    fresh = False
+    for name in (search.EGRESS_NETWORK, search.FRONT_NETWORK):
+        info = _search_network(name, None)
+        if info is None:
+            argv = (search.egress_network_create_argv(network_create_args(name))
+                    if name == search.EGRESS_NETWORK else search.front_network_create_argv())
+            r = _search_docker(argv, None)
+            if r.returncode != 0:
+                raise _search_failed(f"the search service's network {name} could not "
+                                     "be created", r)
+            fresh = True
+        else:
+            _search_check_network(name, info)
+    if not container_running(ROUTER_CONTAINER):
+        raise search.SearchError("RS's egress router is not running, so the search "
+                                 "service was not started; it runs again after a "
+                                 "start of RS")
+    run(["docker", "network", "connect", search.EGRESS_NETWORK, ROUTER_CONTAINER],
+        capture_output=True)                     # already connected: harmless refusal
+    try:
+        # die()'s line carries docker's command line: on the build lane stderr
+        # is the log the browser shows, so it is swallowed and said plainly.
+        with contextlib.redirect_stderr(io.StringIO()):
+            # Before the apply (the purge's sweep would take the fresh rules):
+            # docker hands a freed range to the next network, and an allow left
+            # on it must not reach the service.
+            purge_router_range(search.EGRESS_NETWORK, strict=True)
+            apply_firewall_rules(search.EGRESS_NETWORK, "locked", load_config().sandbox_dns)
+    except SystemExit:
+        raise search.SearchError("the search service's egress rules could not be set "
+                                 "on RS's router (the operation's log has the "
+                                 "router's answer)") from None
+    return fresh
+
+
+def _search_inject_route() -> None:
+    """The service's default route via the router (after every start: its
+    networks are `--internal`, so it has none of its own)."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            inject_route(search.SERVICE_CONTAINER, get_router_ip(search.EGRESS_NETWORK))
+    except SystemExit:
+        raise search.SearchError("the search service's route out through RS's router "
+                                 "could not be set") from None
+
+
+def _search_admin(what: str, deadline: float | None) -> dict | None:
+    """Ask the running service (from inside its container). None when it does
+    not answer or the answer is not JSON."""
+    r = _search_docker(["docker", "exec", search.SERVICE_CONTAINER, *_SEARCH_PY,
+                        "admin", what], deadline)
+    if r.returncode != 0:
+        return None
+    try:
+        out = json.loads(r.stdout)
+    except (ValueError, RecursionError):
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def _search_wait_answering() -> None:
+    end = time.monotonic() + SEARCH_BOOT_WAIT_S
+    while True:
+        if _search_admin("status", end) is not None:
+            return
+        state, _labels = _search_container(None)
+        if state != "running":
+            raise search.SearchError("the search service stopped while starting (its "
+                                     "inner Docker did not come up); turning it on "
+                                     "again retries")
+        if time.monotonic() >= end:
+            raise search.SearchError(f"the search service did not answer within "
+                                     f"{SEARCH_BOOT_WAIT_S} seconds of starting")
+        time.sleep(SEARCH_POLL_S)
+
+
+def _search_inner(args: list[str], deadline: float | None) -> subprocess.CompletedProcess:
+    return _search_docker(["docker", "exec", search.SERVICE_CONTAINER, "docker", *args],
+                          deadline)
+
+
+# The inner tag that says which host image a staged one came from: the repo
+# plus `from-<the host image's content identity, hex>`. Staging is skipped
+# when it is there.
+_SEARCH_STAGED_PREFIX = "from-"
+
+
+def _search_stage(pins: dict) -> None:
+    """Bring each search image into the service's inner Docker when the host's
+    image is not there yet (by its content identity, recorded as a tag), then
+    point the name the service runs at it and drop the earlier stagings."""
+    for host_ref, inner_ref in ((search.AGENT_IMAGE, search.AGENT_IMAGE),
+                                (search.searxng_image(pins), search.inner_searxng_image(pins))):
+        content = _search_image_content(host_ref)
+        if not content.startswith("sha256:"):
+            raise search.SearchError(f"the image {host_ref} is not on this computer")
+        repo = inner_ref.rsplit(":", 1)[0]
+        staged = f"{repo}:{_SEARCH_STAGED_PREFIX}{content[len('sha256:'):]}"
+        if _search_inner(["image", "inspect", staged], None).returncode != 0:
+            print(f"staging {host_ref} into the search service ...", flush=True)
+            try:
+                save = subprocess.Popen(["docker", "save", host_ref],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                load = subprocess.run(["docker", "exec", "-i", search.SERVICE_CONTAINER,
+                                       "docker", "load"], stdin=save.stdout,
+                                      capture_output=True)
+                save.stdout.close()
+                saved = save.wait()
+            except OSError:
+                raise search.SearchError(_MCP_HOST_DOWN) from None
+            if saved != 0 or load.returncode != 0:
+                raise search.SearchError(f"the image {host_ref} could not be staged into "
+                                         "the search service")
+            # The load names the image as the host did (a digest reference
+            # loads untagged): tag it by what was loaded.
+            loaded = re.findall(r"Loaded image(?: ID)?: (\S+)", load.stdout.decode(
+                "utf-8", "replace"))
+            source = loaded[-1] if loaded else host_ref
+            r = _search_inner(["tag", source, staged], None)
+            if r.returncode != 0:
+                raise _search_failed(f"the staged image {host_ref} could not be named "
+                                     "in the search service", r)
+        r = _search_inner(["tag", staged, inner_ref], None)
+        if r.returncode != 0:
+            raise _search_failed(f"the staged image {host_ref} could not be named in "
+                                 "the search service", r)
+        old = _search_inner(["image", "ls", repo, "--format", "{{.Repository}}:{{.Tag}}"], None)
+        for ref in (old.stdout or "").split():
+            if ref.startswith(f"{repo}:{_SEARCH_STAGED_PREFIX}") and ref != staged:
+                _search_inner(["image", "rm", ref], None)
+
+
+def _search_deliver(deadline: float | None) -> None:
+    """Hand the running service its settings and its token (or take the token
+    away), over stdin into its tmpfs — never on a command line."""
+    settings = search.service_settings(_search_settings())
+    token = search.read_token_file()
+    steps = [(["put", search.SETTINGS_FILE_NAME], json.dumps(settings) + "\n")]
+    steps.append((["put", search.TOKEN_FILE_NAME], token) if token is not None
+                 else (["drop", search.TOKEN_FILE_NAME], None))
+    for args, data in steps:
+        r = _search_docker(["docker", "exec", "-i", "-u", "0", search.SERVICE_CONTAINER,
+                            *_SEARCH_PY, *args], deadline, input=data if data is not None else "")
+        if r.returncode != 0:
+            raise search.SearchError("the search service could not be handed its "
+                                     f"{'sign-in' if 'claude' in args[1] else 'settings'}")
+
+
+def _search_up(progress) -> None:
+    """Make the service run this installation's code and pins, answering,
+    staged, handed its settings and token, listed on the gateway. Idempotent.
+    Unbounded (the build lane, the host command, `research start`). Every
+    refusal is a SearchError."""
+    pins = _search_pins()
+    _search_settings()                  # a damaged settings file refuses first
+    search.read_token_file()            # so does a damaged token file
+    if not dist_present(DEFAULT_AGENT):
+        raise search.SearchError("the Claude download is not on this computer; pull "
+                                 "it under Host → Software, then turn the search "
+                                 "service on")
+    _search_list_ready()
+    try:
+        search.set_on(True)
+    except OSError as e:
+        raise search.SearchError("cannot record on the host that the search service "
+                                 f"is on ({e.strerror or 'write failed'})") from None
+
+    progress.step("build", "building the search service's images")
+    _search_build_images()
+    progress.step("pull", "fetching SearXNG")
+    _search_pull_searxng(pins)
+
+    progress.step("start", "starting the search service")
+    fresh_network = _search_networks_up()
+    want_id = _search_image_content(search.SERVICE_IMAGE)
+    state, labels = _search_container(None)
+    if state != "absent" and labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
+        raise _search_foreign("container", search.SERVICE_CONTAINER)
+    if state != "absent" and (fresh_network or labels.get(search.IMAGE_LABEL) != want_id
+                              or labels.get(search.SEARXNG_LABEL) != pins["searxng_version"]):
+        print(f"replacing {search.SERVICE_CONTAINER} (it runs an earlier version of the "
+              "search service; its searches end)", flush=True)
+        r = _search_docker(["docker", "rm", "-f", search.SERVICE_CONTAINER], None)
+        if r.returncode != 0:
+            raise _search_failed(f"{search.SERVICE_CONTAINER} could not be removed", r)
+        state = "absent"
+    if state == "absent":
+        argv = search.service_run_argv(
+            dind_mode=select_dind_mode(load_config().default_dind),
+            dns=load_config().sandbox_dns, pins=pins, image_content=want_id,
+            agent_dist_dir=AGENT_DIST_DIR, pids_limit=project_pids_limit())
+        r = _search_docker(argv, None)
+        if r.returncode != 0:
+            raise _search_failed(f"{search.SERVICE_CONTAINER} could not be created", r)
+        _search_inject_route()
+    elif state == "stopped":
+        r = _search_docker(["docker", "start", search.SERVICE_CONTAINER], None)
+        if r.returncode != 0:
+            raise _search_failed(f"{search.SERVICE_CONTAINER} could not be started", r)
+        _search_inject_route()
+    else:
+        _search_inject_route()          # idempotent: `replace`
+    _search_wait_answering()
+
+    progress.step("stage", "staging the search images into the service")
+    _search_stage(pins)
+    _search_deliver(None)
+    ensured = _search_admin("ensure", None)
+    if ensured is None or ensured.get("searxng") != "running":
+        raise search.SearchError("SearXNG did not start in the search service"
+                                 + (f" ({ensured.get('searxng')})" if ensured else ""))
+
+    problems = search_connect_front(None)
+    if problems:
+        raise search.SearchError("; ".join(problems))
+    progress.step("mcp", "listing the search service on the MCP gateway")
+
+    def change(data: dict) -> None:
+        try:
+            search.apply_gateway_entry(data)
+        except search.SearchError as e:
+            raise mcp_servers.ServerListError(str(e)) from None
+    try:
+        _mcp_change(change, blocking=True, deadline=None)
+    except ValidationError as e:
+        raise search.SearchError(str(e)) from None
+
+
+def search_on(progress=None) -> dict:
+    """Turn the search service on (a build-lane verb: builds and the first
+    staging take minutes). Every refusal is a die(): the build lane shows its
+    line, where a ValidationError would end as a bare "invalid request"."""
+    progress = progress or _NULL_PROGRESS
+    try:
+        _search_up(progress)
+    except search.SearchError as e:
+        die(str(e))
+    print(f"the search service is on ({search.SERVICE_CONTAINER} is running and "
+          f"answering; agents reach it as the MCP server {search.MCP_SERVER_NAME})")
+    return {"search": "on"}
+
+
+def _search_drop_network(name: str, deadline: float | None) -> None:
+    info = _search_network(name, deadline)
+    if info is None:
+        return
+    _search_check_network(name, info)
+    if name == search.EGRESS_NETWORK and info["subnet"]:
+        router = _search_docker(["docker", "container", "inspect", "-f",
+                                 "{{.State.Running}}", ROUTER_CONTAINER], deadline)
+        if router.stdout.strip() == "true":
+            # The range's rules and every allow on it, by RANGE. Best effort:
+            # a range whose rules survive is purged before any network uses
+            # it again (every bring-up purges strictly first).
+            _search_docker(["docker", "exec", ROUTER_CONTAINER, "/scripts/remove-rules.sh",
+                            info["subnet"], ",".join(load_config().sandbox_dns)], deadline)
+            try:
+                script = ROUTER_PURGE_SCRIPT_SRC.read_text()
+            except OSError:
+                script = None
+            if script is not None:
+                _search_docker(["docker", "exec", "-i", ROUTER_CONTAINER, "sh", "-s", "--",
+                                info["subnet"]], deadline, input=script)
+    for peer in _SEARCH_NET_PEERS[name][1:]:
+        if peer in info["members"]:
+            _search_docker(["docker", "network", "disconnect", "-f", name, peer], deadline)
+    r = _search_docker(["docker", "network", "rm", name], deadline)
+    if r.returncode != 0:
+        raise _search_failed(f"the search service's network {name} could not be removed", r)
+
+
+def search_off(*, blocking: bool = True, deadline: float | None = None) -> dict:
+    """Turn the search service off: its gateway entry (only when it is RS's —
+    which also unwires it everywhere), the container (every running search
+    ends with it) and both networks go; the inner Docker's volume (the staged
+    images), the settings and the token stay, so turning it on again finds
+    them. Bounded by `deadline` on the broker; idempotent, so a refusal
+    half-way is finished by running it again."""
+    try:
+        mcp_server_remove(McpServerNameRequest(name=search.MCP_SERVER_NAME),
+                          blocking=blocking, deadline=deadline, if_url=search.MCP_URL)
+        try:
+            search.set_on(False)
+        except OSError as e:
+            raise search.SearchError("cannot record on the host that the search service "
+                                     f"is off ({e.strerror or 'write failed'})") from None
+        state, labels = _search_container(deadline)
+        if state != "absent":
+            if labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
+                raise _search_foreign("container", search.SERVICE_CONTAINER)
+            r = _search_docker(["docker", "rm", "-f", search.SERVICE_CONTAINER], deadline)
+            if r.returncode != 0:
+                raise _search_failed(f"{search.SERVICE_CONTAINER} could not be removed", r)
+        for name in (search.FRONT_NETWORK, search.EGRESS_NETWORK):
+            _search_drop_network(name, deadline)
+    except search.SearchError as e:
+        raise ValidationError(str(e)) from None
+    return {"search": "off"}
+
+
+def search_status(deadline: float | None = None) -> dict:
+    """What the Search page shows: on or off, the container's state and
+    whether it runs this installation's version, the gateway entry, whether a
+    sign-in is stored (never its value), the settings, the staged images, the
+    searches by state. Cheap and bounded: ONE deadline, taken first, shared by
+    every docker call. Never raises for a state it can name."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    out: dict[str, Any] = {"on": search.is_on(), "container": "absent", "current": False,
+                           "searxng_version": None, "mcp_entry": "absent",
+                           "credential": "absent", "settings": None, "answering": None,
+                           "images": None, "searxng": None, "searches": None,
+                           "error": None}
+    errors: list[str] = []
+    pins = None
+    try:
+        pins = _search_pins()
+        out["searxng_version"] = pins["searxng_version"]
+    except search.SearchError as e:
+        errors.append(str(e))
+    try:
+        out["credential"] = "set" if search.read_token_file() is not None else "absent"
+    except search.SearchError as e:
+        out["credential"] = "damaged"
+        errors.append(str(e))
+    try:
+        out["settings"] = _search_settings()
+    except search.SearchError as e:
+        errors.append(str(e))
+    state, data, _why = mcp_servers.read()
+    if state != mcp_servers.OK:
+        out["mcp_entry"] = "unreadable"
+    elif search.MCP_SERVER_NAME in data["servers"]:
+        out["mcp_entry"] = "conflict" if search.gateway_entry_conflict(data) else "listed"
+    try:
+        cstate, labels = _search_container(deadline)
+        out["container"] = cstate
+        if cstate != "absent" and labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
+            out["container"] = "foreign"
+        out["current"] = bool(
+            pins and cstate != "absent"
+            and labels.get(search.SEARXNG_LABEL) == pins["searxng_version"]
+            and labels.get(search.IMAGE_LABEL) == _search_image_content(search.SERVICE_IMAGE,
+                                                                          deadline))
+        if cstate == "running" and out["container"] != "foreign":
+            admin = _search_admin("status", deadline)
+            out["answering"] = admin is not None
+            if admin is not None:
+                images = admin.get("images") if isinstance(admin.get("images"), dict) else {}
+                out["images"] = {"agent": images.get("agent") is True,
+                                 "searxng": images.get("searxng") is True}
+                out["searxng"] = str(admin.get("searxng"))[:20]
+                counts = admin.get("searches") if isinstance(admin.get("searches"), dict) else {}
+                out["searches"] = {k: counts.get(k) for k in ("queued", "running", "ended")
+                                   if isinstance(counts.get(k), int)}
+    except search.SearchError as e:
+        errors.append(str(e))
+    out["error"] = "; ".join(errors) or None
+    return out
+
+
+def resume_search_with_fleet() -> None:
+    """`research start`'s step: bring a turned-on search service back onto
+    this installation's code and pins (re-created when they changed; the
+    staged images are kept), or WARN and carry on — nothing else in the fleet
+    depends on it. Never creates it when it was never turned on."""
+    if not search.is_on():
+        return
+    try:
+        _search_up(_NULL_PROGRESS)
+        print(f"{search.SERVICE_CONTAINER} is running")
+    except search.SearchError as e:
+        print(f"warning: the search service could not be resumed: {e}", file=sys.stderr)
+
+
+def _search_deliver_if_running(deadline: float | None) -> dict:
+    """After a change of the host files: hand it to a running service."""
+    state, labels = _search_container(deadline)
+    if state != "running" or labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
+        return {"delivered": False, "note": SEARCH_NOT_RUNNING}
+    _search_deliver(deadline)
+    return {"delivered": True}
+
+
+@dataclass(frozen=True)
+class SearchTokenRequest:
+    # The long-lived token `claude setup-token` prints: a secret, so off the
+    # repr, off every result, and never on a command line.
+    token: str = field(repr=False)
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "SearchTokenRequest":
+        token = kw.get("token")
+        problem = search.token_problem(token)
+        if problem:
+            raise ValidationError(problem)
+        return cls(token=token.strip())
+
+
+@dataclass(frozen=True)
+class SearchSettingsRequest:
+    name: str
+    model: str
+    effort: str
+    at_once: int
+    contact: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "SearchSettingsRequest":
+        missing = [k for k in ("name", "model", "effort", "at_once", "contact") if k not in kw]
+        if missing:
+            raise ValidationError(f"the searcher needs {', '.join(missing)}")
+        for problem in (search.searcher_name_problem(kw["name"]),
+                        search.at_once_problem(kw["at_once"]),
+                        search.contact_problem(kw["contact"])):
+            if problem:
+                raise ValidationError(problem)
+        model, effort = kw["model"], kw["effort"]
+        if not isinstance(model, str) or not isinstance(effort, str):
+            raise ValidationError("the model and the effort must be text")
+        problem = _search_model_ok(model, effort)
+        if problem:
+            raise ValidationError(problem)
+        return cls(name=kw["name"], model=model, effort=effort, at_once=kw["at_once"],
+                   contact=kw["contact"].strip())
+
+
+def search_token_set(req: SearchTokenRequest, *, blocking: bool = True,
+                     deadline: float | None = None) -> dict:
+    """Store the service's long-lived Claude token (0600) and hand it to a
+    running service. The answer never carries the token."""
+    deadline = _mcp_deadline() if deadline is None and not blocking else deadline
+    try:
+        with _search_lock(blocking):
+            try:
+                search.write_token(req.token)
+            except OSError as e:
+                raise search.SearchError("cannot store the token on the host "
+                                         f"({e.strerror or 'write failed'})") from None
+        out = _search_deliver_if_running(deadline)
+    except search.SearchError as e:
+        raise ValidationError(str(e)) from None
+    return {"credential": "set", **out}
+
+
+def search_token_clear(*, blocking: bool = True, deadline: float | None = None) -> dict:
+    """Remove the stored token from the host and from a running service."""
+    deadline = _mcp_deadline() if deadline is None and not blocking else deadline
+    try:
+        with _search_lock(blocking):
+            try:
+                search.clear_token()
+            except OSError as e:
+                raise search.SearchError("cannot remove the token on the host "
+                                         f"({e.strerror or 'remove failed'})") from None
+        out = _search_deliver_if_running(deadline)
+    except search.SearchError as e:
+        raise ValidationError(str(e)) from None
+    return {"credential": "absent", **out}
+
+
+def search_settings_get() -> dict:
+    """The saved searcher (or the defaults) and the choices the page offers.
+    A damaged settings file is reported with its remedy, never replaced."""
+    try:
+        catalog = model_catalog.load_catalog()
+    except model_catalog.ModelCatalogError:
+        raise ValidationError("the model catalog of this installation cannot be read") from None
+    out: dict[str, Any] = {"settings": None, "error": None,
+                           "models": catalog["models"], "efforts": catalog["efforts"],
+                           "max_at_once": search.MAX_AT_ONCE,
+                           "generic_contact": search.GENERIC_CONTACT,
+                           "defaults": search.default_settings()}
+    try:
+        out["settings"] = _search_settings()
+    except search.SearchError as e:
+        out["error"] = str(e)
+    return out
+
+
+def search_settings_set(req: SearchSettingsRequest, *, blocking: bool = True,
+                        deadline: float | None = None) -> dict:
+    """Save the whole searcher (replacing a damaged file too: the page sends
+    every field) and hand it to a running service."""
+    deadline = _mcp_deadline() if deadline is None and not blocking else deadline
+    data = {"version": search.SETTINGS_VERSION,
+            "searcher": {"name": req.name, "model": req.model, "effort": req.effort,
+                         "at_once": req.at_once},
+            "contact": req.contact}
+    try:
+        with _search_lock(blocking):
+            try:
+                search.write_settings(data)
+            except OSError as e:
+                raise search.SearchError("cannot save the search settings on the host "
+                                         f"({e.strerror or 'write failed'})") from None
+        out = _search_deliver_if_running(deadline)
+    except search.SearchError as e:
+        raise ValidationError(str(e)) from None
+    return {"settings": data, **out}
+
+
+def search_clear(deadline: float | None = None) -> dict:
+    """The operator's clear: every search that has ended and was not
+    collected is removed from the service, by name. Running and waiting
+    searches are left alone."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    try:
+        state, labels = _search_container(deadline)
+        if state != "running" or labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
+            raise search.SearchError("the search service is not running; nothing to clear")
+        out = _search_admin("clear", deadline)
+    except search.SearchError as e:
+        raise ValidationError(str(e)) from None
+    if out is None or not isinstance(out.get("cleared"), int):
+        raise ValidationError("the search service did not answer")
+    problems = out.get("problems") if isinstance(out.get("problems"), list) else []
+    return {"cleared": out["cleared"], "problems": [str(p)[:300] for p in problems]}
 
 
 def _supervisor_mcp_reload(container_name: str) -> None:

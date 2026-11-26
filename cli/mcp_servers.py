@@ -33,6 +33,7 @@ from typing import Any, Iterator
 
 import aldine
 import mcp_run
+import search
 
 STATE_DIR = Path.home() / ".research-sandbox"
 LIST_PATH = STATE_DIR / "mcp-servers.json"
@@ -272,13 +273,19 @@ def save(data: dict[str, Any]) -> None:
 def rendered(data: dict[str, Any]) -> dict[str, Any]:
     """What the gateway mounts: per server its address (derived for a server
     RS runs), its secret headers and its description — never a run server's
-    image, settings or anything else of its `run` record."""
+    image, settings or anything else of its `run` record. RS's own search
+    entry is marked (search.PASS_CALLER_KEY): the gateway hands that server,
+    and no other, the caller's project and consumer. The mark exists only in
+    the rendering — the stored list keeps its format — and is decided here,
+    by name and address, so no entry anyone else writes can carry it."""
     servers: dict[str, Any] = {}
     for name, entry in data["servers"].items():
         out: dict[str, Any] = {"url": entry_url(name, entry)}
         for key in ("description", "headers"):
             if key in entry:
                 out[key] = entry[key]
+        if search.is_rs_entry(name, entry):
+            out[search.PASS_CALLER_KEY] = True
         servers[name] = out
     return {"version": RENDERED_VERSION, "servers": servers}
 

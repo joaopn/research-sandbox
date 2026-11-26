@@ -1,0 +1,41 @@
+# rs-search-agent — one search, inside the search service's inner Docker.
+#
+# Claude Code is NOT baked: the service mounts the host's agent bundle
+# (~/.research-sandbox/agent-dist/claude) read-only at /opt/claude, so a
+# search runs the Claude Code the operator pulled under Host → Software.
+# What is baked: the plain tier's tool server (agent/tools.py, stdlib), the
+# search agent's instructions and launcher, and the managed settings that
+# switch Claude's own web tools off. The agent starts with no built-in tool
+# at all (--tools ""): every tool it has comes from the tool server.
+#
+# Built on the host beside rs-search and staged into the service's inner
+# Docker (docker save | docker load) when the host's image id changes.
+# The base is pinned by tag, as rs-mcp-runner's is.
+FROM python:3.12.16-slim-bookworm
+
+# pdftotext: the page fetch hands the agent the text of a PDF it saved.
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# The search agent's own user (uid 1000, what the service runs it as). The
+# volume's mount point is owned by it, so a fresh search volume (copied up
+# from the image) is writable by the agent and nothing else.
+RUN useradd -m -u 1000 -s /bin/sh agent \
+    && mkdir -p /search \
+    && chown agent:agent /search
+
+COPY container/search/agent/ /opt/rs-search-agent/
+RUN mkdir -p /etc/claude-code \
+    && mv /opt/rs-search-agent/managed-settings.json /etc/claude-code/managed-settings.json \
+    && chmod 644 /etc/claude-code/managed-settings.json \
+    && chmod -R a+rX /opt/rs-search-agent
+
+# No self-update (the bundle is read-only and RS pins it) and no traffic but
+# the model's.
+ENV DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    HOME=/home/agent
+
+USER agent
+WORKDIR /home/agent
+ENTRYPOINT ["/bin/sh", "/opt/rs-search-agent/run.sh"]

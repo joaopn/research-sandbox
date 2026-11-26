@@ -604,6 +604,68 @@ def _verb_aldine_status(_args: dict, _progress=None) -> dict:
     return rscore.aldine_status(rscore._mcp_deadline())
 
 
+# --- the search service (Services → Search) -----------------------------------
+# Turn on builds two images and stages them into the service the first time,
+# so it is a build-lane verb (BUILD_DISPATCH, target "search"). Everything
+# else is inline and takes ONE deadline (rscore.MCP_INLINE_DEADLINE_S) at its
+# first statement, shared by every docker call; the host-file lock (settings,
+# token) is one non-blocking attempt. The token rides the request body only:
+# never a command line, never a result, never a log.
+
+def _verb_search_on(_args: dict, progress=None) -> dict:
+    """Build-lane only: builds the service and agent images, fetches the
+    pinned SearXNG, (re)creates the service, stages the images into it, hands
+    it its settings and sign-in, lists `search` on the gateway."""
+    return rscore.search_on(progress=progress)
+
+
+def _search_not_turning_on() -> None:
+    if any(op.get("target") == "search" for op in _live_build_ops()):
+        raise rscore.ValidationError(rscore.SEARCH_TURNING_ON)
+
+
+def _verb_search_off(_args: dict, _progress=None) -> dict:
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    return rscore.search_off(blocking=False, deadline=deadline)
+
+
+def _verb_search_status(_args: dict, _progress=None) -> dict:
+    return rscore.search_status(rscore._mcp_deadline())
+
+
+def _verb_search_token_set(args: dict, _progress=None) -> dict:
+    deadline = rscore._mcp_deadline()
+    safe = {k: v for k, v in args.items() if k in SEARCH_TOKEN_WEBUI_FIELDS}
+    req = rscore.SearchTokenRequest.from_kwargs(**safe)
+    return rscore.search_token_set(req, blocking=False, deadline=deadline)
+
+
+def _verb_search_token_clear(_args: dict, _progress=None) -> dict:
+    deadline = rscore._mcp_deadline()
+    return rscore.search_token_clear(blocking=False, deadline=deadline)
+
+
+def _verb_search_settings(_args: dict, _progress=None) -> dict:
+    """The searcher (or the defaults), the model choices, the bounds. A file
+    read only, no docker."""
+    return rscore.search_settings_get()
+
+
+def _verb_search_settings_set(args: dict, _progress=None) -> dict:
+    deadline = rscore._mcp_deadline()
+    safe = {k: v for k, v in args.items() if k in SEARCH_SETTINGS_WEBUI_FIELDS}
+    req = rscore.SearchSettingsRequest.from_kwargs(**safe)
+    return rscore.search_settings_set(req, blocking=False, deadline=deadline)
+
+
+def _verb_search_clear(_args: dict, _progress=None) -> dict:
+    """The operator's clear: every ended, uncollected search goes, by name."""
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    return rscore.search_clear(deadline)
+
+
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
@@ -1439,6 +1501,11 @@ MCP_RUN_EDIT_WEBUI_FIELDS = frozenset({"name", "description", "args", "port", "p
                                        "version", "command"})
 # Wiring one consumer (a project's agents, or one of its boxes) to servers.
 MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
+# The search service's sign-in: the long-lived token `claude setup-token`
+# prints (a SECRET: repr=False on the request, never in a result or a log).
+SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
+# The one searcher and the contact address, saved whole.
+SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # Put one version pin back to the shipped value (the Host → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
@@ -1705,6 +1772,13 @@ VERBS = {
     "mcp_server_list": _verb_mcp_server_list,
     "aldine_off": _verb_aldine_off,
     "aldine_status": _verb_aldine_status,
+    "search_off": _verb_search_off,
+    "search_status": _verb_search_status,
+    "search_token_set": _verb_search_token_set,
+    "search_token_clear": _verb_search_token_clear,
+    "search_settings": _verb_search_settings,
+    "search_settings_set": _verb_search_settings_set,
+    "search_clear": _verb_search_clear,
     "mcp_server_add": _verb_mcp_server_add,
     "mcp_server_draft": _verb_mcp_server_draft,
     "mcp_server_edit": _verb_mcp_server_edit,
@@ -1880,6 +1954,7 @@ BUILD_DISPATCH = {
     "rebuild": _verb_rebuild,
     "mcp_gateway_start": _verb_mcp_gateway_start,
     "aldine_on": _verb_aldine_on,
+    "search_on": _verb_search_on,
     "mcp_run_add": _verb_mcp_run_add,
     "mcp_run_edit": _verb_mcp_run_edit,
     "mcp_server_start": _verb_mcp_server_start,
@@ -1953,12 +2028,14 @@ _BUILD_TARGETS = {
     "rebuild": "fleet",
     "mcp_gateway_start": "mcp-gateway",
     "aldine_on": "aldine",
+    "search_on": "search",
     **{verb: _MCP_RUN_TARGET for verb in _MCP_RUN_BUILD_REQUESTS},
 }
 # Browser-facing names for the refusal text.
 _BUILD_TARGET_NAMES = {"editor": "the editor download", "reader": "the reader download",
                        "node": "the node runtime", "fleet": "the image fleet",
-                       "mcp-gateway": "the MCP gateway", "aldine": "Aldine"}
+                       "mcp-gateway": "the MCP gateway", "aldine": "Aldine",
+                       "search": "the search service"}
 
 
 def _build_target(verb: str, args: dict) -> str:

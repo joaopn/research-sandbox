@@ -1,0 +1,16 @@
+# rs-search — RS's search service (cli/search.py, container/search/service.py).
+#
+# The inner-Docker image projects use (rs-sandbox-dind: docker-ce, crun, the
+# inner daemon's pools and its boot) plus the service program. Built by Turn
+# on (Services → Search) and at every `research start` while the service is
+# on (cached: seconds), so the host's wiring and the service are one version.
+FROM rs-sandbox-dind:latest
+
+USER root
+RUN mkdir -p /opt/rs-search
+COPY container/search/service.py container/search/boot.sh /opt/rs-search/
+RUN chmod 755 /opt/rs-search/service.py /opt/rs-search/boot.sh
+USER research
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/rs-search/boot.sh"]
