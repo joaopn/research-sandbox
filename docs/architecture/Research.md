@@ -18,7 +18,10 @@ The three newer workflows form the **lab agenda**. They are built in order, beca
 | `research` | built | a supervisor and worker containers; Claude only | workers, never the supervisor | session logs, written at session end | the supervisor, against its own plan | [Research workflow](Research-workflow.md) |
 | `researcher` | built, phase 1 | one long-lived agent; Claude or pi | the agent itself | the agent's own memory, written as it works | none; the user accepts findings | [Researcher workflow](Researcher-workflow.md) |
 | `researcher-subagents` | built, phase 2 | a researcher and its short-lived subagents; Claude or pi | subagents, with context the researcher selects | the researcher's memory | a re-run and a referee, on every finding; the user accepts | [Researcher with subagents](Researcher-with-subagents.md) |
+| `companion` | built | one long-lived agent for one-off and mixed tasks; Claude or pi | the agent itself, one folder per task | the researcher's memory, with the user's standing preferences in place of a line of inquiry | none; claims only when the user asks, and the user accepts | [The companion](Researcher-workflow.md#the-companion) |
 | `lab` | planned, phase 3 | several researchers, staff, a manager | each member, on its own line of inquiry | each member's memory, plus a shared record | a referee, on every claim | [Lab workflow](Lab-workflow.md) |
+
+The `companion` stands beside the lab agenda rather than in it: a researcher kept for one-off and mixed tasks instead of one line of inquiry, described on the [Researcher workflow](Researcher-workflow.md#the-companion) page.
 
 ```mermaid
 flowchart TD

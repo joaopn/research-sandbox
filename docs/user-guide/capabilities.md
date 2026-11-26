@@ -23,7 +23,7 @@ python research.py project mcp allow myproj arxiv
 
 **Aldine, the shared LaTeX editor.** Turned on under Services → Aldine (or `research aldine on`), it appears on the MCP tab as the server `aldine`; tick it for an agent, a box or a research project's workers like any server. A project with something wired to it also gets an **Aldine** tab. There is one Aldine and one set of papers for the whole installation. See [Aldine](../architecture/Aldine.md).
 
-**Checking a paper's citations.** The agent of a `researcher` or `researcher-subagents` project, or of a zotero box, can check a paper's citations once it is ticked for Aldine. Ask it with `/paper-check <paper>` in Claude Code, `/skill:paper-check <paper>` in pi, or in plain words. It leaves one review comment per problem on the paper, read in the Aldine tab, and lists every citation with its verdict in `/workspace/paper-check/<paper>/checks.md`. See [Checking a paper's citations](../architecture/Aldine.md#checking-a-papers-citations).
+**Checking a paper's citations.** The agent of a `researcher`, `researcher-subagents` or `companion` project, or of a zotero box, can check a paper's citations once it is ticked for Aldine. Ask it with `/paper-check <paper>` in Claude Code, `/skill:paper-check <paper>` in pi, or in plain words. It leaves one review comment per problem on the paper, read in the Aldine tab, and lists every citation with its verdict in `/workspace/paper-check/<paper>/checks.md`. See [Checking a paper's citations](../architecture/Aldine.md#checking-a-papers-citations).
 
 ### Worker services — `worker`
 
@@ -39,7 +39,7 @@ Pipeline-side agents the supervisor's analysis workers call through the proxy (`
 
 ### Boxes
 
-A project with its own inner Docker (`research`, `researcher`, `researcher-subagents`, `sandbox-dind`, `dev`, and the `social-data-pipeline` store workflow) can hold **boxes**: isolated sub-containers, each with its own workspace and no credentials. Add one from the **+** button on the project's tab strip, or with the `rs-sandbox` CLI in the project's terminal; the ✕ on the box's terminal tab removes it. A single-container project (`sandbox` and the other store workflows) cannot hold boxes.
+A project with its own inner Docker (`research`, `researcher`, `researcher-subagents`, `companion`, `sandbox-dind`, `dev`, and the `social-data-pipeline` store workflow) can hold **boxes**: isolated sub-containers, each with its own workspace and no credentials. Add one from the **+** button on the project's tab strip, or with the `rs-sandbox` CLI in the project's terminal; the ✕ on the box's terminal tab removes it. A single-container project (`sandbox` and the other store workflows) cannot hold boxes.
 
 Each box comes from a **box type** over two images (base, or browser with Playwright + Chromium):
 

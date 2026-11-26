@@ -43,11 +43,11 @@ Some agents can check the citations of a paper in Aldine and leave review commen
 
 | Where | Who has the check |
 |---|---|
-| A `researcher` or `researcher-subagents` project | The project's own agent |
+| A `researcher`, `researcher-subagents` or `companion` project | The project's own agent |
 | A zotero box | The box's agent, in every project type that holds boxes except `research` |
 | A `research` project, other project types, other box types | No one |
 
-The agent must be ticked for Aldine on Services → MCP. The user asks it to check a paper: `/paper-check <paper>` in Claude Code, `/skill:paper-check <paper>` in pi, or in plain words. Existing researcher projects and zotero boxes get the check after **Rebuild all** on **Host → Software** and a stop and start of the project.
+The agent must be ticked for Aldine on Services → MCP. The user asks it to check a paper: `/paper-check <paper>` in Claude Code, `/skill:paper-check <paper>` in pi, or in plain words. Existing researcher and companion projects and zotero boxes get the check after **Rebuild all** on **Host → Software** and a stop and start of the project.
 
 ### What comes back
 
@@ -102,7 +102,7 @@ The helper has web search and page fetch (Claude Code only), a shell and a file 
 - **Aldine's own login is off, behind the webui.** Whoever reaches Aldine edits every paper, so only the web interface (behind its Management sign-in, on a shared origin of its own like Gitea's) and the gateway (behind its per-consumer tokens) can reach it.
 - **Pinned by version and image digest.** The installation pins one Aldine version; the containers follow it at the next Turn on or start, and the papers stay in named volumes across the change.
 - **No Git integration yet.** Papers live in Aldine's own store; they are not mirrored to the shared Gitea or GitHub.
-- **The paper check is one skill and one helper role, with no project type or box type of its own.** The task needs only an agent wired to Aldine, so it goes to the agents that already do research work: the researcher projects' agent, and the zotero box's agent, which holds the user's library. The cost is that other agents wired to Aldine cannot run it.
+- **The paper check is one skill and one helper role, with no project type or box type of its own.** The task needs only an agent wired to Aldine, so it goes to the agents that already do research work: the researcher and companion projects' agent, and the zotero box's agent, which holds the user's library. The cost is that other agents wired to Aldine cannot run it.
 - **The unit of work is the source, not the citation.** One helper reads a source once and judges every sentence that cites it. The cost is that a source cited many times keeps its helper busy longer than the others.
 - **A verdict always says how the source was read.** Full text, an abstract and someone else's description are different grounds, and the user must know which one a verdict stands on. The cost is that a paper with no open copy often gets only an abstract-only verdict.
 - **The agent comments and does not edit unless asked.** Every change to the paper stays the user's, through a suggested rewording accepted with one click. The cost is that this is an instruction, not a lock: the agent keeps full edit rights.

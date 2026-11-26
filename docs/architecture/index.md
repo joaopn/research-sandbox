@@ -37,7 +37,7 @@ flowchart TD
 | [Projects](Projects.md) | What a project is, project types, agents, lifecycle |
 | [Research](Research.md) | The research workflows compared: three built, one planned |
 | ↳ [Research workflow](Research-workflow.md) | Built: how a supervisor plans, runs and reviews workers |
-| ↳ [Researcher workflow](Researcher-workflow.md) | Built: one long-lived agent with a memory, the pages it writes for the user, and a logbook |
+| ↳ [Researcher workflow](Researcher-workflow.md) | Built: one long-lived agent with a memory, the pages it writes for the user, and a logbook; the companion, the same agent for one-off and mixed tasks |
 | ↳ [Researcher with subagents](Researcher-with-subagents.md) | Built: a researcher that hands analyses to parallel helpers and has each finding re-run and refereed |
 | ↳ [Lab workflow](Lab-workflow.md) | Planned: several researchers, a board, a lab meeting, budgets |
 | [Boxes](Boxes.md) | Box types; what a box can see of its project |
@@ -83,6 +83,7 @@ Each page ends with its full list of design decisions and their costs; these are
 - Consolidation runs in the background at session end, on the user's model quota.
 - The user reads pages written from the memory (a front page, what waits, what was accepted), not the memory itself; a page never overwrites the user's own file.
 - The logbook is the story and the record is the truth: where they disagree, the record's standing holds.
+- The companion is its own type, not a setting on the researcher, and the same memory command in a mode, so the journal, jobs, skills and paper check are shared.
 
 ### [Researcher with subagents](Researcher-with-subagents.md)
 
@@ -159,4 +160,4 @@ The lab workflow's decisions are proposals until built; they are listed on [Lab 
 - One shared Aldine for the installation, not one per project; every wired agent sees every paper.
 - Aldine's own login is off, so only the web interface and the MCP gateway can reach it, on its own networks.
 - Pinned by version and image digest; the papers are kept across updates and Turn off.
-- The paper check is one skill and one helper role, in researcher projects and zotero boxes only; no project type or box type of its own.
+- The paper check is one skill and one helper role, in researcher and companion projects and zotero boxes only; no project type or box type of its own.

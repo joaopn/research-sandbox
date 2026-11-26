@@ -20,7 +20,7 @@ When it is unclear which parts an update touched, do all of them. The cost is th
 
 A project that has not been restarted since an update keeps working as before. An action that needs the new version there is refused with a message that says to restart the project.
 
-A `researcher` or `researcher-subagents` project needs its image to carry the memory command its instructions describe. On an older image its start ends with an error that names **Rebuild all**, and its memory is not set up until the rebuild and a stop and start.
+A `researcher`, `researcher-subagents` or `companion` project needs its image to carry the memory command its instructions describe. On an older image its start ends with an error that names **Rebuild all**, and its memory is not set up until the rebuild and a stop and start.
 
 ## Once: the update that blocks links to the Anthropic account
 

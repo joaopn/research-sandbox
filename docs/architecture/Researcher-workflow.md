@@ -102,6 +102,29 @@ When the session ends, the end hook runs `close`. A headless run of the same age
 
 The user accepts a finding by saying so in the chat, for example "accept F-3". The front page lists what waits, with the words to say.
 
+## The companion
+
+A `companion` project is a researcher for one-off and mixed tasks: a draft review, a literature check, a quick analysis, one after another, rather than one line of inquiry for weeks. **Companion** is a project type in the Research group of the New Project window, created like a researcher: Claude, pi or both, at least one of them, the Reader tab always on, egress locked by default. Its agent has the paper check, as a researcher's does.
+
+It keeps everything above that does not assume one line of inquiry: the journal with its corrections and dead ends, the checkpoints of what is in flight, the long runs registered as jobs, the skills, and the front page given to the agent at every session start. What differs comes from one key in the project's record, `"companion": true`, written at create. The memory command reads it and keeps the memory in its companion mode; its verbs are the same. A record that sets both `companion` and `subagents` is refused by every verb.
+
+| | Researcher | Companion |
+|---|---|---|
+| The agent's front page | line of inquiry, beliefs, in flight, open threads | standing preferences, in flight, open threads |
+| The consolidation | updates the front page and proposes claims and skills | updates the front page and proposes skills, never claims |
+| Claims | staged as the work produces them | staged only when the user asks; the agent may offer one |
+| The work's files | `analyses/<name>/`, one folder per analysis | `analyses/<task>/`, one folder per task, with its `README.md` |
+| The user's front page | always shows what waits and what is known | adds the tasks; shows what waits and what is known only when there is something in them |
+| The logbook | one entry per topic | one entry per task, under the task folder's name |
+
+**Standing preferences.** When the user says how they want things done (wording, sources, where answers go), the agent journals it in the user's words as a decision. The consolidation carries it into "Standing preferences" on the agent's front page, and retires one only when the journal shows the user dropped or changed it. It never invents one from what the agent did. Every session reads the standing preferences first.
+
+**Task folders.** Every task gets one folder, `analyses/<task>/`, named in a few words, with all its files. The agent keeps a `README.md` in it with the task's status, the decisions taken and where things are. That file is the agent's own, not a page the memory command writes.
+
+**The user's front page.** In a companion it reads, in order: what waits for the user, only while a claim is staged; what is running; the tasks, one line per folder directly under `analyses/`, linked to its `README.md` when it has one; where things stand, from the agent's own front page; the logbook; and what is known, only once the user accepted something. A link or a file under `analyses/` is not a task, and is never followed. At session start the agent is likewise shown the state of knowledge and the staged claims only when they hold something.
+
+**Claims.** Claim, amend, accept and strike work as in a researcher, with the same pages under `staging/` and `results/`. The difference is when a claim is made: only when the user asks for one, so a companion's record grows only from what the user wants to cite.
+
 ## Design decisions
 
 **Memory is four things, kept apart.** Each part changes differently and is trusted differently, so each has its own place and rule for writing. The cost is four places to keep consistent.
@@ -125,5 +148,7 @@ The user accepts a finding by saying so in the chat, for example "accept F-3". T
 **A page never overwrites the user's file.** The pages sit where the user also keeps files, so a file without the memory command's marker is left alone and reported, never renamed or moved. The cost is a page that is missing until the user moves their file.
 
 **The logbook is the story, the record is the truth.** An entry says what was asked and what came out, in words a reader who missed the conversation can follow, and it is never edited, so it keeps what was said at the time. The record is where a result's standing lives: where an entry and the record disagree, as when a result the entry tells of was later superseded or withdrawn, the record's standing holds, and the result's page says so. The cost is an entry that can read out of date; a correction goes into a later entry.
+
+**The companion is its own type, and the same memory command in a mode.** A setting on the researcher would have put two behaviours into one type's instructions and pages; as its own type, the researcher's text and pages stay untouched and each type's instructions say one thing. The mode lives in the memory command, keyed on the project's record, so the journal, the jobs, the skills, the logbook and the paper check are shared and change together. The cost is one more project type to choose from, and a memory command with two front-page layouts.
 
 **Discipline, not security.** The agent can write the memory files by hand. The command is the easy path, and the user's accept is a chat message the agent acts on.
