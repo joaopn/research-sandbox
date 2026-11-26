@@ -1532,7 +1532,8 @@ MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 # prints (a SECRET: repr=False on the request, never in a result or a log).
 SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
 # The one searcher and the contact address, saved whole.
-SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact"})
+SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact",
+                                          "recent"})
 # One search in the service (view, stop), by its id.
 SEARCH_ID_WEBUI_FIELDS = frozenset({"id"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})

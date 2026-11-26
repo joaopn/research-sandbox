@@ -171,6 +171,20 @@ VIEW_TEXT_TAIL_CHARS = 300
 # ten times a row becomes a paragraph and a long queue's list grows by
 # kilobytes per search.
 LIST_QUESTION_MAX_CHARS = 200
+# How many ended searches the operator's "Recent searches" list keeps, from the
+# delivered settings' `recent` (search.DEFAULT_RECENT / search.RECENT_MAX —
+# MIRRORS); a missing or bad value reads as the default.
+DEFAULT_RECENT = 20
+RECENT_MAX = 100
+# A recent search's reason as its row keeps it (the page shows it on hover).
+# Every reason RS writes itself is shorter (the longest, the timeout's, is
+# under 100 characters) except the refused sign-in's, whose first 200 still
+# say that the stored token was refused; the agent's own words after it are in
+# the caller's search_check and the work view while the search is in the
+# table. At half the sign-in sentence is cut before its point; at ten times
+# 100 rows outgrow the 64 KiB the broker keeps its replies to (the list rides
+# every read of the live table).
+RECENT_REASON_MAX_CHARS = 200
 # Reasons the operator's stop leaves (the caller's search_check and
 # search_collect show them, worded like the timeout's).
 STOPPED_QUEUED = "the search was stopped by the operator before it started"
@@ -246,6 +260,9 @@ def read_settings() -> dict | None:
                 and isinstance(s["effort"], str) and isinstance(s["at_once"], int)
                 and isinstance(data["contact"], str)):
             return None
+        r = data.get("recent")
+        if isinstance(r, bool) or not isinstance(r, int) or not 0 <= r <= RECENT_MAX:
+            data["recent"] = DEFAULT_RECENT     # missing (an older host) or bad
         return data
     except (OSError, ValueError, RecursionError, KeyError, TypeError):
         return None
@@ -541,14 +558,18 @@ def end_follow(follower: tuple[threading.Thread, subprocess.Popen | None]) -> No
 
 class Searches:
     """Every search the service knows, in memory (a restart forgets them and
-    its start removes what they left). One lock guards the table and the
-    queue; docker work happens outside it."""
+    its start removes what they left). One lock guards the table, the queue
+    and the recent list; docker work happens outside it."""
 
     def __init__(self) -> None:
         self.lock = threading.Condition()
         self.table: dict[str, dict] = {}
         self.queue: collections.deque = collections.deque()
         self.running = 0
+        # The searches that ended, newest first, one line each: they outlive
+        # the caller's collect and the operator's clear (which remove the
+        # search and its files, not this line).
+        self.recent: collections.deque = collections.deque()
 
     # --- the caller's three tools ---
 
@@ -676,15 +697,42 @@ class Searches:
         return {"cleared": len(ids), "problems": problems}
 
     def active(self) -> dict:
-        """The operator's list: every waiting and running search, oldest first."""
+        """The operator's list: every waiting and running search, oldest
+        first, and the searches that ended, newest first (at most the
+        setting's `recent`)."""
         with self.lock:
             recs = sorted((dict(r) for r in self.table.values() if r["state"] not in ENDED),
                           key=lambda r: r["submitted_at"])
+            kept = self._trim_recent()
+            recent = [dict(e) for e in self.recent]
         return {"searches": [
             {"id": r["id"], "project": r["project"], "consumer": r["consumer"],
              "question": r["question"][:LIST_QUESTION_MAX_CHARS], "searcher": r["searcher"],
              "state": r["state"], **self._times(r), "tokens": r["stream"].tokens()}
-            for r in recs]}
+            for r in recs], "recent": recent, "recent_kept": kept}
+
+    def _trim_recent(self) -> int:
+        """Under the lock: drop the oldest recent lines past the setting's
+        `recent` (read now: a lowered value trims at once). Returns it."""
+        settings = read_settings()
+        kept = settings["recent"] if settings else DEFAULT_RECENT
+        while len(self.recent) > kept:
+            self.recent.pop()
+        return kept
+
+    def _record_end(self, rec: dict) -> None:
+        """Under the lock, once per search, when it ends (any way): its line
+        in the recent list."""
+        self.recent.appendleft({
+            "project": rec["project"], "consumer": rec["consumer"],
+            "question": rec["question"][:LIST_QUESTION_MAX_CHARS],
+            "searcher": rec["searcher"], "state": rec["state"],
+            "reason": rec["outcome"]["reason"][:RECENT_REASON_MAX_CHARS],
+            "ended_at": rec["finished_at"],
+            "ran_s": (round(rec["finished_at"] - rec["started_at"])
+                      if rec["started_at"] else 0),
+            "tokens": rec["stream"].tokens()})
+        self._trim_recent()
 
     def view(self, sid: str) -> dict | None:
         """The operator's read-only view of one search still in the table
@@ -728,6 +776,7 @@ class Searches:
                 rec["state"] = "failed"
                 rec["finished_at"] = time.time()
                 rec["outcome"] = {"reason": STOPPED_QUEUED}
+                self._record_end(rec)
                 self.lock.notify_all()
                 state = "failed"
             else:
@@ -787,6 +836,7 @@ class Searches:
                 rec["state"] = state
                 rec["finished_at"] = time.time()
                 rec["outcome"] = outcome
+                self._record_end(rec)
             self.running -= 1
             self.lock.notify_all()
         log(f"search {sid} {state}: {outcome['reason']}")

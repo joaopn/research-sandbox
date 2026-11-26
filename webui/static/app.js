@@ -8676,6 +8676,10 @@ const SEARCH_TEST_HINT =
 const SEARCH_RUN_STATE_TEXT = {
     queued: "waiting", starting: "starting", running: "running", done: "done", failed: "failed",
 };
+// A recent search ended by the operator's Stop: every reason the service
+// leaves for it says so (service.py STOPPED_QUEUED / STOPPED_WITH_REPORT /
+// STOPPED_NO_REPORT), whether it ended done or failed.
+const SEARCH_STOPPED_MARK = "stopped by the operator";
 // How often the open Search page re-reads its searches table (and an open
 // work box its search). Token counts move once per model turn, seconds apart,
 // so a read every five seconds shows each move soon after it happens: half
@@ -9015,6 +9019,10 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
     const atOnce = el("input", { type: "number", class: "searchsvc-input searchsvc-input-num",
                                  min: "1", max: String(max), step: "1" });
     atOnce.value = s.at_once !== undefined && s.at_once !== null ? String(s.at_once) : "";
+    const maxRecent = Number.isSafeInteger(cfg.max_recent) ? cfg.max_recent : 0;
+    const recent = el("input", { type: "number", class: "searchsvc-input searchsvc-input-num",
+                                 min: "0", max: String(maxRecent), step: "1" });
+    recent.value = cur.recent !== undefined && cur.recent !== null ? String(cur.recent) : "";
     const contact = el("input", {
         type: "email", class: "searchsvc-input searchsvc-input-wide", spellcheck: "false",
         placeholder: cfg.generic_contact ? "empty: " + cfg.generic_contact : "",
@@ -9033,13 +9041,19 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
             errEl.textContent = `Searches at once is a whole number from 1 to ${max}.`;
             return;
         }
+        const rawRecent = recent.value.trim();
+        const kept = /^[0-9]+$/.test(rawRecent) ? Number(rawRecent) : NaN;
+        if (!Number.isSafeInteger(kept) || (maxRecent && kept > maxRecent)) {
+            errEl.textContent = `Recent searches kept is a whole number from 0 to ${maxRecent}.`;
+            return;
+        }
         const v = picker.value();
         busy = true;
         save.disabled = true;
         errEl.textContent = "";
         const { status, body } = await mcpPost("/broker/search/settings", {
             name: name.value.trim(), model: v.model, effort: v.effort,
-            at_once: n, contact: contact.value.trim(),
+            at_once: n, contact: contact.value.trim(), recent: kept,
         });
         busy = false;
         save.disabled = false;
@@ -9057,6 +9071,7 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         searchCell("name", name),
         picker.row,
         searchCell("searches at once", atOnce),
+        searchCell("recent searches kept", recent),
         searchCell("contact address", contact, SEARCH_CONTACT_HINT),
         save,
         errEl,
@@ -9097,6 +9112,54 @@ function searchTimeOfDay(ts) {
         .map((n) => String(n).padStart(2, "0")).join(":");
 }
 
+// When a recent search ended, in the browser's local time: HH:MM today, the
+// date before it on any other day.
+function searchEndedAt(ts) {
+    const d = new Date(typeof ts === "number" ? ts * 1000 : NaN);
+    if (Number.isNaN(d.getTime())) return "—";
+    const pad = (n) => String(n).padStart(2, "0");
+    const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const now = new Date(Date.now());
+    if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()
+        && d.getDate() === now.getDate()) return hm;
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+}
+
+// The recent searches table: the searches that ended since the service
+// started, newest first, as the list read gave them (`kept` = how many the
+// service keeps; 0 = the list is off). Plain text only; the reason is the
+// Ended as cell's hover text.
+function searchRecentTable(list, kept) {
+    if (kept === 0) {
+        return el("div", { class: "searchsvc-flash" },
+                  ["The list of recent searches is off (recent searches kept: 0)."]);
+    }
+    if (!list.length) {
+        return el("div", { class: "searchsvc-flash" },
+                  ["No searches have ended since the service started."]);
+    }
+    const head = ["Asked by", "Question", "Searcher", "Ended as", "Ended", "Took", "Tokens"];
+    const row = (s) => {
+        const q = String(s.question || "");
+        const reason = String(s.reason || "");
+        const as = reason.includes(SEARCH_STOPPED_MARK) ? "stopped"
+            : (SEARCH_RUN_STATE_TEXT[s.state] || String(s.state || ""));
+        return el("tr", {}, [
+            el("td", {}, [`${String(s.project || "")}/${String(s.consumer || "")}`]),
+            el("td", { class: "searchsvc-q", title: q }, [q]),
+            el("td", {}, [String(s.searcher || "")]),
+            el("td", { title: reason }, [as]),
+            el("td", {}, [searchEndedAt(s.ended_at)]),
+            el("td", { class: "searchsvc-num" }, [searchClock(s.ran_s)]),
+            el("td", { class: "searchsvc-num" }, [searchTokens(s.tokens)]),
+        ]);
+    };
+    return el("table", { class: "searchsvc-runs" }, [
+        el("thead", {}, [el("tr", {}, head.map((h) => el("th", {}, [h])))]),
+        el("tbody", {}, list.map(row)),
+    ]);
+}
+
 // A GET that answers {status, body}; status 0 = the request itself failed.
 async function searchGet(path) {
     let res;
@@ -9107,17 +9170,20 @@ async function searchGet(path) {
 
 // The searches table: every waiting or running search, re-read every
 // SEARCH_LIST_POLL_MS while the page is on screen, its Time counting up
-// locally in between. A read that fails keeps the last table under a short
-// note; a session that ended lands on the sign-in. Every timer stops once the
-// page is left or re-rendered. Returns {wrap, start}: start runs after wrap is
-// on the page.
+// locally in between; under it the recent searches, from the same read. A
+// read that fails keeps the last tables under a short note; a session that
+// ended lands on the sign-in. Every timer stops once the page is left or
+// re-rendered. Returns {wrap, start}: start runs after wrap is on the page.
 function searchRunsSection(view) {
     const landing = view.__rsRender || renderSearchInto;
     const body = el("div", { class: "searchsvc-runs-wrap" }, [
         el("div", { class: "searchsvc-flash" }, ["Reading the searches…"])]);
     const note = el("div", { class: "searchsvc-flash mcp-test-bad" }, []);
+    const recentBody = el("div", { class: "searchsvc-runs-wrap" }, []);
     const wrap = el("div", { class: "mgmt-infra" }, [
         el("h3", { class: "mgmt-infra-title" }, ["Searches"]), body, note,
+        el("h3", { class: "mgmt-infra-title searchsvc-recent-title" }, ["Recent searches"]),
+        recentBody,
     ]);
     const stopping = new Set();    // ids whose Stop was sent
     const rowErr = new Map();      // id → the text of a refused Stop
@@ -9151,6 +9217,9 @@ function searchRunsSection(view) {
         }
         note.textContent = "";
         paint(Array.isArray(reply.result.searches) ? reply.result.searches : []);
+        recentBody.replaceChildren(searchRecentTable(
+            Array.isArray(reply.result.recent) ? reply.result.recent : [],
+            reply.result.recent_kept));
         return undefined;
     };
     const stopOne = async (s) => {

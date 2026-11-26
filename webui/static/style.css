@@ -2592,6 +2592,8 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-run { cursor: pointer; }
 .searchsvc-run:hover td { background: var(--btn-secondary-bg); }
 .searchsvc-runs .searchsvc-q { max-width: 28em; overflow: hidden; text-overflow: ellipsis; }
+/* The recent searches (ended since the service started) under the live table. */
+.searchsvc-recent-title { margin-top: 18px; }
 .searchsvc-runs .searchsvc-num {
     text-align: right;
     font-family: ui-monospace, Menlo, Consolas, monospace;

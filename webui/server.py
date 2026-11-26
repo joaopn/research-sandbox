@@ -999,7 +999,7 @@ async def broker_aldine_session_handler(request: web.Request) -> web.Response:
 # fourth leg of the request-field ↔ SEARCH_*_WEBUI_FIELDS ↔ app.js payload
 # lockstep. The token is a secret: it travels in this request's body to the
 # broker and nowhere else (no log line, no reply carries it).
-_SEARCH_SETTINGS_FIELDS = ("name", "model", "effort", "at_once", "contact")
+_SEARCH_SETTINGS_FIELDS = ("name", "model", "effort", "at_once", "contact", "recent")
 
 
 async def _search_body(request: web.Request) -> dict:
@@ -1025,9 +1025,10 @@ async def broker_search_settings_handler(request: web.Request) -> web.Response:
 
 
 async def broker_search_settings_set_handler(request: web.Request) -> web.Response:
-    """POST /broker/search/settings {name, model, effort, at_once, contact} —
-    save the searcher and the contact address (all five; saving replaces the
-    file). An absent key is sent as absent, so the broker refuses it cleanly."""
+    """POST /broker/search/settings {name, model, effort, at_once, contact,
+    recent} — save the searcher, the contact address and how many ended
+    searches the page lists (all six; saving replaces the file). An absent
+    key is sent as absent, so the broker refuses it cleanly."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     body = await _search_body(request)

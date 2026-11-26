@@ -1651,7 +1651,8 @@ def cmd_search_settings(args: argparse.Namespace) -> None:
                  model=sr["model"] if args.model is None else args.model,
                  effort=sr["effort"] if args.effort is None else args.effort,
                  at_once=sr["at_once"] if args.at_once is None else args.at_once,
-                 contact=base["contact"] if args.contact is None else args.contact)
+                 contact=base["contact"] if args.contact is None else args.contact,
+                 recent=base["recent"])
     out = _call(rscore.search_settings_set, req)
     print(json.dumps(out["settings"], indent=2, sort_keys=True))
 

@@ -23601,15 +23601,18 @@ class SearchSettingsRequest:
     effort: str
     at_once: int
     contact: str
+    recent: int
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "SearchSettingsRequest":
-        missing = [k for k in ("name", "model", "effort", "at_once", "contact") if k not in kw]
+        missing = [k for k in ("name", "model", "effort", "at_once", "contact", "recent")
+                   if k not in kw]
         if missing:
             raise ValidationError(f"the searcher needs {', '.join(missing)}")
         for problem in (search.searcher_name_problem(kw["name"]),
                         search.at_once_problem(kw["at_once"]),
-                        search.contact_problem(kw["contact"])):
+                        search.contact_problem(kw["contact"]),
+                        search.recent_problem(kw["recent"])):
             if problem:
                 raise ValidationError(problem)
         model, effort = kw["model"], kw["effort"]
@@ -23619,7 +23622,7 @@ class SearchSettingsRequest:
         if problem:
             raise ValidationError(problem)
         return cls(name=kw["name"], model=model, effort=effort, at_once=kw["at_once"],
-                   contact=kw["contact"].strip())
+                   contact=kw["contact"].strip(), recent=kw["recent"])
 
 
 def search_token_set(req: SearchTokenRequest, *, blocking: bool = True,
@@ -23666,6 +23669,7 @@ def search_settings_get() -> dict:
     out: dict[str, Any] = {"settings": None, "error": None,
                            "models": catalog["models"], "efforts": catalog["efforts"],
                            "max_at_once": search.MAX_AT_ONCE,
+                           "max_recent": search.RECENT_MAX,
                            "generic_contact": search.GENERIC_CONTACT,
                            "defaults": search.default_settings()}
     try:
@@ -23683,7 +23687,7 @@ def search_settings_set(req: SearchSettingsRequest, *, blocking: bool = True,
     data = {"version": search.SETTINGS_VERSION,
             "searcher": {"name": req.name, "model": req.model, "effort": req.effort,
                          "at_once": req.at_once},
-            "contact": req.contact}
+            "contact": req.contact, "recent": req.recent}
     try:
         with _search_lock(blocking):
             try:
@@ -23727,6 +23731,7 @@ _SEARCH_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 # service.py ADMIN_REFUSED_EXIT — MIRROR: the service answered "no such search".
 _SEARCH_ADMIN_REFUSED_EXIT = 3
 _SEARCH_LIST_QUESTION_MAX = 200          # service.py LIST_QUESTION_MAX_CHARS
+_SEARCH_RECENT_REASON_MAX = 200          # service.py RECENT_REASON_MAX_CHARS
 _SEARCH_QUESTION_MAX = 32 * 1024         # service.py QUESTION_MAX_CHARS
 _SEARCH_WORK_MAX = 10                    # service.py VIEW_TAIL_ENTRIES
 _SEARCH_VIEW_TEXT_MAX = 300 + 1          # service.py VIEW_TEXT_TAIL_CHARS, plus its leading …
@@ -23743,6 +23748,7 @@ _SEARCH_REASON_MAX = _SEARCH_TEXT_MAX + 500
 _SEARCH_NAME_MAX = 200
 _SEARCH_ACTIVE_STATES = ("queued", "starting", "running")
 _SEARCH_STATES = _SEARCH_ACTIVE_STATES + ("done", "failed")
+_SEARCH_ENDED_STATES = ("done", "failed")    # service.py ENDED
 
 SEARCH_OFF = "the search service is not running (turn it on under Services → Search)"
 SEARCH_NO_ANSWER = "the search service did not answer"
@@ -23831,12 +23837,17 @@ def _search_reply_dict(value: Any) -> dict:
 def search_list(deadline: float | None = None) -> dict:
     """The operator's list: every waiting and running search, oldest first,
     with how long it waited and ran and its tokens so far (the page counts
-    the times up from these)."""
+    the times up from these); beside it the searches that ended since the
+    service started, newest first (at most `recent_kept`, the setting the
+    service read last)."""
     deadline = _mcp_deadline() if deadline is None else deadline
     _how, out = _search_ask(["list"], deadline)
-    items = _search_reply_dict(out).get("searches")
-    if not isinstance(items, list):
+    reply = _search_reply_dict(out)
+    items = reply.get("searches")
+    recent_items = reply.get("recent")
+    if not isinstance(items, list) or not isinstance(recent_items, list):
         raise ValidationError(SEARCH_BAD_ANSWER)
+    kept = _search_reply_int(reply.get("recent_kept"))
     searches = []
     for raw in items:
         s = _search_reply_dict(raw)
@@ -23850,7 +23861,20 @@ def search_list(deadline: float | None = None) -> dict:
             "waited_s": _search_reply_int(s.get("waited_s")),
             "ran_s": _search_reply_int(s.get("ran_s")),
             "tokens": _search_reply_int(s.get("tokens"))})
-    return {"searches": searches}
+    recent = []
+    for raw in recent_items:
+        s = _search_reply_dict(raw)
+        recent.append({
+            "project": _search_reply_str(s.get("project"), _SEARCH_NAME_MAX),
+            "consumer": _search_reply_str(s.get("consumer"), _SEARCH_NAME_MAX),
+            "question": _search_reply_str(s.get("question"), _SEARCH_LIST_QUESTION_MAX),
+            "searcher": _search_reply_str(s.get("searcher"), _SEARCH_NAME_MAX),
+            "state": _search_reply_choice(s.get("state"), _SEARCH_ENDED_STATES),
+            "reason": _search_reply_str(s.get("reason"), _SEARCH_RECENT_REASON_MAX),
+            "ended_at": _search_reply_ts(s.get("ended_at")),
+            "ran_s": _search_reply_int(s.get("ran_s")),
+            "tokens": _search_reply_int(s.get("tokens"))})
+    return {"searches": searches, "recent": recent, "recent_kept": kept}
 
 
 def _search_work_entry(raw: Any) -> dict:

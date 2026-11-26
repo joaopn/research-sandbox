@@ -167,6 +167,21 @@ DEFAULT_AT_ONCE = 2
 # rate limit and the engines' suspensions bound the work anyway. 32 keeps
 # well inside the pool with every search of the queue holding its network.
 MAX_AT_ONCE = 32
+# How many ended searches the Search page's "Recent searches" list keeps. The
+# list lives in the search service's memory only (a restart of the service
+# clears it), newest first; 0 keeps none.
+#   - 20 is a few days of a small lab's questions, or one busy afternoon: enough
+#     to see what was asked lately and how each search ended, short enough to
+#     read without scrolling far under the live table.
+#   - The list rides every 5-second read of the live table, so its size is paid
+#     on every read: one row (project, consumer, the question cut at 200
+#     characters, searcher, state, the reason cut at 200, ended_at, ran_s,
+#     tokens) is about 500 bytes, and 100 rows (RECENT_MAX) are about 50 KB,
+#     which stays inside the 64 KiB the broker keeps its own replies to. Ten
+#     times that would make every read of the page a half-megabyte transfer for
+#     rows nobody scrolls to.
+DEFAULT_RECENT = 20
+RECENT_MAX = 100
 # Unpaywall requires an email address and Crossref's polite pool asks for
 # one. When the operator leaves the contact empty, the requests carry this
 # generic address (a reserved documentation domain: no person behind it).
@@ -306,7 +321,7 @@ def default_settings() -> dict[str, Any]:
     return {"version": SETTINGS_VERSION,
             "searcher": {"name": DEFAULT_SEARCHER_NAME, "model": DEFAULT_MODEL,
                          "effort": DEFAULT_EFFORT, "at_once": DEFAULT_AT_ONCE},
-            "contact": ""}
+            "contact": "", "recent": DEFAULT_RECENT}
 
 
 def searcher_name_problem(name: Any) -> str | None:
@@ -323,6 +338,13 @@ def at_once_problem(value: Any) -> str | None:
     return None
 
 
+def recent_problem(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, int) \
+            or not 0 <= value <= RECENT_MAX:
+        return f"recent searches kept is a whole number from 0 to {RECENT_MAX}"
+    return None
+
+
 def contact_problem(value: Any) -> str | None:
     if not isinstance(value, str):
         return "the contact address must be text"
@@ -335,8 +357,9 @@ def contact_problem(value: Any) -> str | None:
 def settings_problem(data: Any, model_ok) -> str | None:
     """Why `data` is not a valid settings record, or None. `model_ok(model,
     effort)` is the catalog's check (rscore passes it in: this module does
-    not import the model catalog)."""
-    if not isinstance(data, dict) or set(data) != {"version", "searcher", "contact"}:
+    not import the model catalog). A record without `recent` is valid: it was
+    saved before that setting existed (read_settings fills the default)."""
+    if not isinstance(data, dict) or set(data) - {"recent"} != {"version", "searcher", "contact"}:
         return "it does not have the expected shape"
     if data["version"] != SETTINGS_VERSION or isinstance(data["version"], bool):
         return "it was written by another version of RS"
@@ -344,7 +367,8 @@ def settings_problem(data: Any, model_ok) -> str | None:
     if not isinstance(s, dict) or set(s) != {"name", "model", "effort", "at_once"}:
         return "its searcher does not have the expected shape"
     for problem in (searcher_name_problem(s["name"]), at_once_problem(s["at_once"]),
-                    contact_problem(data["contact"])):
+                    contact_problem(data["contact"]),
+                    recent_problem(data["recent"]) if "recent" in data else None):
         if problem:
             return problem
     if not isinstance(s["model"], str) or not isinstance(s["effort"], str):
@@ -374,13 +398,14 @@ def read_settings(model_ok, path: Path | None = None) -> dict[str, Any]:
     problem = settings_problem(data, model_ok)
     if problem:
         raise SearchError(SETTINGS_DAMAGED.format(why=problem))
+    data.setdefault("recent", DEFAULT_RECENT)       # saved before the setting existed
     return data
 
 
 def service_settings(data: dict[str, Any]) -> dict[str, Any]:
     """What the service is handed: the settings with the contact filled."""
     return {"version": SETTINGS_VERSION, "searcher": dict(data["searcher"]),
-            "contact": data["contact"] or GENERIC_CONTACT}
+            "contact": data["contact"] or GENERIC_CONTACT, "recent": data["recent"]}
 
 
 # --- host files ------------------------------------------------------------------
