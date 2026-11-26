@@ -163,9 +163,12 @@ STREAM_LINE_MAX_BYTES = 1024 * 1024
 # see a failing tool and the agent's reaction to it; at half one retry loop
 # fills the view, at ten times it becomes the audit it is not meant to be.
 VIEW_TAIL_ENTRIES = 10
-# A text's end as the view shows it: two or three lines of the box. At half a
-# sentence is cut before its point; at ten times one text fills the box.
-VIEW_TEXT_TAIL_CHARS = 300
+# How much of one of the agent's texts the view shows, from its end: all of
+# what the service keeps of it (AGENT_TEXT_MAX_CHARS), a paragraph or two of
+# the box, so a check reads the agent's reasoning and not only its last
+# sentence (the maintainer asked for more than the first 300). A longer text
+# would need the service to keep more of it per message.
+VIEW_TEXT_TAIL_CHARS = AGENT_TEXT_MAX_CHARS
 # The question as the operator's list shows it: one row of a table (the full
 # question is in the view). At half a one-sentence question is cut mid-way; at
 # ten times a row becomes a paragraph and a long queue's list grows by
@@ -576,9 +579,9 @@ class Searches:
         # (the agent's words are AGENT_TEXT_MAX_CHARS of it, the rest is RS's
         # own sentence) and VIEW_TAIL_ENTRIES entries of at most 3 x
         # TRACE_NAME_MAX_CHARS + 2 x TRACE_TARGET_MAX_CHARS (a tool call) or
-        # VIEW_TEXT_TAIL_CHARS (a text), about 7k characters for the ten: some
-        # 42k characters, 168 KB in memory when every one is a 4-byte character.
-        # RECENT_MAX of them stay under 17 MB at worst; real questions are a
+        # VIEW_TEXT_TAIL_CHARS (a text), about 20k characters for the ten: some
+        # 55k characters, 220 KB in memory when every one is a 4-byte character.
+        # RECENT_MAX of them stay under 23 MB at worst; real questions are a
         # paragraph, so a full list is a few MB at most.
         # A line whose search ended with a report also keeps that report in
         # full (its summary, sources and tiers as the agent wrote them, as

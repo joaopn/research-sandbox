@@ -9408,18 +9408,23 @@ function searchWorkBox(view, id) {
 // field a string): `first` is the leading line's fields, `second` the next
 // line's; empty fields are left out. An item the agent did not write as an
 // object is its text.
-function searchReportItem(prefix, item, first, second) {
+function searchReportLines(prefix, item, first, second) {
     const o = item || {};
     const f = (v) => (v === null || v === undefined ? "" : String(v));
-    if (o.text !== undefined) {
-        return el("div", { class: "searchsvc-report-item" }, [
-            el("div", {}, [prefix + f(o.text)])]);
-    }
+    if (o.text !== undefined) return [prefix + f(o.text)];
     const line = (parts) => parts.filter((p) => p).join(" · ");
-    const lines = [prefix + line(first(o).map(f)), line(second(o).map(f))];
-    return el("div", { class: "searchsvc-report-item" },
-              lines.filter((l, i) => i === 0 || l).map((l) => el("div", {}, [l])));
+    return [prefix + line(first(o).map(f)), line(second(o).map(f))]
+        .filter((l, i) => i === 0 || l);
 }
+
+function searchReportItem(lines) {
+    return el("div", { class: "searchsvc-report-item" },
+              lines.map((l) => el("div", {}, [l])));
+}
+
+// How long the Copy button says what happened before it reads Copy again.
+// Long enough to notice after a click, short enough to copy again at once.
+const SEARCH_COPY_NOTE_MS = 1500;
 
 // A search's report, read-only, in a box over the page: its question, then
 // the summary, every source (numbered as the agent listed them) and what it
@@ -9434,9 +9439,20 @@ function searchReportBox(view, id) {
     const body = el("div", { class: "searchsvc-work searchsvc-report" }, []);
     const close = el("button", { class: "btn btn-secondary" }, ["Close"]);
     close.onclick = () => backdrop.remove();
+    // Copy: the whole report as plain text, the way the box shows it.
+    let copyText = "";
+    const copy = el("button", { class: "btn btn-secondary" }, ["Copy"]);
+    copy.disabled = true;
+    copy.onclick = async () => {
+        if (!copyText) return;
+        let ok = true;
+        try { await navigator.clipboard.writeText(copyText); } catch (e) { ok = false; }
+        copy.textContent = ok ? "Copied" : "Copy failed";
+        setTimeout(() => { copy.textContent = "Copy"; }, SEARCH_COPY_NOTE_MS);
+    };
     backdrop.appendChild(el("div", { class: "card searchsvc-work-card" }, [
         el("h2", {}, ["A search’s report"]), head, body,
-        el("div", { class: "btn-row" }, [close]),
+        el("div", { class: "btn-row" }, [copy, close]),
     ]));
     document.body.appendChild(backdrop);
     const section = (title, nodes, empty) => [
@@ -9448,13 +9464,22 @@ function searchReportBox(view, id) {
             el("div", { class: "searchsvc-flash" }, [
                 (SEARCH_RUN_STATE_TEXT[r.state] || String(r.state || ""))
                 + " · searcher " + String(r.searcher || "")]));
-        const sources = (Array.isArray(r.sources) ? r.sources : []).map((s, i) =>
-            searchReportItem(`[${s && s.n ? s.n : i + 1}] `, s,
-                             (o) => [o.title, o.address, o.doi && "DOI " + o.doi,
-                                     o.file && "file " + o.file],
-                             (o) => [o.contributed, o.other]));
-        const tiers = (Array.isArray(r.tiers) ? r.tiers : []).map((t) =>
-            searchReportItem("", t, (o) => [o.tier, o.asked], (o) => [o.result, o.other]));
+        const sourceLines = (Array.isArray(r.sources) ? r.sources : []).map((s, i) =>
+            searchReportLines(`[${s && s.n ? s.n : i + 1}] `, s,
+                              (o) => [o.title, o.address, o.doi && "DOI " + o.doi,
+                                      o.file && "file " + o.file],
+                              (o) => [o.contributed, o.other]));
+        const tierLines = (Array.isArray(r.tiers) ? r.tiers : []).map((t) =>
+            searchReportLines("", t, (o) => [o.tier, o.asked], (o) => [o.result, o.other]));
+        const sources = sourceLines.map(searchReportItem);
+        const tiers = tierLines.map(searchReportItem);
+        const indent = (lines) => lines.map((l, i) => (i ? "    " + l : l)).join("\n");
+        copyText = [String(r.question || ""), "",
+                    "Summary", String(r.summary || "No summary."), "",
+                    "Sources", ...(sourceLines.length ? sourceLines.map(indent) : ["No sources."]), "",
+                    "What was tried", ...(tierLines.length ? tierLines.map(indent) : ["Nothing listed."]),
+                   ].join("\n") + "\n";
+        copy.disabled = false;
         body.replaceChildren(
             ...section("Summary", r.summary ? [el("div", { class: "searchsvc-work-text" },
                                                   [String(r.summary)])] : [], "No summary."),
