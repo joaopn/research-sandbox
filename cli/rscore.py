@@ -21018,7 +21018,11 @@ def _mcp_run_inject_route(name: str, network: str) -> None:
     """The server's default route via the router (after every start: a fresh
     network namespace has none, `--internal` gives none)."""
     try:
-        inject_route(mcp_run.container_name(name), get_router_ip(network))
+        # die()'s line (the full docker command and its stderr) is swallowed:
+        # on the build lane stderr is the log the browser shows, and the
+        # refusal below says what happened in the operator's terms.
+        with contextlib.redirect_stderr(io.StringIO()):
+            inject_route(mcp_run.container_name(name), get_router_ip(network))
     except SystemExit:
         # Not running, or running again after docker restarted it (it exited).
         r = _mcp_docker(["docker", "container", "inspect", "-f",
