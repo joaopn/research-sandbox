@@ -156,22 +156,16 @@ TRACE_TARGET_MAX_CHARS = 300
 # per message instead of the result's totals); at ten times one search's
 # reader could hold 10 MiB at once.
 STREAM_LINE_MAX_BYTES = 1024 * 1024
-# The work record the operator's view shows: the agent's text blocks kept per
-# search, and the newest entries (tool calls and texts together) the view
-# returns. A deep search runs tens of tool calls, each turn with at most one
-# text block: 200 covers the whole of one. At half the start of a deep search
-# falls out of the view; at ten times the record held per search (each text up
-# to AGENT_TEXT_MAX_CHARS) grows to megabytes, and the reply's byte budget
-# below would cut it anyway.
-WORK_MAX_ENTRIES = 200
-# The view's whole reply, measured as the broker relays it (JSON with ASCII
-# escapes). The broker's length prefix would carry 4 GiB, so the bound kept is
-# its own for one reply it composes: 64 KiB (cli/broker.py OP_TAIL_MAX_BYTES,
-# which mirrors its request ceiling MAX_REQUEST_BYTES), less 4 KiB for the
-# envelope the host and the broker add. The oldest work entries are dropped
-# until the reply fits (`truncated`); the question itself (QUESTION_MAX_CHARS)
-# is always whole.
-VIEW_REPLY_MAX_BYTES = 60 * 1024
+# The operator's view is a tail, for checking how a search goes and spotting
+# what broke, not for auditing it: the newest entries (tool calls and the
+# agent's texts together), and of a text only its end. One turn is a text and
+# one to three tool calls, so 10 entries show the last few turns, enough to
+# see a failing tool and the agent's reaction to it; at half one retry loop
+# fills the view, at ten times it becomes the audit it is not meant to be.
+VIEW_TAIL_ENTRIES = 10
+# A text's end as the view shows it: two or three lines of the box. At half a
+# sentence is cut before its point; at ten times one text fills the box.
+VIEW_TEXT_TAIL_CHARS = 300
 # The question as the operator's list shows it: one row of a table (the full
 # question is in the view). At half a one-sentence question is cut mid-way; at
 # ten times a row becomes a paragraph and a long queue's list grows by
@@ -451,13 +445,13 @@ class AgentStream:
     """What the operator sees of one search agent while it runs: the token
     count (the latest usage per message id, summed; the `result` event's
     totals once it arrives) and its text blocks, each with the time it was
-    read (bounded: the newest WORK_MAX_ENTRIES)."""
+    read (bounded: the newest VIEW_TAIL_ENTRIES, all the view shows)."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.per_message: dict[str, int] = {}
         self.final: int | None = None
-        self.texts: collections.deque = collections.deque(maxlen=WORK_MAX_ENTRIES)
+        self.texts: collections.deque = collections.deque(maxlen=VIEW_TAIL_ENTRIES)
         self.dropped = 0
 
     def tokens(self) -> int:
@@ -695,8 +689,8 @@ class Searches:
     def view(self, sid: str) -> dict | None:
         """The operator's read-only view of one search still in the table
         (ended and not collected too): the tool calls of its trace and the
-        agent's text blocks, oldest first, the newest that fit (count and
-        bytes). None when there is no such search."""
+        agent's text blocks, oldest first: the newest VIEW_TAIL_ENTRIES, a
+        text cut to its end. None when there is no such search."""
         with self.lock:
             rec = self.table.get(sid)
             rec = dict(rec) if rec is not None else None
@@ -712,17 +706,11 @@ class Searches:
                **self._times(rec),
                "reason": rec["outcome"]["reason"] if rec["state"] in ENDED else None,
                "work": [], "truncated": False}
-        kept = work[-WORK_MAX_ENTRIES:]
-        left = VIEW_REPLY_MAX_BYTES - len(json.dumps(out))
-        fit = 0
-        for entry in reversed(kept):
-            size = len(json.dumps(entry)) + len(", ")
-            if size > left:
-                break
-            left -= size
-            fit += 1
-        out["work"] = kept[len(kept) - fit:]
-        out["truncated"] = dropped or fit < len(work)
+        for entry in work[-VIEW_TAIL_ENTRIES:]:
+            if entry["kind"] == "text" and len(entry["text"]) > VIEW_TEXT_TAIL_CHARS:
+                entry = dict(entry, text="…" + entry["text"][-VIEW_TEXT_TAIL_CHARS:])
+            out["work"].append(entry)
+        out["truncated"] = dropped or len(work) > VIEW_TAIL_ENTRIES
         return out
 
     def stop(self, sid: str) -> dict | None:

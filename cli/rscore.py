@@ -23728,7 +23728,8 @@ _SEARCH_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 _SEARCH_ADMIN_REFUSED_EXIT = 3
 _SEARCH_LIST_QUESTION_MAX = 200          # service.py LIST_QUESTION_MAX_CHARS
 _SEARCH_QUESTION_MAX = 32 * 1024         # service.py QUESTION_MAX_CHARS
-_SEARCH_WORK_MAX = 200                   # service.py WORK_MAX_ENTRIES
+_SEARCH_WORK_MAX = 10                    # service.py VIEW_TAIL_ENTRIES
+_SEARCH_VIEW_TEXT_MAX = 300 + 1          # service.py VIEW_TEXT_TAIL_CHARS, plus its leading …
 _SEARCH_TRACE_NAME_MAX = 40              # service.py TRACE_NAME_MAX_CHARS
 _SEARCH_TRACE_TARGET_MAX = 300           # service.py TRACE_TARGET_MAX_CHARS
 _SEARCH_TEXT_MAX = 2000                  # service.py AGENT_TEXT_MAX_CHARS
@@ -23857,7 +23858,7 @@ def _search_work_entry(raw: Any) -> dict:
     kind = _search_reply_choice(e.get("kind"), ("tool", "text"))
     if kind == "text":
         return {"ts": _search_reply_ts(e.get("ts")), "kind": kind,
-                "text": _search_reply_str(e.get("text"), _SEARCH_TEXT_MAX)}
+                "text": _search_reply_str(e.get("text"), _SEARCH_VIEW_TEXT_MAX)}
     return {"ts": _search_reply_ts(e.get("ts")), "kind": kind,
             **{k: _search_reply_str(e.get(k), _SEARCH_TRACE_NAME_MAX)
                for k in ("tool", "tier", "outcome")},
@@ -23869,8 +23870,8 @@ def search_view(req: SearchIdRequest, deadline: float | None = None) -> dict:
     """The operator's read-only view of one search still in the service (an
     ended one not collected yet too): its question, state, times, tokens,
     the reason once it ended, and its work — the tool calls and the agent's
-    text, oldest first, the newest that fit (`truncated` when some were
-    left out). Every string is text to show as it is."""
+    text, oldest first: only the latest few (`truncated` when there was
+    earlier work), a text cut to its end. Every string is text to show as it is."""
     deadline = _mcp_deadline() if deadline is None else deadline
     how, out = _search_ask(["view", req.id], deadline)
     if how == "refused":

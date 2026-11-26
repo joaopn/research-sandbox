@@ -9285,7 +9285,7 @@ function searchWorkBox(view, id) {
         }
         if (r.truncated) {
             work.prepend(el("div", { class: "searchsvc-flash" },
-                            ["Only part of the work is shown: it is too long to show in full."]));
+                            ["Only the latest work is shown."]));
         }
         return ended;
     };
