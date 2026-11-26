@@ -48,6 +48,7 @@ flowchart TD
 | [Browser and broker](Browser-and-broker.md) | The web interface, the broker on the host, sign-in, bringing an RS update live |
 | [Networking and egress](Networking-and-egress.md) | Isolation from the host and the LAN; open and locked egress |
 | [Aldine](Aldine.md) | The shared LaTeX editor: turned on in the browser, reached by agents as the MCP server `aldine` |
+| [Search service](Search.md) | The shared search service: an agent hands over a question and later collects a summary with its sources and files; reached as the MCP server `search` |
 
 ## Core design decisions
 
@@ -161,3 +162,11 @@ The lab workflow's decisions are proposals until built; they are listed on [Lab 
 - Aldine's own login is off, so only the web interface and the MCP gateway can reach it, on its own networks.
 - Pinned by version and image digest; the papers are kept across updates and Turn off.
 - The paper check is one skill and one helper role, in researcher and companion projects and zotero boxes only; no project type or box type of its own.
+
+### [Search service](Search.md)
+
+- A search framework RS builds and maintains, escalating inside the search from the cheapest way (scholarly APIs, a page fetch, SearXNG) upwards.
+- One shared service with its own inner Docker; each search gets its own network, container and volume, removed when it is collected.
+- The gateway tells RS's own service who called, and no other server; a project sees only its own searches.
+- One long-lived Claude token for every search; a pi search agent follows later with an API key.
+- The `research` workflow keeps its own websearcher unchanged, as the benchmark.

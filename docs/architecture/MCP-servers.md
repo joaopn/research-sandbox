@@ -122,7 +122,7 @@ flowchart TD
     G -->|server's secret headers| S[MCP servers: internet, this machine, LAN]
 ```
 
-The gateway forwards a call only when three things hold: the token is known, the call arrives from that token's own project network, and the server is on that consumer's list. It replaces the token with the server's own secret headers.
+The gateway forwards a call only when three things hold: the token is known, the call arrives from that token's own project network, and the server is on that consumer's list. It replaces the token with the server's own secret headers. A caller's `X-RS-Caller` header never reaches a server; for RS's own [search service](Search.md), and for no other server, the gateway sets that header itself to the caller's project and consumer, so the service can keep each project's searches to that project.
 
 What Save reports, per agent in the container:
 
