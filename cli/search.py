@@ -170,7 +170,7 @@ MAX_AT_ONCE = 32
 # Unpaywall requires an email address and Crossref's polite pool asks for
 # one. When the operator leaves the contact empty, the requests carry this
 # generic address (a reserved documentation domain: no person behind it).
-GENERIC_CONTACT = "research-sandbox-search@example.org"
+GENERIC_CONTACT = "user@example.org"
 _CONTACT_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 
 

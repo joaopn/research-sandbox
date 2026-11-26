@@ -39,7 +39,7 @@ OUT_DIR = os.path.join(VOLUME, "out")          # service.py OUT_DIR (MIRROR)
 TRACE_PATH = os.path.join(OUT_DIR, "trace.jsonl")
 REPORT_PATH = os.path.join(OUT_DIR, "report.json")
 SEARXNG_URL = "http://searxng:8080/search"     # service.py SEARXNG_ALIAS / SEARXNG_PORT
-CONTACT = os.environ.get("RS_SEARCH_CONTACT", "") or "research-sandbox-search@example.org"
+CONTACT = os.environ.get("RS_SEARCH_CONTACT", "") or "user@example.org"
 USER_AGENT = f"research-sandbox-search/1 (mailto:{CONTACT})"
 
 # One HTTP request (connect, and each read). The scholarly APIs answer in

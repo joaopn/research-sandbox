@@ -8648,10 +8648,16 @@ const SEARCH_TOKEN_HINT =
     "To get a token, open a terminal tab of any project, run claude setup-token " +
     "there, signed in to the Claude account the searches should use, and paste " +
     "what it prints here. Every search uses this one sign-in, whichever project asked.";
+// Shown on the contact address's question mark (a mouseover title).
 const SEARCH_CONTACT_HINT =
-    "The contact address is optional: Unpaywall requires an email address with " +
-    "each request and Crossref asks for one. When it is empty, a generic address " +
-    "is sent.";
+    "Optional. The scholarly databases ask callers to identify themselves by " +
+    "email, so they can write before they throttle or block a client: Unpaywall " +
+    "refuses a request without one, and Crossref and OpenAlex serve requests " +
+    "that carry one more reliably. Searches send this address to those " +
+    "databases, and in the identification string of the pages they fetch; it " +
+    "never reaches the agents that call the search service. When it is empty, " +
+    "the generic user@example.org is sent, which works but is shared by every " +
+    "installation and reaches nobody.";
 // The gateway entry's state, when it is not the normal "listed".
 const SEARCH_ENTRY_TEXT = {
     absent: "it is not on the MCP server list (Turn on lists it)",
@@ -8696,7 +8702,7 @@ function searchSavedText(first, result) {
 
 function searchFlashEl(where, flash) {
     if (!flash || flash.where !== where) return null;
-    return el("div", { class: "search-flash" + (flash.bad ? " mcp-test-bad" : "") },
+    return el("div", { class: "searchsvc-flash" + (flash.bad ? " mcp-test-bad" : "") },
               [flash.text]);
 }
 
@@ -8845,11 +8851,11 @@ function renderSearchScreen(view, a, settings, settingsErr) {
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => rerenderView(view);
     view.appendChild(el("div", {
-        class: "mgmt-row mgmt-infra-row search-bar", "data-swtarget": "search",
+        class: "mgmt-row mgmt-infra-row searchsvc-bar", "data-swtarget": "search",
     }, searchBarParts(view, a, refresh)));
     const barFlash = searchFlashEl("bar", flash);
     if (barFlash) view.appendChild(barFlash);
-    view.appendChild(el("div", { class: "hint search-hint" }, [SEARCH_HINT]));
+    view.appendChild(el("div", { class: "hint searchsvc-hint" }, [SEARCH_HINT]));
     view.appendChild(searchSignInSection(view, a, flash));
     view.appendChild(searchSearcherSection(view, settings, settingsErr, flash));
     paintSoftwareLabels();
@@ -8860,7 +8866,7 @@ function renderSearchScreen(view, a, settings, settingsErr) {
 function searchSignInSection(view, a, flash) {
     const landing = view.__rsRender || renderSearchInto;
     const input = el("input", {
-        type: "password", class: "search-input search-input-wide",
+        type: "password", class: "searchsvc-input searchsvc-input-wide",
         // "new-password": the browser must not fill in a saved password
         // (the master password) here, where Save would store it as the token.
         autocomplete: "new-password", spellcheck: "false", placeholder: "paste the token",
@@ -8921,10 +8927,15 @@ function searchSignInSection(view, a, flash) {
 }
 
 // One labelled control of the searcher form, captioned like the model picker.
-function searchCell(caption, control) {
-    return el("div", { class: "model-cell" }, [
-        el("span", { class: "model-cap" }, [caption]), control,
-    ]);
+function searchCell(caption, control, help) {
+    const cap = el("span", { class: "model-cap" }, [caption]);
+    if (help) {
+        cap.appendChild(el("span", {
+            class: "searchsvc-help", title: help, tabindex: "0",
+            "aria-label": help,
+        }, ["?"]));
+    }
+    return el("div", { class: "model-cell" }, [cap, control]);
 }
 
 // Searcher: the one searcher's name, model and effort, searches at once, and
@@ -8943,18 +8954,18 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
     }
     const cur = cfg.settings || cfg.defaults || {};
     const s = cur.searcher || {};
-    const name = el("input", { type: "text", class: "search-input", spellcheck: "false" });
+    const name = el("input", { type: "text", class: "searchsvc-input", spellcheck: "false" });
     name.value = s.name || "";
     const picker = modelPicker({
         models: cfg.models || [], efforts: cfg.efforts || [],
         defaults: { search: { model: s.model || "", effort: s.effort || "" } },
     }, "search", "", "", {});
     const max = Number.isSafeInteger(cfg.max_at_once) ? cfg.max_at_once : 0;
-    const atOnce = el("input", { type: "number", class: "search-input search-input-num",
+    const atOnce = el("input", { type: "number", class: "searchsvc-input searchsvc-input-num",
                                  min: "1", max: String(max), step: "1" });
     atOnce.value = s.at_once !== undefined && s.at_once !== null ? String(s.at_once) : "";
     const contact = el("input", {
-        type: "email", class: "search-input search-input-wide", spellcheck: "false",
+        type: "email", class: "searchsvc-input searchsvc-input-wide", spellcheck: "false",
         placeholder: cfg.generic_contact ? "empty: " + cfg.generic_contact : "",
     });
     contact.value = cur.contact || "";
@@ -8991,11 +9002,11 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         searchFlash = { where: "searcher", text: searchSavedText("Saved.", body.result) };
         rerenderView(view);
     };
-    wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row search-form" }, [
+    wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row searchsvc-form" }, [
         searchCell("name", name),
         picker.row,
         searchCell("searches at once", atOnce),
-        searchCell("contact address", contact),
+        searchCell("contact address", contact, SEARCH_CONTACT_HINT),
         save,
         errEl,
     ]));
@@ -9003,8 +9014,7 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
     if (saved) wrap.appendChild(saved);
     wrap.appendChild(el("div", { class: "mgmt-settings-hint" }, [
         "Agents name the searcher when they submit a question; with one searcher "
-        + "they can leave it out. More searches than this wait their turn. "
-        + SEARCH_CONTACT_HINT]));
+        + "they can leave it out. More searches than this wait their turn."]));
     return wrap;
 }
 
