@@ -2813,10 +2813,135 @@ function mcpEditPayload(name, f) {
     return payload;
 }
 
+// ---- pasting a server's configuration into the Add form
+// Fill sends the pasted text to the broker, which reads it into drafts of the
+// Add form and runs or saves nothing. One draft opens its form filled; several
+// are listed, each with its own Fill. The last paste is kept HERE, in memory
+// only — never in the vault or localStorage, since it may hold keys — until the
+// operator clears or replaces it; a draft leaves the list once Add has taken
+// it, so the servers of one paste are added one by one.
+let mcpPasteLast = null;   // {text, drafts, notes} | null
+const MCP_PASTE_KIND_TEXT = { address: "an address", image: "an image", package: "a package" };
+
+// What a listed draft is: package@version, the image, or the address.
+function mcpDraftWhat(d) {
+    if (d.kind === "package") {
+        return d.version ? d.package + "@" + d.version : String(d.package || "");
+    }
+    return String((d.kind === "image" ? d.image : d.url) || "");
+}
+
+// A filled form's notes: those about the paste as a whole (what could not be
+// read into any draft) and then the draft's own. The paste's own notes come
+// first so a single draft, whose form opens at once, never hides them.
+function mcpPrefillNotes(prefill) {
+    const fromPaste = mcpPasteLast && mcpPasteLast.drafts.includes(prefill)
+        && Array.isArray(mcpPasteLast.notes) ? mcpPasteLast.notes : [];
+    return fromPaste.concat(Array.isArray(prefill.notes) ? prefill.notes : []);
+}
+
+// A filled form's notes, above its fields (each note's text), or null.
+function mcpDraftNotes(notes) {
+    const list = Array.isArray(notes) ? notes : [];
+    if (!list.length) return null;
+    return el("div", { class: "mcp-draft-notes" }, list.map(
+        (n) => el("div", { class: "mcp-draft-note" }, [String((n && n.text) || "")])));
+}
+
+// A draft's filled Add form: the address form, or the run form's image or
+// package source.
+function mcpOpenDraft(view, draft) {
+    if (draft.kind === "address") return mcpServerDialog(view, null, draft);
+    return mcpRunDialog(view, null, draft.kind === "package" ? "package" : "image", draft);
+}
+
+// Add took this draft: it leaves the list, and the paste goes with its last one.
+function mcpPasteTaken(draft) {
+    if (!mcpPasteLast) return;
+    mcpPasteLast.drafts = mcpPasteLast.drafts.filter((d) => d !== draft);
+    if (!mcpPasteLast.drafts.length) mcpPasteLast = null;
+}
+
+// The "Paste a config" area at the top of an Add dialog that is not filled.
+// A failure is a line here, never the page-wide outage card; a session that
+// ended lands on the sign-in.
+function mcpPasteArea(view, backdrop) {
+    const textI = el("textarea", { class: "mcp-paste-text", rows: "4",
+                                   placeholder: "Paste a server's install line or its mcp.json block" });
+    textI.value = mcpPasteLast ? mcpPasteLast.text : "";
+    const msg = el("div", { class: "mcp-paste-msg" });
+    const out = el("div", { class: "mcp-paste-out" });
+    const fill = el("button", { type: "button", class: "btn-small mcp-paste-fill" }, ["Fill"]);
+    const clear = el("button", { type: "button", class: "btn-small mcp-paste-clear" }, ["Clear"]);
+    const say = (text, bad) => {
+        msg.className = "mcp-paste-msg" + (bad ? " mcp-paste-err" : "");
+        msg.textContent = text;
+    };
+    const paint = () => {
+        out.textContent = "";
+        if (!mcpPasteLast) return;
+        for (const n of mcpPasteLast.notes) {
+            out.appendChild(el("div", { class: "mcp-paste-note" }, [String((n && n.text) || "")]));
+        }
+        if (!mcpPasteLast.drafts.length) return;
+        const list = el("div", { class: "mcp-paste-list" });
+        for (const d of mcpPasteLast.drafts) {
+            const b = el("button", { type: "button", class: "btn-small mcp-paste-row-fill" }, ["Fill"]);
+            b.onclick = () => { backdrop.remove(); mcpOpenDraft(view, d); };
+            list.appendChild(el("div", { class: "mcp-paste-row" }, [
+                el("span", { class: "mcp-paste-name" }, [String(d.name || "")]),
+                el("span", { class: "mcp-paste-kind" }, [MCP_PASTE_KIND_TEXT[d.kind] || String(d.kind || "")]),
+                el("span", { class: "mcp-paste-what" }, [mcpDraftWhat(d)]),
+                b]));
+        }
+        out.appendChild(list);
+    };
+    clear.onclick = () => { mcpPasteLast = null; textI.value = ""; say("", false); paint(); };
+    fill.onclick = async () => {
+        const text = textI.value;
+        say("Reading it…", false);
+        fill.disabled = true; clear.disabled = true;
+        const { status, body } = await mcpPost("/broker/mcp/servers/draft", { text });
+        fill.disabled = false; clear.disabled = false;
+        if (status === 401) {
+            backdrop.remove();
+            return mgmtStatusRedirect(view, status, view.__rsRender || renderMcpInto)();
+        }
+        if (status !== 200 || !body.ok || !body.result) {
+            say(status === 200 && body.error ? mgmtErrText(body) : MCP_TEST_RETRY_TEXT, true);
+            return;
+        }
+        say("", false);
+        const r = body.result;
+        mcpPasteLast = { text, drafts: Array.isArray(r.drafts) ? r.drafts : [],
+                         notes: Array.isArray(r.notes) ? r.notes : [] };
+        if (mcpPasteLast.drafts.length === 1 && backdrop.isConnected) {
+            backdrop.remove();
+            mcpOpenDraft(view, mcpPasteLast.drafts[0]);
+            return;
+        }
+        paint();
+    };
+    paint();
+    return el("div", { class: "mcp-paste" }, [
+        el("div", { class: "mcp-headers-title" }, ["Paste a config"]),
+        textI,
+        el("div", { class: "hint" }, [
+            "The install line or the configuration block a server's README gives. "
+            + "Nothing in it is run or saved: Fill opens this form filled in, to "
+            + "review and add."]),
+        el("div", { class: "mcp-paste-actions" }, [fill, clear]),
+        msg,
+        out,
+    ]);
+}
+
 // The Add / Edit dialog. `existing` is the list row being edited, or null.
 // Secret values are password inputs that start EMPTY in both modes: the page
 // never holds a saved secret, so there is nothing to refill them with.
-function mcpServerDialog(view, existing) {
+// `prefill` (Add only): a draft read from a paste; its values are the ones the
+// operator just pasted, shown masked, and its notes sit above the fields.
+function mcpServerDialog(view, existing, prefill) {
     if (document.querySelector(".modal-backdrop")) return null;
     const backdrop = el("div", { class: "modal-backdrop" });
     const errEl = el("div", { class: "error" });
@@ -2830,6 +2955,11 @@ function mcpServerDialog(view, existing) {
         nameI.value = existing.name; nameI.disabled = true;
         urlI.value = existing.url;
         descI.value = existing.description || "";
+    }
+    if (prefill) {
+        nameI.value = prefill.name || "";
+        urlI.value = prefill.url || "";
+        descI.value = prefill.description || "";
     }
     const headerRows = [];            // new or replaced secrets: {nameI, valueI}
     const removeBoxes = [];           // saved secrets: {name, cb}
@@ -2845,13 +2975,14 @@ function mcpServerDialog(view, existing) {
         kindField = el("div", { class: "field" }, [el("label", {}, ["Kind"]), kindI]);
     }
     const headersWrap = el("div", { class: "mcp-headers" });
-    const addHeaderRow = (fixedName) => {
+    const addHeaderRow = (fixedName, pasted) => {
         const hn = el("input", { type: "text", autocomplete: "off",
                                  class: "mcp-header-name", placeholder: "Authorization" });
         const hv = el("input", { type: "password", autocomplete: "new-password",
                                  class: "mcp-header-value",
                                  placeholder: fixedName ? "new value (empty keeps it)" : "value" });
         if (fixedName) { hn.value = fixedName; hn.disabled = true; }
+        if (pasted) { hn.value = pasted[0]; hv.value = String(pasted[1] || ""); }
         const line = el("div", { class: "mcp-header-row" }, [hn, hv]);
         if (fixedName) {
             const cb = el("input", { type: "checkbox" });
@@ -2862,6 +2993,7 @@ function mcpServerDialog(view, existing) {
         headersWrap.appendChild(line);
     };
     for (const hname of (existing ? existing.headers : [])) addHeaderRow(hname);
+    for (const h of Object.entries((prefill && prefill.headers) || {})) addHeaderRow(null, h);
     const moreBtn = el("button", { type: "button", class: "btn-small" }, ["Add a secret header"]);
     moreBtn.onclick = () => addHeaderRow(null);
     const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
@@ -2886,11 +3018,13 @@ function mcpServerDialog(view, existing) {
             errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
             return;
         }
+        if (prefill) mcpPasteTaken(prefill);
         backdrop.remove();
         rerenderView(view);
     };
     const card = el("div", { class: "card mcp-server-card" }, [
         el("h2", {}, [existing ? "Edit MCP server" : "Add an MCP server"]),
+        prefill ? mcpDraftNotes(mcpPrefillNotes(prefill)) : (existing ? null : mcpPasteArea(view, backdrop)),
         kindField,
         el("div", { class: "field" }, [el("label", {}, ["Name"]), nameI]),
         el("div", { class: "field" }, [el("label", {}, ["Address"]), urlI]),
@@ -3085,8 +3219,11 @@ async function mcpRunTail(view, opId, title, backdrop, card) {
 
 // The Add / Edit dialog of a server RS runs. `existing` is its list row, or
 // null; `source` ("image" or "package") picks the Add form (an existing
-// server keeps its own).
-function mcpRunDialog(view, existing, source) {
+// server keeps its own). `prefill` (Add only): a draft read from a paste, its
+// pasted settings in their secret ticks (a secret one masked, a placeholder
+// empty) and its notes above the fields; an image draft's port stays empty
+// for the operator.
+function mcpRunDialog(view, existing, source, prefill) {
     if (document.querySelector(".modal-backdrop")) return null;
     const run = (existing && existing.run) || {};
     const isPackage = existing ? run.source === "package" : source === "package";
@@ -3129,11 +3266,28 @@ function mcpRunDialog(view, existing, source) {
         dataI.value = run.data || "";
         destI.value = (run.destinations || []).join("\n");
     }
+    if (prefill) {
+        nameI.value = prefill.name || "";
+        descI.value = prefill.description || "";
+        if (isPackage) {
+            registryI.value = prefill.registry || "npm";
+            packageI.value = prefill.package || "";
+            versionI.value = prefill.version || "";
+            commandI.value = prefill.command || "";
+        } else {
+            imageI.value = prefill.image || "";
+            portI.value = prefill.port === null || prefill.port === undefined ? "" : String(prefill.port);
+            pathI.value = prefill.path || "/mcp";
+        }
+        argsI.value = (prefill.args || []).join("\n");
+        dataI.value = prefill.data || "";
+        destI.value = (prefill.destinations || []).join("\n");
+    }
     // Settings: NAME, value, a secret tick (a secret value is a password
     // field), and on a saved one a remove box.
     const settingRows = [];
     const settingsWrap = el("div", { class: "mcp-settings" });
-    const addSettingRow = (saved) => {
+    const addSettingRow = (saved, pasted) => {
         const sn = el("input", { type: "text", autocomplete: "off",
                                  class: "mcp-header-name mcp-setting-name", placeholder: "API_KEY" });
         const sv = el("input", { type: "text", autocomplete: "off",
@@ -3155,24 +3309,31 @@ function mcpRunDialog(view, existing, source) {
             row.removeCb = el("input", { type: "checkbox", class: "mcp-setting-remove" });
             line.appendChild(el("span", { class: "mcp-header-remove" }, [row.removeCb, " remove"]));
         }
+        if (pasted) {
+            sn.value = pasted.name; sv.value = pasted.value; secretCb.checked = pasted.secret;
+        }
         setSecret(secretCb.checked);
         settingRows.push(row);
         settingsWrap.appendChild(line);
     };
     for (const s of (run.settings || [])) addSettingRow(s);
+    for (const [k, v] of Object.entries((prefill && prefill.settings) || {})) {
+        addSettingRow(null, { name: k, secret: !!(v && v.secret), value: String((v && v.value) || "") });
+    }
     const moreSetting = el("button", { type: "button", class: "btn-small" }, ["Add a setting"]);
     moreSetting.onclick = () => addSettingRow(null);
     // Secret headers: the address form's control.
     const headerRows = [];
     const headerRemoves = [];
     const headersWrap = el("div", { class: "mcp-headers" });
-    const addHeaderRow = (fixedName) => {
+    const addHeaderRow = (fixedName, pasted) => {
         const hn = el("input", { type: "text", autocomplete: "off",
                                  class: "mcp-header-name", placeholder: "Authorization" });
         const hv = el("input", { type: "password", autocomplete: "new-password",
                                  class: "mcp-header-value",
                                  placeholder: fixedName ? "new value (empty keeps it)" : "value" });
         if (fixedName) { hn.value = fixedName; hn.disabled = true; }
+        if (pasted) { hn.value = pasted[0]; hv.value = String(pasted[1] || ""); }
         const line = el("div", { class: "mcp-header-row" }, [hn, hv]);
         if (fixedName) {
             const cb = el("input", { type: "checkbox", class: "mcp-header-remove-cb" });
@@ -3183,6 +3344,7 @@ function mcpRunDialog(view, existing, source) {
         headersWrap.appendChild(line);
     };
     for (const hname of (existing ? existing.headers || [] : [])) addHeaderRow(hname);
+    for (const h of Object.entries((prefill && prefill.headers) || {})) addHeaderRow(null, h);
     const moreHeader = el("button", { type: "button", class: "btn-small" }, ["Add a secret header"]);
     moreHeader.onclick = () => addHeaderRow(null);
 
@@ -3248,6 +3410,7 @@ function mcpRunDialog(view, existing, source) {
             errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
             return;
         }
+        if (prefill) mcpPasteTaken(prefill);
         const title = MCP_RUN_OP_TITLE[action] + payload.name
             + (existing && payload.version
                 ? " and installing " + run.package + " " + payload.version : "");
@@ -3277,6 +3440,7 @@ function mcpRunDialog(view, existing, source) {
     ];
     for (const c of [
         el("h2", {}, [existing ? "Edit MCP server" : "Add an MCP server"]),
+        prefill ? mcpDraftNotes(mcpPrefillNotes(prefill)) : (existing ? null : mcpPasteArea(view, backdrop)),
         kindField,
         sourceField,
         field("Name", nameI),

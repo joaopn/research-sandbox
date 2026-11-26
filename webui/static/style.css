@@ -2577,6 +2577,29 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .mcp-header-name:focus, .mcp-header-value:focus { outline: none; border-color: var(--bg-input-focus-border); }
 .mcp-header-remove { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
 .mcp-headers-more { margin: 8px 0 4px; }
+/* Paste a config: the box at the top of Add, its notes and drafts; a filled form's notes. */
+.mcp-paste { border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 4px; }
+.mcp-paste-text {
+    display: block; width: 100%; box-sizing: border-box; margin-top: 6px;
+    padding: 6px 8px; background: var(--bg-input); color: var(--fg-base);
+    border: 1px solid var(--border); border-radius: 4px;
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; resize: vertical;
+}
+.mcp-paste-text:focus { outline: none; border-color: var(--bg-input-focus-border); }
+.mcp-paste-actions { display: flex; gap: 6px; margin: 6px 0 4px; }
+.mcp-paste-msg { font-size: 12px; color: var(--fg-muted); }
+.mcp-paste-msg:empty { display: none; }
+.mcp-paste-err { color: var(--error-fg); }
+.mcp-paste-note, .mcp-draft-note { font-size: 12px; color: var(--fg-muted); margin-top: 4px; }
+.mcp-draft-notes { margin: 4px 0 8px; padding: 2px 10px 6px; border-left: 3px solid var(--border); }
+.mcp-paste-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.mcp-paste-row { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.mcp-paste-name { font-weight: 600; color: var(--fg-base); }
+.mcp-paste-kind { color: var(--fg-muted); font-size: 12px; white-space: nowrap; }
+.mcp-paste-what {
+    flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--fg-muted); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+}
 /* A server RS runs: its state badge, the Logs panel, the form's textareas. */
 .mcp-run-logs { flex: 1 0 100%; }
 .mcp-run-logs:empty { display: none; }

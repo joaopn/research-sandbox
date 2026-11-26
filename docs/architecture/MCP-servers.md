@@ -76,6 +76,7 @@ A server's README usually says how to configure it in one of a few shapes: a one
 - **Settings are secret by default.** Every setting the paste names starts as secret; a value that is a placeholder (`${input:…}`, `<your-token>`, `YOUR_API_KEY`, `$VAR`, …) is left empty to fill in.
 - **A docker line needs an HTTP image.** RS runs an image only when it serves MCP over HTTP; one that speaks only stdio does not run that way. Its port and path are left to fill in, and a host folder it mounts is left out.
 - **What could not be mapped is a note** on the draft: an unknown option, a path on the operator's machine (a server RS runs sees only its own data folder), a program installed on the operator's machine, a failed lookup.
+- **On the page.** Add server opens with a **Paste a config** box. **Fill** opens the form filled from a single draft, with its notes above the fields, or lists several drafts, each with its own Fill. The drafts stay listed, in the open page only and never saved, until the box is cleared or another paste replaces them; a saved draft leaves the list, so a block's servers are added one by one.
 
 Two credentials for the same kind of server (a lab's account and a personal one) are two servers with their own names.
 
