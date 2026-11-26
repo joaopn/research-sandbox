@@ -2538,6 +2538,25 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .mgmt-settings-num:focus { outline: none; border-color: var(--bg-input-focus-border); }
 .mgmt-settings-note { color: var(--fg-muted); font-size: 12px; }
 .mgmt-settings-hint { color: var(--fg-muted); font-size: 12px; margin: 6px 10px 0; }
+/* Services → Search: its bar, the sign-in field and the searcher form.
+   Self-scoped classes only (no bare input rule — the .field-bleed
+   discipline); the form's captions reuse the model picker's cells. */
+.search-bar { flex-wrap: wrap; }
+.search-hint { margin: 8px 10px 0; }
+.search-form { flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+.search-input {
+    width: 12em;
+    padding: 6px 8px;
+    background: var(--bg-input);
+    color: var(--fg-base);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 13px;
+}
+.search-input:focus { outline: none; border-color: var(--bg-input-focus-border); }
+.search-input-num { width: 6em; }
+.search-input-wide { width: 22em; max-width: 100%; }
+.search-flash { font-size: 12px; color: var(--fg-muted); margin: 6px 10px 0; }
 
 /* Services → MCP (the gateway's server list). Self-scoped classes only. */
 .mcp-server-row { flex-wrap: wrap; }

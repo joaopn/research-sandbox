@@ -1896,7 +1896,7 @@ function makeBottomNav() {
         mk("workflows-entry", "newProject", "New Project",
            "New Project — pick a workflow, or import an existing project", openWorkflows),
         mk("services-entry", "services", "Services",
-           "Services — Gitea, repos, fetch, reviews, MCP, Aldine", () => openServices()),
+           "Services — Gitea, repos, fetch, reviews, MCP, Aldine, Search", () => openServices()),
         mk("host-entry", "host", "Host",
            "Host — projects, software, ports, defaults", openHost),
         mk("settings-entry", "settings", "Settings", "Interface settings", openSettings),
@@ -2271,7 +2271,7 @@ const HOST_TAB_DIVIDER = "divider";
 
 // The Services tabs that act on Gitea: the strip hides them while Gitea is not
 // running. Gitea itself (its bar enables it), Reviews (its history needs no
-// Gitea; it says when Gitea is off), MCP and Aldine always show.
+// Gitea; it says when Gitea is off), MCP, Aldine and Search always show.
 const SERVICES_GITEA_TABS = ["repos", "fetch"];
 // Whether Gitea runs, from the newest /broker/dev answer the Services page
 // read (noteServicesGitea): null until the first one, and then every tab shows,
@@ -2284,7 +2284,7 @@ const HOST_PAGES = {
         landing: "gitea",
         tabs: [["gitea", "Gitea"], ["repos", "Repos"], ["fetch", "Fetch"],
                ["reviews", "Reviews"], HOST_TAB_DIVIDER,
-               ["mcp", "MCP"], ["aldine", "Aldine"]],
+               ["mcp", "MCP"], ["aldine", "Aldine"], ["search", "Search"]],
         shown: (k) => servicesGiteaRunning !== false || !SERVICES_GITEA_TABS.includes(k),
         get: () => servicesActiveTab,
         set: (k) => { servicesActiveTab = k; },
@@ -2363,7 +2363,7 @@ function noteServicesGitea(gitea) {
 }
 
 // The one /broker/dev read Services makes for itself, when it opens on a tab
-// that does not read it (MCP, Aldine): it only settles which tabs the strip
+// that does not read it (MCP, Aldine, Search): it only settles which tabs the strip
 // shows. A failure changes nothing — the tabs on screen say what is wrong.
 async function servicesGiteaProbe() {
     let gitea = null;
@@ -2520,7 +2520,7 @@ function openHostPage(page, tab) {
     if (!view) return;
     setActiveNavEntry(page + "-entry");
     renderHostPage();
-    // MCP and Aldine do not read Gitea's state; one read settles which tabs
+    // MCP, Aldine and Search do not read Gitea's state; one read settles which tabs
     // the strip shows (the other tabs, Reviews included, learn it from their
     // own read).
     if (page === "services" && !SERVICES_GITEA_TABS.includes(servicesActiveTab)
@@ -3621,7 +3621,8 @@ function mcpRunRow(view, srv, wiredNames, cell) {
 }
 
 // A plain confirm for an action that answers at once (Remove, Start an empty
-// list): it POSTs, shows a refusal in place, and re-renders the page on success.
+// list): it POSTs, shows a refusal in place, and re-renders the page on success
+// (after `cfg.onOk(body)`, when given, so the page can say what came back).
 function mcpConfirmDialog(view, cfg) {
     if (document.querySelector(".modal-backdrop")) return null;
     const backdrop = el("div", { class: "modal-backdrop" });
@@ -3641,6 +3642,7 @@ function mcpConfirmDialog(view, cfg) {
             return;
         }
         backdrop.remove();
+        if (cfg.onOk) cfg.onOk(body);
         rerenderView(view);
     };
     backdrop.appendChild(el("div", { class: "card" }, [
@@ -4969,7 +4971,8 @@ function setTypeBadge(elm, label) {
 // off.)
 //
 // Past a divider, the shared services that are not Gitea: "MCP" (the MCP
-// gateway) and "Aldine" (the shared LaTeX editor).
+// gateway), "Aldine" (the shared LaTeX editor) and "Search" (the search
+// service agents hand questions to).
 
 // Open Services, on `tab` when given (a project pane's link to Gitea or Repos).
 function openServices(tab) { openHostPage("services", tab); }
@@ -5025,6 +5028,11 @@ function renderServicesInto(view) {
         // Its row is a build-lane target: learn a Turn on running elsewhere.
         seedSoftwareFromBroker();
         return renderAldineInto(view);
+    }
+    if (tab === "search") {
+        // Its bar is a build-lane target too.
+        seedSoftwareFromBroker();
+        return renderSearchInto(view);
     }
     view.innerHTML = "";
     if (tab === "reviews") {
@@ -8618,6 +8626,388 @@ async function aldineOpen(view, errEl) {
     w.location.href = r.url;
 }
 
+// ---- the search service (Services → Search) --------------------------------
+// One search service for the whole installation: agents hand it a question,
+// go on working and collect the written result later. Turn on is a background
+// build-lane action (the first one builds the service's images and stages
+// them into its own Docker) tailed like Aldine's; everything else answers at
+// once. The sign-in token is a secret: it goes from its field into one POST
+// body and is never put back on the page — the field is emptied after every
+// try, and the page only ever says whether a sign-in is stored.
+const SEARCH_ON_TITLE = "Turning the search service on";
+const SEARCH_HINT =
+    "Agents hand the search service a question, go on working, and later collect " +
+    "a written summary with every source, the files it downloaded and what it " +
+    "tried. Agents get it as the MCP server search: tick search for a project's " +
+    "agent, a box or a research project's workers under Services → MCP, like any " +
+    "MCP server.";
+// The one command this page names: the reviewer-token exception, extended by
+// the maintainer to the search service's sign-in (a project terminal tab is a
+// browser surface).
+const SEARCH_TOKEN_HINT =
+    "To get a token, open a terminal tab of any project, run claude setup-token " +
+    "there, signed in to the Claude account the searches should use, and paste " +
+    "what it prints here. Every search uses this one sign-in, whichever project asked.";
+const SEARCH_CONTACT_HINT =
+    "The contact address is optional: Unpaywall requires an email address with " +
+    "each request and Crossref asks for one. When it is empty, a generic address " +
+    "is sent.";
+// The gateway entry's state, when it is not the normal "listed".
+const SEARCH_ENTRY_TEXT = {
+    absent: "it is not on the MCP server list (Turn on lists it)",
+    unreadable: "the MCP server list cannot be read",
+    conflict: "another server named search is on the MCP server list",
+};
+const SEARCH_CREDENTIAL_TEXT = {
+    set: "a sign-in is stored",
+    absent: "no sign-in stored: searches cannot start",
+    damaged: "the stored sign-in cannot be used: save the token again",
+};
+// What the last change on the page reported, shown once by the render that
+// follows it (every change re-reads the page). {where: "bar" | "token" |
+// "searcher", text, bad}.
+let searchFlash = null;
+
+// The bar's state from one status answer (`a` = the search_status result):
+// [label, reason]; the reason is null unless the label is "problem".
+function searchState(a) {
+    if (!a.on) return ["off", null];
+    if (a.container === "foreign") {
+        return ["problem", "another container holds the search service's name"];
+    }
+    if (a.container !== "running") return ["stopped", null];
+    if (a.answering === false) return ["problem", "it is running but not answering"];
+    if (!a.current) return ["problem", "it is not on this installation's version"];
+    if (a.mcp_entry !== "listed") {
+        return ["problem", SEARCH_ENTRY_TEXT[a.mcp_entry] || a.mcp_entry];
+    }
+    if (a.images && (!a.images.agent || !a.images.searxng)) {
+        return ["problem", "its search images are not staged (Turn on stages them)"];
+    }
+    return ["running", null];
+}
+
+// A change's confirmation, plus the broker's note when the service did not
+// receive it (it is off or stopped).
+function searchSavedText(first, result) {
+    return result && result.delivered === false && result.note
+        ? `${first} Note: ${result.note}.` : first;
+}
+
+function searchFlashEl(where, flash) {
+    if (!flash || flash.where !== where) return null;
+    return el("div", { class: "search-flash" + (flash.bad ? " mcp-test-bad" : "") },
+              [flash.text]);
+}
+
+// The bar's content (pure DOM building; `refresh` goes right after the
+// .sw-act buttons, so it is never disabled while a Turn on runs).
+function searchBarParts(view, a, refresh) {
+    const [said, reason] = searchState(a);
+    const parts = [
+        el("span", {}, ["Search"]),
+        el("span", { class: "sw-status " + (said === "running" ? "state-running" : "state-stopped") },
+           [said]),
+    ];
+    if (a.searxng_version) {
+        parts.push(el("span", { class: "type-badge" }, ["SearXNG " + a.searxng_version]));
+    }
+    const counts = a.searches;
+    if (counts) {
+        parts.push(el("span", { class: "type-badge" }, [
+            `${counts.queued || 0} waiting · ${counts.running || 0} running · `
+            + `${counts.ended || 0} ended, not collected`]));
+    }
+    const errEl = el("span", { class: "mcp-test mcp-test-bad" },
+                     [[reason, a.error].filter(Boolean).join("; ")]);
+    const act = el("span", { class: "sw-act" }, []);
+    const present = a.container === "running" || a.container === "stopped";
+    // Turn on: when off, and to repair an on service that is not running and
+    // answering on this installation's version and listed (idempotent).
+    let onLabel = null;
+    if (!a.on) onLabel = "Turn on";
+    else if (present && !a.current) onLabel = "Update";
+    else if (said !== "running") onLabel = "Turn on";
+    if (onLabel) {
+        const b = el("button", { class: "btn-small" }, [onLabel]);
+        b.onclick = () => searchTurnOn(view, b, errEl);
+        act.appendChild(b);
+    }
+    if (a.on || a.container !== "absent") {
+        const b = el("button", { class: "btn-small" }, ["Turn off"]);
+        b.onclick = () => mcpConfirmDialog(view, {
+            title: "Turn the search service off",
+            text: "Its container and networks are removed, and every running search "
+                + "ends with it. The sign-in, the searcher and the downloaded images "
+                + "are kept, so turning it on again finds them. Every agent loses "
+                + "the MCP server search.",
+            confirmLabel: "Turn off",
+            path: "/broker/search/off",
+            payload: {},
+        });
+        act.appendChild(b);
+    }
+    const ended = counts && counts.ended ? counts.ended : 0;
+    if (a.container === "running" && ended > 0) {
+        const b = el("button", { class: "btn-small" }, [`Clear ended searches (${ended})`]);
+        b.onclick = () => mcpConfirmDialog(view, {
+            title: "Clear ended searches",
+            text: `The ${ended} search${ended === 1 ? "" : "es"} that ended and were `
+                + "not collected are removed with their results and files. The agents "
+                + "that asked can no longer collect them. Running and waiting searches "
+                + "are left alone.",
+            confirmLabel: "Clear",
+            path: "/broker/search/clear",
+            payload: {},
+            onOk: (body) => {
+                const r = body.result || {};
+                const problems = Array.isArray(r.problems) ? r.problems : [];
+                searchFlash = {
+                    where: "bar",
+                    bad: problems.length > 0,
+                    text: `Cleared ${r.cleared || 0}.`
+                        + (problems.length ? " Not everything went: " + problems.join("; ") : ""),
+                };
+            },
+        });
+        act.appendChild(b);
+    }
+    parts.push(act, refresh, errEl);
+    return parts;
+}
+
+// Turn on / Update: start the build-lane action and tail it in a box that can
+// be sent to the background (the first one builds and stages images: minutes).
+async function searchTurnOn(view, btn, errEl) {
+    if (document.querySelector(".modal-backdrop")) return;
+    if (softwareInFlight.get("search")) return;
+    errEl.textContent = "";
+    btn.disabled = true;
+    const { status, body } = await mcpPost("/broker/software/build", { verb: "search_on" });
+    const landing = view.__rsRender || renderSearchInto;
+    const redirect = mgmtStatusRedirect(view, status, landing);
+    if (redirect) return redirect();
+    if (status !== 200 || !body.ok || !body.op_id) {
+        btn.disabled = false;
+        errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+        return;
+    }
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" }, [el("h2", {}, [SEARCH_ON_TITLE])]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    await softwareTail(view, backdrop, card, body.op_id, SEARCH_ON_TITLE, "search",
+                       { verb: "search_on" }, landing);
+}
+
+// Services → Search. The status read decides the page (the transport-vs-verb
+// split: no answer is the broker-unreachable card, a refusal its own text);
+// the searcher's settings are a second read whose failure stays in its
+// section.
+async function renderSearchInto(view) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading the search service…"]));
+    const landing = view.__rsRender || renderSearchInto;
+    let res, body;
+    try {
+        res = await fetch("/broker/search");
+    } catch (e) { return view.isConnected ? renderMgmtUnavailable(view) : undefined; }
+    if (!view.isConnected) return undefined;
+    if (res.status === 401) return renderMgmtLogin(view, landing);
+    if (res.status === 403) return renderMgmtRejected(view);
+    if (res.status === 503) return renderMgmtUnavailable(view);
+    try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+    if (!view.isConnected) return undefined;
+    if (!res.ok || !body.ok || !body.result) {
+        return renderMgmtVerbError(view, body, (v) => rerenderView(v));
+    }
+    let settings = null, settingsErr = null;
+    try {
+        const sres = await fetch("/broker/search/settings");
+        if (sres.status === 401) {
+            return view.isConnected ? renderMgmtLogin(view, landing) : undefined;
+        }
+        if (sres.status === 200) {
+            const sbody = await sres.json();
+            if (sbody && sbody.ok && sbody.result) settings = sbody.result;
+            else settingsErr = mgmtErrText(sbody);
+        }
+    } catch (e) { /* the section's "unavailable" line */ }
+    if (!view.isConnected) return undefined;
+    renderSearchScreen(view, body.result, settings, settingsErr);
+    return undefined;
+}
+
+function renderSearchScreen(view, a, settings, settingsErr) {
+    const flash = searchFlash;
+    searchFlash = null;
+    view.innerHTML = "";
+    const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
+    refresh.onclick = () => rerenderView(view);
+    view.appendChild(el("div", {
+        class: "mgmt-row mgmt-infra-row search-bar", "data-swtarget": "search",
+    }, searchBarParts(view, a, refresh)));
+    const barFlash = searchFlashEl("bar", flash);
+    if (barFlash) view.appendChild(barFlash);
+    view.appendChild(el("div", { class: "hint search-hint" }, [SEARCH_HINT]));
+    view.appendChild(searchSignInSection(view, a, flash));
+    view.appendChild(searchSearcherSection(view, settings, settingsErr, flash));
+    paintSoftwareLabels();
+}
+
+// Sign-in: whether a credential is stored (never its value), a field to paste
+// the long-lived token with Save, and Remove.
+function searchSignInSection(view, a, flash) {
+    const landing = view.__rsRender || renderSearchInto;
+    const input = el("input", {
+        type: "password", class: "search-input search-input-wide",
+        // "new-password": the browser must not fill in a saved password
+        // (the master password) here, where Save would store it as the token.
+        autocomplete: "new-password", spellcheck: "false", placeholder: "paste the token",
+    });
+    const errEl = el("span", { class: "mgmt-reviewer-err" }, []);
+    const save = el("button", { class: "btn-small" }, ["Save"]);
+    let busy = false;
+    save.onclick = async () => {
+        if (busy) return;
+        const token = input.value.trim();
+        if (!token) { errEl.textContent = "Paste the token first."; return; }
+        busy = true;
+        save.disabled = true;
+        errEl.textContent = "";
+        const { status, body } = await mcpPost("/broker/search/token", { token });
+        input.value = "";
+        busy = false;
+        save.disabled = false;
+        const redirect = mgmtStatusRedirect(view, status, landing);
+        if (redirect) return redirect();
+        if (status !== 200 || !body.ok) {
+            errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+            return;
+        }
+        searchFlash = { where: "token",
+                        text: searchSavedText("The token is stored.", body.result) };
+        rerenderView(view);
+    };
+    input.onkeydown = (ev) => { if (ev.key === "Enter") save.onclick(); };
+    const row = el("div", { class: "mgmt-row mgmt-infra-row mgmt-settings-row" }, [
+        el("span", { class: a.credential === "set" ? "state-running" : "state-stopped" },
+           [SEARCH_CREDENTIAL_TEXT[a.credential] || String(a.credential)]),
+        input, save,
+    ]);
+    if (a.credential !== "absent") {
+        const remove = el("button", { class: "btn-small" }, ["Remove"]);
+        remove.onclick = () => mcpConfirmDialog(view, {
+            title: "Remove the search service's sign-in",
+            text: "The stored token is deleted from this machine and from the running "
+                + "service. Searches cannot start until a token is saved again.",
+            confirmLabel: "Remove",
+            path: "/broker/search/token-clear",
+            payload: {},
+            onOk: (body) => {
+                searchFlash = { where: "token",
+                                text: searchSavedText("The sign-in is removed.", body.result) };
+            },
+        });
+        row.appendChild(remove);
+    }
+    row.appendChild(errEl);
+    return el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Sign-in"]),
+        row,
+        searchFlashEl("token", flash),
+        el("div", { class: "mgmt-settings-hint" }, [SEARCH_TOKEN_HINT]),
+    ]);
+}
+
+// One labelled control of the searcher form, captioned like the model picker.
+function searchCell(caption, control) {
+    return el("div", { class: "model-cell" }, [
+        el("span", { class: "model-cap" }, [caption]), control,
+    ]);
+}
+
+// Searcher: the one searcher's name, model and effort, searches at once, and
+// the contact address, saved together (the broker replaces the whole file).
+function searchSearcherSection(view, cfg, cfgErr, flash) {
+    const landing = view.__rsRender || renderSearchInto;
+    const wrap = el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Searcher"]),
+    ]);
+    if (!cfg) {
+        wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row" }, [
+            cfgErr ? el("span", { class: "mgmt-reviewer-err" }, [cfgErr])
+                   : el("span", { class: "type-badge" }, ["unavailable"]),
+        ]));
+        return wrap;
+    }
+    const cur = cfg.settings || cfg.defaults || {};
+    const s = cur.searcher || {};
+    const name = el("input", { type: "text", class: "search-input", spellcheck: "false" });
+    name.value = s.name || "";
+    const picker = modelPicker({
+        models: cfg.models || [], efforts: cfg.efforts || [],
+        defaults: { search: { model: s.model || "", effort: s.effort || "" } },
+    }, "search", "", "", {});
+    const max = Number.isSafeInteger(cfg.max_at_once) ? cfg.max_at_once : 0;
+    const atOnce = el("input", { type: "number", class: "search-input search-input-num",
+                                 min: "1", max: String(max), step: "1" });
+    atOnce.value = s.at_once !== undefined && s.at_once !== null ? String(s.at_once) : "";
+    const contact = el("input", {
+        type: "email", class: "search-input search-input-wide", spellcheck: "false",
+        placeholder: cfg.generic_contact ? "empty: " + cfg.generic_contact : "",
+    });
+    contact.value = cur.contact || "";
+    // A damaged settings file: the broker's text (the form shows the defaults,
+    // and Save replaces the file).
+    const errEl = el("span", { class: "mgmt-reviewer-err" }, [cfg.error || ""]);
+    const save = el("button", { class: "btn-small" }, ["Save"]);
+    let busy = false;
+    save.onclick = async () => {
+        if (busy) return;
+        const raw = atOnce.value.trim();
+        const n = /^[0-9]+$/.test(raw) ? Number(raw) : NaN;
+        if (!Number.isSafeInteger(n) || n < 1 || (max && n > max)) {
+            errEl.textContent = `Searches at once is a whole number from 1 to ${max}.`;
+            return;
+        }
+        const v = picker.value();
+        busy = true;
+        save.disabled = true;
+        errEl.textContent = "";
+        const { status, body } = await mcpPost("/broker/search/settings", {
+            name: name.value.trim(), model: v.model, effort: v.effort,
+            at_once: n, contact: contact.value.trim(),
+        });
+        busy = false;
+        save.disabled = false;
+        const redirect = mgmtStatusRedirect(view, status, landing);
+        if (redirect) return redirect();
+        if (status !== 200 || !body.ok) {
+            // The broker answered and refused: its message beside the form.
+            errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+            return;
+        }
+        searchFlash = { where: "searcher", text: searchSavedText("Saved.", body.result) };
+        rerenderView(view);
+    };
+    wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row search-form" }, [
+        searchCell("name", name),
+        picker.row,
+        searchCell("searches at once", atOnce),
+        searchCell("contact address", contact),
+        save,
+        errEl,
+    ]));
+    const saved = searchFlashEl("searcher", flash);
+    if (saved) wrap.appendChild(saved);
+    wrap.appendChild(el("div", { class: "mgmt-settings-hint" }, [
+        "Agents name the searcher when they submit a question; with one searcher "
+        + "they can leave it out. More searches than this wait their turn. "
+        + SEARCH_CONTACT_HINT]));
+    return wrap;
+}
+
 // True when dotted-number version a is older than b ("1.25.1" < "28.2.0").
 // Display only: the broker decides for real and refuses when it disagrees.
 function devVersionOlder(a, b) {
@@ -10065,20 +10455,22 @@ function swTarget(verb, agent) {
     if (verb === "rebuild") return "fleet";
     if (verb === "mcp_gateway_start") return "mcp-gateway";
     if (verb === "aldine_on") return "aldine";
+    if (verb === "search_on") return "search";
     return verb;
 }
 
 function swTargetName(target) {
     if (target.startsWith("agent:")) return target.slice("agent:".length) + " agent";
     return { editor: "editor", reader: "reader", node: "node", fleet: "image fleet",
-             "mcp-gateway": "MCP gateway", aldine: "Aldine" }[target] || target;
+             "mcp-gateway": "MCP gateway", aldine: "Aldine",
+             search: "search service" }[target] || target;
 }
 
 function swLabel(entry) {
     if (entry.queued) return "queued…";
     if (entry.verb === "rebuild") return "rebuilding the image fleet…";
     if (entry.verb === "mcp_gateway_start") return "starting…";
-    if (entry.verb === "aldine_on") return "turning on…";
+    if (entry.verb === "aldine_on" || entry.verb === "search_on") return "turning on…";
     return /_refresh$/.test(entry.verb) ? "refreshing…" : "pulling…";
 }
 
@@ -10105,7 +10497,7 @@ function swSetQueued(target, opId, queued) {
 // An in-flight row also gets one "Show progress" button (never disabled: it
 // only opens the box again), and loses it once the target is no longer in
 // flight; the button is looked up before it is added, so repaints never stack
-// it. The Aldine row puts it with its other buttons; a dist row and the fleet
+// it. The Aldine and Search bars put it with their other buttons; a dist row and the fleet
 // line, whose action cell has no room for a third button, below or beside the
 // status (style.css).
 function paintSoftwareLabels() {
@@ -10123,7 +10515,7 @@ function paintSoftwareLabels() {
                 title: "Open this action's progress box again",
             }, ["Show progress"]);
             b.onclick = () => softwareReopen(b);
-            const act = target === "aldine" ? row.querySelector(".sw-act") : null;
+            const act = SW_PAGE_TARGETS[target] ? row.querySelector(".sw-act") : null;
             if (act) act.prepend(b); else row.appendChild(b);
         } else if (!entry && progressBtn) {
             progressBtn.remove();
@@ -10165,10 +10557,17 @@ function softwareView() {
     return hostBody();
 }
 
-// The Aldine tab's body, when it is on screen (its Aldine row is the one
-// build-lane target outside Host → Software).
-function aldineView() {
-    if (state.hostPage !== "services" || servicesActiveTab !== "aldine") return null;
+// The build-lane targets whose bar sits on a Services tab of their own (the
+// tab key is the target) rather than on Host → Software, with that tab's
+// renderer: where a finished Turn on re-renders and where its box lands.
+const SW_PAGE_TARGETS = {
+    aldine: (view) => renderAldineInto(view),
+    search: (view) => renderSearchInto(view),
+};
+
+// The tab body of such a target, when that tab is on screen.
+function swPageView(target) {
+    if (state.hostPage !== "services" || servicesActiveTab !== target) return null;
     return hostBody();
 }
 
@@ -10189,6 +10588,7 @@ function softwareTitle(verb, target) {
     if (verb === "rebuild") return "Rebuilding the image fleet";
     if (verb === "mcp_gateway_start") return MCP_GATEWAY_START_TITLE;
     if (verb === "aldine_on") return ALDINE_ON_TITLE;
+    if (verb === "search_on") return SEARCH_ON_TITLE;
     return (/_refresh$/.test(verb) ? "Refreshing " : "Pulling ") + swTargetName(target);
 }
 
@@ -10206,6 +10606,11 @@ function softwareNoticeText(entry, target, outcome) {
     if (entry.verb === "aldine_on") {
         if (outcome.interrupted) return "Turning Aldine on was interrupted";
         return outcome.ok ? "Aldine is on" : "Aldine could not be turned on";
+    }
+    if (entry.verb === "search_on") {
+        if (outcome.interrupted) return "Turning the search service on was interrupted";
+        return outcome.ok ? "The search service is on"
+                          : "The search service could not be turned on";
     }
     if (outcome.interrupted) return `${name}: the ${what} was interrupted`;
     return outcome.ok ? `${name} ${what === "refresh" ? "refreshed" : "pulled"}`
@@ -10225,10 +10630,10 @@ function softwareFinish(target, opId, outcome, background) {
     if (!background) return;
     showOpNotice(softwareNoticeText(entry, target, outcome), outcome.ok,
                  () => softwareReplay(opId, softwareTitle(entry.verb, target)));
-    const aldine = target === "aldine";
-    const view = aldine ? aldineView() : softwareView();
+    const onPage = !!SW_PAGE_TARGETS[target];
+    const view = onPage ? swPageView(target) : softwareView();
     if (view && !document.querySelector(".modal-backdrop") && !mgmtViewHoldsInput(view)) {
-        if (aldine) rerenderView(view); else renderSoftwareInto(view);
+        if (onPage) rerenderView(view); else renderSoftwareInto(view);
     }
 }
 
@@ -10348,8 +10753,8 @@ function softwareReopen(btn) {
         paintSoftwareLabels();
         return;
     }
-    const landing = target === "aldine" ? (view.__rsRender || renderAldineInto)
-                                        : renderSoftwareInto;
+    const landing = SW_PAGE_TARGETS[target] ? (view.__rsRender || SW_PAGE_TARGETS[target])
+                                            : renderSoftwareInto;
     const title = softwareTitle(entry.verb, target);
     const backdrop = el("div", { class: "modal-backdrop" });
     const card = el("div", { class: "card sw-build-card" }, [el("h2", {}, [title])]);

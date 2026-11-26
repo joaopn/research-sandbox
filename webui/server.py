@@ -992,6 +992,71 @@ async def broker_aldine_session_handler(request: web.Request) -> web.Response:
     return response
 
 
+# --- the search service (Services → Search) ----------------------------------
+# Turn on is the build-lane verb `search_on` (POST /broker/software/build, in
+# _BUILD_VERBS); everything else is an inline relay. Reads are session-gated;
+# writes are origin-checked too, and their fields are HAND-PICKED here — the
+# fourth leg of the request-field ↔ SEARCH_*_WEBUI_FIELDS ↔ app.js payload
+# lockstep. The token is a secret: it travels in this request's body to the
+# broker and nowhere else (no log line, no reply carries it).
+_SEARCH_SETTINGS_FIELDS = ("name", "model", "effort", "at_once", "contact")
+
+
+async def _search_body(request: web.Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
+async def broker_search_status_handler(request: web.Request) -> web.Response:
+    """GET /broker/search — on/off, the container's state, the gateway entry,
+    whether a sign-in is stored (never its value), the searches by state."""
+    status, body = await _relay(request, "search_status")
+    return web.json_response(body, status=status)
+
+
+async def broker_search_settings_handler(request: web.Request) -> web.Response:
+    """GET /broker/search/settings — the searcher (or the defaults), the model
+    choices and the bounds the page offers."""
+    status, body = await _relay(request, "search_settings")
+    return web.json_response(body, status=status)
+
+
+async def broker_search_settings_set_handler(request: web.Request) -> web.Response:
+    """POST /broker/search/settings {name, model, effort, at_once, contact} —
+    save the searcher and the contact address (all five; saving replaces the
+    file). An absent key is sent as absent, so the broker refuses it cleanly."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _search_body(request)
+    args = {k: body[k] for k in _SEARCH_SETTINGS_FIELDS if k in body}
+    status, reply = await _relay(request, "search_settings_set", args)
+    return web.json_response(reply, status=status)
+
+
+async def broker_search_token_handler(request: web.Request) -> web.Response:
+    """POST /broker/search/token {token} — store the service's long-lived
+    sign-in. The answer says only that one is stored."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _search_body(request)
+    args = {"token": body["token"]} if "token" in body else {}
+    status, reply = await _relay(request, "search_token_set", args)
+    return web.json_response(reply, status=status)
+
+
+def _search_plain_post(verb: str):
+    """A POST that carries no field (token-clear, off, clear)."""
+    async def handler(request: web.Request) -> web.Response:
+        if not origin_ok(request):
+            return web.Response(status=403, text="origin rejected")
+        status, reply = await _relay(request, verb)
+        return web.json_response(reply, status=status)
+    return handler
+
+
 def _aldine_tab_listed(project: str, path: Path | None = None) -> bool:
     """Whether `project` gets the Aldine tab by the host-written tab record:
     the record says Aldine is on AND lists the project. Anything else — no
@@ -1109,7 +1174,8 @@ def _mcp_run_action_handler(action: str):
 # child-side — no client-supplied version crosses).
 _BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "reader_pull", "node_pull",
                           "agent_refresh", "editor_refresh", "reader_refresh",
-                          "rebuild", "mcp_gateway_start", "aldine_on"})
+                          "rebuild", "mcp_gateway_start", "aldine_on",
+                          "search_on"})
 
 
 async def broker_build_handler(request: web.Request) -> web.Response:
@@ -4756,6 +4822,13 @@ def main() -> None:
     app.router.add_get("/broker/aldine", broker_aldine_status_handler)
     app.router.add_post("/broker/aldine/off", broker_aldine_off_handler)
     app.router.add_post("/broker/aldine/session", broker_aldine_session_handler)
+    app.router.add_get("/broker/search", broker_search_status_handler)
+    app.router.add_get("/broker/search/settings", broker_search_settings_handler)
+    app.router.add_post("/broker/search/settings", broker_search_settings_set_handler)
+    app.router.add_post("/broker/search/token", broker_search_token_handler)
+    app.router.add_post("/broker/search/token-clear", _search_plain_post("search_token_clear"))
+    app.router.add_post("/broker/search/off", _search_plain_post("search_off"))
+    app.router.add_post("/broker/search/clear", _search_plain_post("search_clear"))
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
