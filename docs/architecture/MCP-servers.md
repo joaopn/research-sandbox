@@ -45,7 +45,7 @@ flowchart LR
 
 ## Servers RS runs from a package
 
-Instead of an image, the operator can give a package: the registry (npm or PyPI), the package name, one exact version (npm `1.2.3`, PyPI `1.2.3`; never a range, a tag such as `latest` or a wildcard), the command the package installs, and optionally its arguments. Settings, secret headers, destinations and the data folder are as for an image server; there is no port or path, because RS serves the package itself. From the host: `research mcp server add NAME --package npm:NAME@VERSION | pypi:NAME==VERSION --command CMD [--arg A]...`.
+Instead of an image, the operator can give a package: the registry (npm or PyPI), the package name, one exact version (npm `1.2.3`, PyPI `1.2.3`; never a range, a tag such as `latest` or a wildcard), the command the package installs, and optionally its arguments. Settings, secret headers, destinations and the data folder are as for an image server; there is no port or path, because RS serves the package itself. On the page, Add server → a server RS runs → comes from a package; in Edit the registry and the package are shown but cannot be changed, and a new version is installed again. From the host: `research mcp server add NAME --package npm:NAME@VERSION | pypi:NAME==VERSION --command CMD [--arg A]...`.
 
 ```mermaid
 flowchart LR

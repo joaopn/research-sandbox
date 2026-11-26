@@ -913,10 +913,11 @@ _MCP_SERVER_ACTIONS = {
 # app.js payload lockstep; setting and header VALUES only pass through.
 _MCP_RUN_ACTIONS = {
     "add": ("mcp_run_add", ("name", "image", "args", "port", "path", "data",
-                            "settings", "headers", "destinations", "description")),
+                            "settings", "headers", "destinations", "description",
+                            "registry", "package", "version", "command")),
     "edit": ("mcp_run_edit", ("name", "description", "args", "port", "path", "data",
                               "settings_set", "settings_remove", "headers_set",
-                              "headers_remove", "destinations")),
+                              "headers_remove", "destinations", "version", "command")),
     "start": ("mcp_server_start", ("name",)),
     "restart": ("mcp_server_restart", ("name",)),
     "update": ("mcp_run_update", ("name",)),

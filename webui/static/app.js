@@ -2913,7 +2913,7 @@ function mcpServerDialog(view, existing) {
     return backdrop;
 }
 
-// ---- servers RS runs (a container image RS starts beside the gateway) ------
+// ---- servers RS runs (an image, or a package RS installs, started beside the gateway)
 // Add, Edit, Start, Restart and Update run in the background on the host and
 // show their log in the same box as the gateway's Start; Stop, Logs and Remove
 // answer at once. A secret setting's value, like a secret header's, is never
@@ -2933,6 +2933,10 @@ const MCP_RUN_OP_TITLE = {
     restart: "Restarting the MCP server ",
     update: "Updating the MCP server ",
 };
+// A package server's Update installs its package again.
+const MCP_RUN_PACKAGE_UPDATE_TITLE = "Installing the package again for the MCP server ";
+// How a package server's registry is shown.
+const MCP_RUN_REGISTRY_TEXT = { npm: "npm", pypi: "PyPI" };
 const MCP_RUN_DEST_HINT = "One host:port per line, on your network or this machine, "
     + "for example db.lab.example:5432. Without any, the server reaches only the "
     + "internet, on the web ports (80 and 443).";
@@ -2969,8 +2973,11 @@ function mcpShortDigest(digest) {
 
 // The Add payload of a server RS runs, in the broker's field shapes.
 function mcpRunAddPayload(f) {
-    const payload = { name: f.name.trim(), image: f.image.trim(),
-                      port: mcpPortValue(f.port), path: f.path.trim() || "/mcp" };
+    const payload = f.source === "package"
+        ? { name: f.name.trim(), registry: f.registry, package: f.package.trim(),
+            version: f.version.trim(), command: f.command.trim() }
+        : { name: f.name.trim(), image: f.image.trim(),
+            port: mcpPortValue(f.port), path: f.path.trim() || "/mcp" };
     if (f.description.trim()) payload.description = f.description.trim();
     const args = mcpLines(f.args, true);
     if (args.length) payload.args = args;
@@ -2990,10 +2997,6 @@ function mcpRunAddPayload(f) {
     return payload;
 }
 
-// The Edit payload: only what changed. A saved setting is sent when its value
-// was typed (a secret) or changed (a plain one), or its secret tick changed;
-// named for removal only when its remove box is ticked. Headers as for an
-// address server.
 // The name of a saved SECRET setting whose secret tick was taken off while its
 // value field was left empty (a secret is never refilled, so an empty field
 // would silently replace the value with ""), or null. Edit refuses in place.
@@ -3008,6 +3011,10 @@ function mcpRunUnsecretEmpty(existing, f) {
     return null;
 }
 
+// The Edit payload: only what changed. A saved setting is sent when its value
+// was typed (a secret) or changed (a plain one), or its secret tick changed;
+// named for removal only when its remove box is ticked. Headers as for an
+// address server.
 function mcpRunEditPayload(existing, f) {
     const run = existing.run || {};
     const payload = { name: existing.name };
@@ -3017,10 +3024,19 @@ function mcpRunEditPayload(existing, f) {
     }
     const args = mcpLines(f.args, true);
     if (!same(args, run.args || [])) payload.args = args;
-    const port = mcpPortValue(f.port);
-    if (port !== run.port) payload.port = port;
-    const path = f.path.trim() || "/mcp";
-    if (path !== run.path) payload.path = path;
+    if (run.source === "package") {
+        // The registry and the package cannot be changed; a new version is
+        // installed again by the broker.
+        const version = f.version.trim();
+        if (version !== run.version) payload.version = version;
+        const command = f.command.trim();
+        if (command !== run.command) payload.command = command;
+    } else {
+        const port = mcpPortValue(f.port);
+        if (port !== run.port) payload.port = port;
+        const path = f.path.trim() || "/mcp";
+        if (path !== run.path) payload.path = path;
+    }
     const data = f.data.trim();
     if (data !== (run.data || "")) payload.data = data;
     const dests = mcpLines(f.destinations, false);
@@ -3067,10 +3083,13 @@ async function mcpRunTail(view, opId, title, backdrop, card) {
                            () => rerenderView(view), view.__rsRender || renderMcpInto);
 }
 
-// The Add / Edit dialog of a server RS runs. `existing` is its list row, or null.
-function mcpRunDialog(view, existing) {
+// The Add / Edit dialog of a server RS runs. `existing` is its list row, or
+// null; `source` ("image" or "package") picks the Add form (an existing
+// server keeps its own).
+function mcpRunDialog(view, existing, source) {
     if (document.querySelector(".modal-backdrop")) return null;
     const run = (existing && existing.run) || {};
+    const isPackage = existing ? run.source === "package" : source === "package";
     const backdrop = el("div", { class: "modal-backdrop" });
     const errEl = el("div", { class: "error" });
     const text = (cls, placeholder) => el("input", { type: "text", autocomplete: "off",
@@ -3078,6 +3097,14 @@ function mcpRunDialog(view, existing) {
     const nameI = text("mcp-run-name", "zotero");
     const descI = text("mcp-run-desc", "what this server is for");
     const imageI = text("mcp-run-image", "ghcr.io/owner/server:1.2");
+    const registryI = el("select", { class: "mcp-run-registry" }, [
+        el("option", { value: "npm" }, [MCP_RUN_REGISTRY_TEXT.npm]),
+        el("option", { value: "pypi" }, [MCP_RUN_REGISTRY_TEXT.pypi]),
+    ]);
+    registryI.value = "npm";
+    const packageI = text("mcp-run-package", "@scope/server or mcp-server-fetch");
+    const versionI = text("mcp-run-version", "1.2.3");
+    const commandI = text("mcp-run-command", "mcp-server-fetch");
     const argsI = el("textarea", { class: "mcp-run-args", rows: "3",
                                    placeholder: "one argument per line (optional)" });
     const portI = text("mcp-run-port", "8000");
@@ -3089,6 +3116,12 @@ function mcpRunDialog(view, existing) {
     if (existing) {
         nameI.value = existing.name; nameI.disabled = true;
         imageI.value = run.image || ""; imageI.disabled = true;
+        if (isPackage) {
+            registryI.value = run.registry || ""; registryI.disabled = true;
+            packageI.value = run.package || ""; packageI.disabled = true;
+            versionI.value = run.version || "";
+            commandI.value = run.command || "";
+        }
         descI.value = existing.description || "";
         argsI.value = (run.args || []).join("\n");
         portI.value = run.port === undefined ? "" : String(run.port);
@@ -3163,10 +3196,28 @@ function mcpRunDialog(view, existing) {
         };
         kindField = el("div", { class: "field" }, [el("label", {}, ["Kind"]), kindI]);
     }
+    // Add only: where the server comes from. The other choice swaps the form.
+    let sourceField = null;
+    if (!existing) {
+        const sourceI = el("select", { class: "mcp-run-source" }, [
+            el("option", { value: "image" }, ["An image"]),
+            el("option", { value: "package" }, ["A package"]),
+        ]);
+        sourceI.value = isPackage ? "package" : "image";
+        sourceI.onchange = () => {
+            if (sourceI.value === (isPackage ? "package" : "image")) return;
+            backdrop.remove();
+            mcpRunDialog(view, null, sourceI.value);
+        };
+        sourceField = el("div", { class: "field" }, [el("label", {}, ["Comes from"]), sourceI]);
+    }
     const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
     cancel.onclick = () => backdrop.remove();
     const go = el("button", { class: "btn" }, [existing ? "Save" : "Add server"]);
     const read = () => ({
+        source: isPackage ? "package" : "image",
+        registry: registryI.value, package: packageI.value, version: versionI.value,
+        command: commandI.value,
         name: nameI.value, description: descI.value, image: imageI.value,
         args: argsI.value, port: portI.value, path: pathI.value, data: dataI.value,
         destinations: destI.value,
@@ -3197,15 +3248,23 @@ function mcpRunDialog(view, existing) {
             errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
             return;
         }
-        await mcpRunTail(view, body.op_id, MCP_RUN_OP_TITLE[action] + payload.name,
-                         backdrop, card);
+        const title = MCP_RUN_OP_TITLE[action] + payload.name
+            + (existing && payload.version
+                ? " and installing " + run.package + " " + payload.version : "");
+        await mcpRunTail(view, body.op_id, title, backdrop, card);
     };
     const field = (label, input) => el("div", { class: "field" }, [el("label", {}, [label]), input]);
-    for (const c of [
-        el("h2", {}, [existing ? "Edit MCP server" : "Add an MCP server"]),
-        kindField,
-        field("Name", nameI),
-        field("Description", descI),
+    const sourceFields = isPackage ? [
+        field("Registry", registryI),
+        field("Package", packageI),
+        field("Version", versionI),
+        el("div", { class: "hint" }, [
+            "One exact version, as in 1.2.3. It is installed once, without the "
+            + "server's settings; Update installs it again."]),
+        field("Command", commandI),
+        el("div", { class: "hint" }, ["The program the package installs."]),
+        field("Arguments", argsI),
+    ] : [
         field("Image", imageI),
         el("div", { class: "hint" }, [
             "A container image reference. RS fetches it once and keeps running that "
@@ -3215,6 +3274,14 @@ function mcpRunDialog(view, existing) {
         field("Path", pathI),
         el("div", { class: "hint" }, [
             "The port and path the server answers MCP on inside its container."]),
+    ];
+    for (const c of [
+        el("h2", {}, [existing ? "Edit MCP server" : "Add an MCP server"]),
+        kindField,
+        sourceField,
+        field("Name", nameI),
+        field("Description", descI),
+        ...sourceFields,
         field("Data folder", dataI),
         el("div", { class: "hint" }, [
             "A folder inside the server kept across restarts and updates (optional)."]),
@@ -3246,7 +3313,7 @@ function mcpRunDialog(view, existing) {
 // Start / Restart / Update of a run server's row: a background action tailed
 // in the box. A session that ended lands on the sign-in; every other failure
 // is a line on this row, never the page-wide outage card.
-async function mcpRunRowOp(view, name, action, btn, cell) {
+async function mcpRunRowOp(view, name, action, btn, cell, title) {
     if (document.querySelector(".modal-backdrop")) return;
     btn.disabled = true;
     cell.className = "mcp-test";
@@ -3259,7 +3326,7 @@ async function mcpRunRowOp(view, name, action, btn, cell) {
         cell.textContent = status === 200 && body.error ? mgmtErrText(body) : MCP_TEST_RETRY_TEXT;
         return;
     }
-    await mcpRunTail(view, body.op_id, MCP_RUN_OP_TITLE[action] + name, null, null);
+    await mcpRunTail(view, body.op_id, (title || MCP_RUN_OP_TITLE[action]) + name, null, null);
 }
 
 // Stop: answers at once; the page re-reads itself on success.
@@ -3336,7 +3403,9 @@ function mcpRunRow(view, srv, wiredNames, cell) {
         }
         for (const [action, label] of [["restart", "Restart"], ["update", "Update"]]) {
             const b = el("button", { class: "btn-small" }, [label]);
-            b.onclick = () => mcpRunRowOp(view, srv.name, action, b, cell);
+            const title = action === "update" && run.source === "package"
+                ? MCP_RUN_PACKAGE_UPDATE_TITLE : null;
+            b.onclick = () => mcpRunRowOp(view, srv.name, action, b, cell, title);
             actions.push(b);
         }
         const logs = el("button", { class: "btn-small" }, ["Logs"]);
@@ -3360,8 +3429,14 @@ function mcpRunRow(view, srv, wiredNames, cell) {
     }
     const meta = [];
     if (run) {
-        const digest = mcpShortDigest(run.digest);
-        meta.push("Image: " + run.image + (digest ? " (" + digest + ")" : ""));
+        if (run.source === "package") {
+            meta.push("Package: " + (MCP_RUN_REGISTRY_TEXT[run.registry] || run.registry)
+                      + " " + run.package + " " + run.version);
+            meta.push("Command: " + run.command);
+        } else {
+            const digest = mcpShortDigest(run.digest);
+            meta.push("Image: " + run.image + (digest ? " (" + digest + ")" : ""));
+        }
         if (srv.description) meta.unshift(srv.description);
         const settings = (run.settings || []).map((s) => (s.secret
             ? s.name + " (secret)" : s.name + "=" + (s.value || "")));
