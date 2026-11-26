@@ -569,6 +569,17 @@ class Searches:
         # The searches that ended, newest first, one line each: they outlive
         # the caller's collect and the operator's clear (which remove the
         # search and its files, not this line).
+        # Each line also keeps its search's work view as it ended (the dict
+        # view() returned at that moment), opened from the page after the search
+        # was collected too; the list read never carries it. What one costs at
+        # most: the question (QUESTION_MAX_CHARS, 32k characters), the reason
+        # (the agent's words are AGENT_TEXT_MAX_CHARS of it, the rest is RS's
+        # own sentence) and VIEW_TAIL_ENTRIES entries of at most 3 x
+        # TRACE_NAME_MAX_CHARS + 2 x TRACE_TARGET_MAX_CHARS (a tool call) or
+        # VIEW_TEXT_TAIL_CHARS (a text), about 7k characters for the ten: some
+        # 42k characters, 168 KB in memory when every one is a 4-byte character.
+        # RECENT_MAX of them stay under 17 MB at worst; real questions are a
+        # paragraph, so a full list is a few MB at most.
         self.recent: collections.deque = collections.deque()
 
     # --- the caller's three tools ---
@@ -704,7 +715,7 @@ class Searches:
             recs = sorted((dict(r) for r in self.table.values() if r["state"] not in ENDED),
                           key=lambda r: r["submitted_at"])
             kept = self._trim_recent()
-            recent = [dict(e) for e in self.recent]
+            recent = [{k: v for k, v in e.items() if k != "view"} for e in self.recent]
         return {"searches": [
             {"id": r["id"], "project": r["project"], "consumer": r["consumer"],
              "question": r["question"][:LIST_QUESTION_MAX_CHARS], "searcher": r["searcher"],
@@ -720,10 +731,12 @@ class Searches:
             self.recent.pop()
         return kept
 
-    def _record_end(self, rec: dict) -> None:
+    def _record_end(self, rec: dict, tools: list[dict]) -> None:
         """Under the lock, once per search, when it ends (any way): its line
-        in the recent list."""
+        in the recent list, with its work view as it ended (`tools`: its
+        trace's tool calls, read outside the lock before it ended)."""
         self.recent.appendleft({
+            "id": rec["id"], "view": self._build_view(rec, tools),
             "project": rec["project"], "consumer": rec["consumer"],
             "question": rec["question"][:LIST_QUESTION_MAX_CHARS],
             "searcher": rec["searcher"], "state": rec["state"],
@@ -735,21 +748,37 @@ class Searches:
         self._trim_recent()
 
     def view(self, sid: str) -> dict | None:
-        """The operator's read-only view of one search still in the table
-        (ended and not collected too): the tool calls of its trace and the
-        agent's text blocks, oldest first: the newest VIEW_TAIL_ENTRIES, a
-        text cut to its end. None when there is no such search."""
+        """The operator's read-only view of one search: live while it is in
+        the table (ended and not collected too), else as it ended, from its
+        recent line. None when it is in neither."""
         with self.lock:
             rec = self.table.get(sid)
             rec = dict(rec) if rec is not None else None
-        if rec is None:
-            return None
+            if rec is None:
+                self._trim_recent()
+                for e in self.recent:
+                    if e["id"] == sid:
+                        return dict(e["view"])
+                return None
+        tools = self._trace_tools(sid) if rec["state"] != "queued" else []
+        return self._build_view(rec, tools)
+
+    @staticmethod
+    def _trace_tools(sid: str) -> list[dict]:
+        """Outside the lock: the tool calls of a search's trace (none when it
+        has no volume)."""
+        root = volume_root(SEARCH_PREFIX + sid)
+        return _trace_work(read_volume_file(root, OUT_DIR, TRACE_NAME, TRACE_MAX_BYTES)
+                           if root else None)
+
+    def _build_view(self, rec: dict, tools: list[dict]) -> dict:
+        """One search's view from its record and its trace's tool calls: the
+        tool calls and the agent's text blocks, oldest first: the newest
+        VIEW_TAIL_ENTRIES, a text cut to its end. No reads of the volume, so
+        it may run under the lock."""
         texts, dropped = rec["stream"].work_texts()
-        root = volume_root(SEARCH_PREFIX + sid) if rec["state"] != "queued" else None
-        tools = _trace_work(read_volume_file(root, OUT_DIR, TRACE_NAME, TRACE_MAX_BYTES)
-                            if root else None)
         work = sorted(tools + texts, key=lambda e: e["ts"])
-        out = {"id": sid, "state": rec["state"], "question": rec["question"],
+        out = {"id": rec["id"], "state": rec["state"], "question": rec["question"],
                "searcher": rec["searcher"], "tokens": rec["stream"].tokens(),
                **self._times(rec),
                "reason": rec["outcome"]["reason"] if rec["state"] in ENDED else None,
@@ -776,7 +805,7 @@ class Searches:
                 rec["state"] = "failed"
                 rec["finished_at"] = time.time()
                 rec["outcome"] = {"reason": STOPPED_QUEUED}
-                self._record_end(rec)
+                self._record_end(rec, [])           # never started: no volume, no work
                 self.lock.notify_all()
                 state = "failed"
             else:
@@ -830,13 +859,17 @@ class Searches:
                 self.lock.wait(QUEUE_RECHECK_S)
 
     def _finish(self, sid: str, state: str, outcome: dict) -> None:
+        # The trace is read before the search counts as ended: its container
+        # is gone, so the trace is final, and no collect can remove the
+        # volume yet.
+        tools = self._trace_tools(sid)
         with self.lock:
             rec = self.table.get(sid)
             if rec is not None:
                 rec["state"] = state
                 rec["finished_at"] = time.time()
                 rec["outcome"] = outcome
-                self._record_end(rec)
+                self._record_end(rec, tools)
             self.running -= 1
             self.lock.notify_all()
         log(f"search {sid} {state}: {outcome['reason']}")

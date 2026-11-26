@@ -9128,8 +9128,8 @@ function searchEndedAt(ts) {
 // The recent searches table: the searches that ended since the service
 // started, newest first, as the list read gave them (`kept` = how many the
 // service keeps; 0 = the list is off). Plain text only; the reason is the
-// Ended as cell's hover text.
-function searchRecentTable(list, kept) {
+// Ended as cell's hover text. A row opens the search's work box as it ended.
+function searchRecentTable(view, list, kept) {
     if (kept === 0) {
         return el("div", { class: "searchsvc-flash" },
                   ["The list of recent searches is off (recent searches kept: 0)."]);
@@ -9144,7 +9144,7 @@ function searchRecentTable(list, kept) {
         const reason = String(s.reason || "");
         const as = reason.includes(SEARCH_STOPPED_MARK) ? "stopped"
             : (SEARCH_RUN_STATE_TEXT[s.state] || String(s.state || ""));
-        return el("tr", {}, [
+        const tr = el("tr", { class: "searchsvc-run" }, [
             el("td", {}, [`${String(s.project || "")}/${String(s.consumer || "")}`]),
             el("td", { class: "searchsvc-q", title: q }, [q]),
             el("td", {}, [String(s.searcher || "")]),
@@ -9153,6 +9153,8 @@ function searchRecentTable(list, kept) {
             el("td", { class: "searchsvc-num" }, [searchClock(s.ran_s)]),
             el("td", { class: "searchsvc-num" }, [searchTokens(s.tokens)]),
         ]);
+        tr.onclick = () => searchWorkBox(view, s.id);
+        return tr;
     };
     return el("table", { class: "searchsvc-runs" }, [
         el("thead", {}, [el("tr", {}, head.map((h) => el("th", {}, [h])))]),
@@ -9218,7 +9220,7 @@ function searchRunsSection(view) {
         note.textContent = "";
         paint(Array.isArray(reply.result.searches) ? reply.result.searches : []);
         recentBody.replaceChildren(searchRecentTable(
-            Array.isArray(reply.result.recent) ? reply.result.recent : [],
+            view, Array.isArray(reply.result.recent) ? reply.result.recent : [],
             reply.result.recent_kept));
         return undefined;
     };

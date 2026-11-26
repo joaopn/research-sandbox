@@ -23865,6 +23865,7 @@ def search_list(deadline: float | None = None) -> dict:
     for raw in recent_items:
         s = _search_reply_dict(raw)
         recent.append({
+            "id": _search_reply_id(s.get("id")),
             "project": _search_reply_str(s.get("project"), _SEARCH_NAME_MAX),
             "consumer": _search_reply_str(s.get("consumer"), _SEARCH_NAME_MAX),
             "question": _search_reply_str(s.get("question"), _SEARCH_LIST_QUESTION_MAX),
@@ -23892,7 +23893,8 @@ def _search_work_entry(raw: Any) -> dict:
 
 def search_view(req: SearchIdRequest, deadline: float | None = None) -> dict:
     """The operator's read-only view of one search still in the service (an
-    ended one not collected yet too): its question, state, times, tokens,
+    ended one not collected yet too; one in the recent list as it ended,
+    also after it was collected): its question, state, times, tokens,
     the reason once it ended, and its work — the tool calls and the agent's
     text, oldest first: only the latest few (`truncated` when there was
     earlier work), a text cut to its end. Every string is text to show as it is."""
