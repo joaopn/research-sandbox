@@ -82,6 +82,18 @@ accept's conditions on a finding) exist only in a project whose record,
 /workspace/.orchestrator/project.json, says "subagents": true; anywhere else
 every verb behaves as it always has.
 
+A project whose record says "companion": true keeps a companion's memory:
+front.md's parts are "Standing preferences" (P-<n>, kept by the consolidation
+from the PI's own words), "In flight" and "Open threads", with no line of
+inquiry and no beliefs; the consolidation proposes no claims; open leaves out
+the knowledge and staged-claims blocks while they are empty; and README.md
+shows what waits for the PI only while a claim is staged, then what is
+running, the tasks (one line per folder under analyses/, linked to its
+README.md), where things stand, the logbook, and what is known only once
+something is accepted. Every verb works as it does in a researcher. A record
+that says both "companion": true and "subagents": true is refused by every
+verb.
+
 A fact (D-<n>, claim --fact) is a descriptive result about the data: an
 inventory line, a gap, a count. It needs a scope and evidence like a finding,
 but never the checks, in any project: the PI's accept is all it takes. Its
@@ -138,6 +150,11 @@ GUARD = "RS_MEMORY_CONSOLIDATING"
 STRICT_GUARD = "RS_MEMORY_REFEREEING"
 # The project record's key that turns the finding checks on.
 CHECKS_KEY = "subagents"
+# The project record's key that makes the agent a companion: one folder per
+# task, standing preferences on its front page instead of a line of inquiry
+# and beliefs, and claims only when the PI asks for one. Never set together
+# with CHECKS_KEY.
+COMPANION_KEY = "companion"
 # What a fresh process drops from the session's environment, as the
 # consolidation run does: the child is no part of the agent's session.
 SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "PI_SESSION_ID", "PI_SESSION_FILE")
@@ -185,15 +202,19 @@ DELTA_ITEM_KEYS = {"add": ("part", "text"), "edit": ("id", "text"),
                               "topics"),
                    "skills": ("name", "description", "body")}
 
-# The front page's parts: heading, id letter, and whether consolidation edits it.
-PARTS = (
+# The front page's parts: heading, id letter, and whether consolidation edits
+# it. Which set a project's page has follows its record (front_parts).
+RESEARCHER_PARTS = (
     ("inquiry", "Line of inquiry", "L", True),
     ("beliefs", "Beliefs", "B", True),
     ("inflight", "In flight", "I", False),
     ("threads", "Open threads", "T", True),
 )
-PART_BY_KEY = {k: (h, letter, c) for k, h, letter, c in PARTS}
-CONSOLIDATED_PARTS = tuple(k for k, _h, _l, c in PARTS if c)
+COMPANION_PARTS = (
+    ("preferences", "Standing preferences", "P", True),
+    ("inflight", "In flight", "I", False),
+    ("threads", "Open threads", "T", True),
+)
 
 RELATIONS = ("supersedes", "contradicts", "withdraws", "depends-on", "answers")
 # Claim prefixes: F a finding, Q an open question, R a retraction, D a fact
@@ -220,7 +241,6 @@ FRONT_MARK_RE = re.compile(r"<!-- rs-memory page=(\d+) next=(\d+) -->")
 # record at every write of the page, never held as items, and skipped when the
 # page is read back (its heading is no part's, and its lines are no items).
 FACTS_HEADING = "What we know about the data"
-ITEM_LINE_RE = re.compile(r"\A- \[([LBIT]-[1-9][0-9]*)\] (.*)\Z")
 
 
 class Refused(Exception):
@@ -284,8 +304,56 @@ def project_record() -> dict:
     return data
 
 
+def companion_on() -> bool:
+    """Whether this project's record makes the agent a companion; a record
+    that also turns the finding checks on is refused."""
+    rec = project_record()
+    companion = rec.get(COMPANION_KEY) is True
+    if companion and rec.get(CHECKS_KEY) is True:
+        raise Refused(f"the project's record {record_path()} says both \"{COMPANION_KEY}\": true "
+                      f"and \"{CHECKS_KEY}\": true, which cannot be set together: a companion "
+                      "has no finding checks, and a researcher-subagents project is no "
+                      "companion, so rs-memory cannot tell how this project's memory is kept. "
+                      "It does nothing in this project until one of the two is gone from the "
+                      "record; tell the PI")
+    return companion
+
+
+def refuse_both_kinds() -> None:
+    """Every verb's first step: a record that makes the project both a
+    companion and a researcher-subagents project refuses before anything is
+    written. A record that cannot be read is refused where a verb reads it,
+    as it always was."""
+    try:
+        project_record()
+    except Refused:
+        return
+    companion_on()
+
+
 def checks_on() -> bool:
+    companion_on()                      # refuses a record that sets both
     return project_record().get(CHECKS_KEY) is True
+
+
+def front_parts() -> tuple:
+    """The front page's parts in this project: (key, heading, id letter,
+    whether consolidation edits it), in page order."""
+    return COMPANION_PARTS if companion_on() else RESEARCHER_PARTS
+
+
+def part_by_key(parts: tuple) -> dict:
+    return {k: (h, letter, c) for k, h, letter, c in parts}
+
+
+def consolidated_parts(parts: tuple) -> tuple:
+    return tuple(k for k, _h, _l, c in parts if c)
+
+
+def item_line_re(parts: tuple) -> "re.Pattern":
+    """A front page item line, `- [<letter>-<n>] <text>`, for these parts' letters."""
+    letters = "".join(letter for _k, _h, letter, _c in parts)
+    return re.compile(r"\A- \[([" + letters + r"]-[1-9][0-9]*)\] (.*)\Z")
 
 
 def require_checks(what: str) -> None:
@@ -444,7 +512,7 @@ def new_since_mark() -> "list[tuple[int, Path]]":
 
 # ---------------------------------------------------------------- front page
 def empty_front() -> dict:
-    return {"page": 0, "next": 1, "parts": {k: [] for k, *_ in PARTS}}
+    return {"page": 0, "next": 1, "parts": {k: [] for k, *_ in front_parts()}}
 
 
 def read_front(p: "Path | None" = None) -> dict:
@@ -457,16 +525,18 @@ def read_front(p: "Path | None" = None) -> dict:
     if not m:
         raise Refused(f"{p} has no rs-memory header line; it was not written by "
                       "rs-memory. Move it aside and run the command again.")
+    parts = front_parts()
     front = {"page": int(m.group(1)), "next": int(m.group(2)),
-             "parts": {k: [] for k, *_ in PARTS}}
-    heading_to_key = {h: k for k, h, *_ in PARTS}
+             "parts": {k: [] for k, *_ in parts}}
+    heading_to_key = {h: k for k, h, *_ in parts}
+    item_re = item_line_re(parts)
     cur = None
     for line in text.split("\n"):
         if line.startswith("## "):
             # Any other heading, the facts section's included, holds no items.
             cur = heading_to_key.get(line[3:].strip())
             continue
-        im = ITEM_LINE_RE.match(line)
+        im = item_re.match(line)
         if im and cur:
             front["parts"][cur].append((im.group(1), im.group(2)))
     return front
@@ -477,7 +547,7 @@ def render_front(front: dict) -> str:
     record as it is now (absent when no fact is current)."""
     out = ["# Front page", "",
            f"<!-- rs-memory page={front['page']} next={front['next']} -->", ""]
-    for k, heading, _letter, _c in PARTS:
+    for k, heading, _letter, _c in front_parts():
         out.append(f"## {heading}")
         for ident, text in front["parts"][k]:
             out.append(f"- [{ident}] {text}")
@@ -498,7 +568,7 @@ def fact_lines(rec: "dict[str, dict]") -> "list[str]":
 
 
 def new_item_id(front: dict, part: str) -> str:
-    ident = f"{PART_BY_KEY[part][1]}-{front['next']}"
+    ident = f"{part_by_key(front_parts())[part][1]}-{front['next']}"
     front["next"] += 1
     return ident
 
@@ -1740,6 +1810,8 @@ PAGE_MARKER = "<!-- rs-memory: a page written from the researcher's record -->"
 PAGE_FOOTER = ("*This page is rebuilt by rs-memory from the researcher's record: "
                "an edit made in it is lost at the next change.*")
 FRONT_PAGE = "README.md"
+# A companion's task folders, one per task, each with its README.md.
+TASKS_DIR = "analyses"
 STAGING_DIR = "staging"
 RESULTS_DIR = "results"
 RESULTS_INDEX = "index.md"
@@ -2104,6 +2176,7 @@ class PageContext:
         self.st = standing(self.rec)
         self.staged = {i: parse_entry(p) for i, (w, p) in self.files.items() if w == "staged"}
         self.checks = checks_on()
+        self.companion = companion_on()
         # Who points at whom, for "superseded by" and the like.
         self.by: "dict[tuple[str, str], list[str]]" = {}
         for o, oe in self.rec.items():
@@ -2433,15 +2506,10 @@ def running_lines(page: Path, ctx: PageContext) -> "list[str]":
     return out
 
 
-def front_page(ctx: PageContext, w: PageWriter) -> str:
-    page = pages_root() / FRONT_PAGE
-    lines = ["# The research, for the PI", "",
-             "What the researcher has for you: the claims waiting for your decision (each "
-             "with its page in staging/), what is running, where the work stands, and what is "
-             "known (each accepted entry with its page in results/), and the logbook, the "
-             "story of the work (logbook/). The agent keeps its own memory in memory/, and "
-             "every page here is written from it.", "",
-             "## Waiting for you", ""]
+def waiting_lines(page: Path, ctx: PageContext) -> "list[str]":
+    """The front page's "Waiting for you": each staged claim and the words to
+    decide it."""
+    lines = ["## Waiting for you", ""]
     staged = sorted(ctx.staged, key=lambda i: (i[0], int(i[2:])))
     if not staged:
         lines.append("Nothing is waiting for you.")
@@ -2458,11 +2526,20 @@ def front_page(ctx: PageContext, w: PageWriter) -> str:
     if len(staged) > 1:
         lines += ["", f"Several at once: say `accept {' '.join(staged)}` (or name the ones "
                   "you accept), and `strike` with the ids and why for the others."]
-    lines += ["", "## Running", "",
-              "As the agent's last memory command saw it."]
+    return lines
+
+
+def running_block(page: Path, ctx: PageContext) -> "list[str]":
+    lines = ["", "## Running", "",
+             "As the agent's last memory command saw it."]
     running = running_lines(page, ctx)
     lines += [""] + (running or ["Nothing is running."])
-    lines += ["", "## Where things stand", ""]
+    return lines
+
+
+def standing_block(page: Path, ctx: PageContext, w: PageWriter) -> "list[str]":
+    """The front page's "Where things stand", from the agent's own front page."""
+    lines = ["", "## Where things stand", ""]
     try:
         front = read_front()
     except Refused as e:
@@ -2472,15 +2549,19 @@ def front_page(ctx: PageContext, w: PageWriter) -> str:
     if front is None or not any(front["parts"].values()):
         lines.append("The agent has not written its own front page yet.")
     else:
-        for k, heading, _letter, _c in PARTS:
+        for k, heading, _letter, _c in (COMPANION_PARTS if ctx.companion else RESEARCHER_PARTS):
             items = front["parts"][k]
             if items:
                 lines += [f"### {heading}", ""]
                 lines += [f"- {ctx.linkify(page, text)}" for _i, text in items]
                 lines.append("")
-    lines += [""] + logbook_front_lines(page)
-    lines += ["", "## What is known", ""]
-    g = knowledge_groups(ctx.rec, ctx.st)
+    return lines
+
+
+def known_block(page: Path, ctx: PageContext, g: dict) -> "list[str]":
+    """The front page's "What is known": the current findings and facts by
+    topic, the contested pairs, the open questions."""
+    lines = ["", "## What is known", ""]
     known = g["findings"] + g["facts"]
     if not known:
         lines.append("No current finding or fact has been accepted yet.")
@@ -2503,6 +2584,82 @@ def front_page(ctx: PageContext, w: PageWriter) -> str:
               or ["None."])
     lines += ["", "Everything accepted, with how it stands now: "
               + rel_link(page, pages_root() / RESULTS_DIR / RESULTS_INDEX, "results/index.md")]
+    return lines
+
+
+def task_lines(page: Path, w: PageWriter) -> "list[str]":
+    """A companion's "Tasks": one line per folder directly under analyses/, by
+    name, linked to its README.md when it has one. Links are never followed:
+    a link, a file or anything else that is not a folder is no task."""
+    lines = ["", "## Tasks", ""]
+    d = pages_root() / TASKS_DIR
+    names: "list[str]" = []
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        st = None
+    try:
+        if st is not None and not stat.S_ISDIR(st.st_mode):
+            w.problems.setdefault(str(d), f"the front page's \"Tasks\" lists no task: {d} "
+                                  "should be the folder of task folders, and it is not a "
+                                  "folder (a link or a file). rs-memory leaves it as it is; "
+                                  "tell the PI.")
+        elif st is not None:
+            for name in sorted(os.listdir(d)):
+                if stat.S_ISDIR(os.lstat(d / name).st_mode):
+                    names.append(name)
+    except OSError as e:
+        w.problems.setdefault(str(d), f"the front page's \"Tasks\" lists no task: {d} "
+                              f"cannot be read ({e.strerror or e}).")
+        names = []
+    if not names:
+        return lines + ["No task folders yet."]
+    for name in names:
+        readme = d / name / FRONT_PAGE
+        try:
+            has_readme = stat.S_ISREG(os.lstat(readme).st_mode)
+        except OSError:
+            has_readme = False
+        lines.append(f"- {rel_link(page, readme, name)}" if has_readme else f"- {md(name)}")
+    return lines
+
+
+def front_page(ctx: PageContext, w: PageWriter) -> str:
+    if ctx.companion:
+        return companion_front_page(ctx, w)
+    page = pages_root() / FRONT_PAGE
+    lines = ["# The research, for the PI", "",
+             "What the researcher has for you: the claims waiting for your decision (each "
+             "with its page in staging/), what is running, where the work stands, and what is "
+             "known (each accepted entry with its page in results/), and the logbook, the "
+             "story of the work (logbook/). The agent keeps its own memory in memory/, and "
+             "every page here is written from it.", ""]
+    lines += waiting_lines(page, ctx)
+    lines += running_block(page, ctx)
+    lines += standing_block(page, ctx, w)
+    lines += [""] + logbook_front_lines(page)
+    lines += known_block(page, ctx, knowledge_groups(ctx.rec, ctx.st))
+    return page_text(lines)
+
+
+def companion_front_page(ctx: PageContext, w: PageWriter) -> str:
+    """A companion's front page: what waits for the PI only when something
+    does, the task folders, and what is known only when something is."""
+    page = pages_root() / FRONT_PAGE
+    lines = ["# The work, for the PI", "",
+             "What the agent has for you: what is running, the tasks it worked on (each in "
+             "its folder under analyses/), where things stand, and the logbook, the story of "
+             "the work (logbook/). The agent keeps its own memory in memory/, and every page "
+             "here is written from it.", ""]
+    if ctx.staged:
+        lines += waiting_lines(page, ctx)
+    lines += running_block(page, ctx)
+    lines += task_lines(page, w)
+    lines += standing_block(page, ctx, w)
+    lines += [""] + logbook_front_lines(page)
+    g = knowledge_groups(ctx.rec, ctx.st)
+    if any(g[k] for k in ("findings", "facts", "contested", "questions")):
+        lines += known_block(page, ctx, g)
     return page_text(lines)
 
 
@@ -2585,8 +2742,13 @@ def open_text() -> str:
              if (d / "front.md").exists() else "# Front page\n(not written yet)"]
     if jobs_part:
         parts.append(jobs_part)
-    parts.append(knowledge_text())
-    parts.append(staged_text(checks_on()))
+    # A companion stages claims only when the PI asks for one: its knowledge
+    # and staged blocks show only when they hold something.
+    companion = companion_on()
+    if not companion or record_entries():
+        parts.append(knowledge_text())
+    if not companion or any(w == "staged" for w, _p in claim_files().values()):
+        parts.append(staged_text(checks_on()))
     since = entries_since_mark()
     if since:
         lines = ["## Journal since the last consolidation"]
@@ -3228,6 +3390,65 @@ inquiry, beliefs, threads. "kind" is finding, fact or question. Leave out
 what you do not use.
 """
 
+# A companion's brief: its parts, and no candidate claims (the agent stages a
+# claim only when the PI asks for one).
+COMPANION_BRIEF_HEAD = """\
+You are consolidating a companion agent's memory: an agent that works with the
+PI on one-off and mixed tasks. You run on your own, with no one to ask: read
+this brief, write one delta file, apply it, and stop.
+
+The front page below is what every new session of the agent reads first. Your
+job is to bring its durable parts up to date with the journal entries listed
+after it, by proposing itemised changes. You never rewrite the page: code
+merges your changes, and anything you do not mention stays as it is.
+
+Rules:
+- Parts you may change: "Standing preferences" (how the PI wants the work
+  done: wording, venues, where answers go, and the like), "Open threads"
+  (questions, leads and tasks not yet followed up). A standing preference
+  comes only from the PI's own words as the journal records them: never
+  invent one or infer it from what the agent did, and keep the PI's wording.
+  Never "In flight": the working session owns it. Never "What we know about
+  the data" either: it lists the facts the PI accepted, and code writes it
+  from the record.
+- Keep each item one line. Keep hedges as the journal states them; do not make
+  a tentative result sound settled.
+- Retire an item only when a journal entry shows it no longer holds or is done
+  (a preference the PI dropped or changed, a thread closed). Never leave a
+  part that has items empty.
+- A dead end worth remembering is an open thread ("X does not work because
+  Y"), not a deletion.
+- Propose no claims: this agent stages a claim only when the PI asks for one,
+  in the session. You may propose candidate skills (a procedure the journal
+  shows was needed and worked). Propose none when nothing qualifies; most runs
+  propose none. A skill name is lowercase letters, digits and single hyphens;
+  "earned-" is added in front of it.
+- Use no other rs-memory verb than consolidate. Do not change any other file.
+
+Write the delta as JSON to {delta} and then run:
+
+    rs-memory consolidate --apply {delta}
+
+If it refuses, read the message, fix the delta and apply again, with one
+exception: if it says the page moved on or the entries are already
+consolidated, stop there (another run covered them; never change "page" or
+"through" to get past it). The delta's shape:
+
+{{
+  "page": {page},
+  "through": "{through}",
+  "add": [{{"part": "preferences", "text": "..."}}],
+  "edit": [{{"id": "P-3", "text": "..."}}],
+  "retire": ["T-5"],
+  "skills": [{{"name": "...", "description": "...", "body": "..."}}]
+}}
+
+If the entries change nothing on the page, apply a delta with only "page"
+and "through": that records them as covered. "page" and "through" must stay
+exactly as written above. "part" is one of preferences, threads. Leave out
+what you do not use.
+"""
+
 
 def build_brief(delta_path: str) -> "tuple[str, int, str]":
     front = read_front()
@@ -3235,7 +3456,8 @@ def build_brief(delta_path: str) -> "tuple[str, int, str]":
     if not new_since_mark():
         raise Refused(NOTHING_NEW)
     through = f"J-{since[-1][0]}"
-    head = BRIEF_HEAD.format(delta=delta_path, page=front["page"], through=through)
+    head = (COMPANION_BRIEF_HEAD if companion_on() else BRIEF_HEAD).format(
+        delta=delta_path, page=front["page"], through=through)
     body = ["", "=" * 70, f"THE FRONT PAGE (page {front['page']})", "=" * 70, "",
             render_front(front), "", "=" * 70,
             f"JOURNAL ENTRIES SINCE THE LAST CONSOLIDATION (through {through})", "=" * 70, ""]
@@ -3305,6 +3527,12 @@ def apply_delta(path: Path) -> None:
             e.get("id") for e in _as_list(delta.get("edit"), "edit")]:
         if not isinstance(ident, str):
             raise Refused(f"delta: an item id is a string such as \"B-3\", not {ident!r}")
+    parts_def = front_parts()
+    consolidated = consolidated_parts(parts_def)
+    if parts_def is COMPANION_PARTS and _as_list(delta.get("claims"), "claims"):
+        raise Refused("delta: a companion's consolidation proposes no claims: the agent stages "
+                      "a claim only when the PI asks for one. Drop \"claims\" from the delta "
+                      "and apply it again")
     with Lock():
         front = read_front()
         if delta.get("page") != front["page"]:
@@ -3324,7 +3552,7 @@ def apply_delta(path: Path) -> None:
             text = single_line(e.get("text", "")) if isinstance(e, dict) else ""
             if ident not in index:
                 raise Refused(f"delta: edit names {ident!r}, which is not on the front page")
-            if index[ident] not in CONSOLIDATED_PARTS:
+            if index[ident] not in consolidated:
                 raise Refused(f"delta: {ident} is in In flight, which consolidation never changes")
             if not text:
                 raise Refused(f"delta: edit of {ident} has no text (retire it instead)")
@@ -3333,7 +3561,7 @@ def apply_delta(path: Path) -> None:
         for ident in _as_list(delta.get("retire"), "retire"):
             if ident not in index:
                 raise Refused(f"delta: retire names {ident!r}, which is not on the front page")
-            if index[ident] not in CONSOLIDATED_PARTS:
+            if index[ident] not in consolidated:
                 raise Refused(f"delta: {ident} is in In flight, which consolidation never changes")
             k = index[ident]
             parts[k] = [(i, t) for i, t in parts[k] if i != ident]
@@ -3349,14 +3577,14 @@ def apply_delta(path: Path) -> None:
         for e in _as_list(delta.get("add"), "add"):
             part = e.get("part") if isinstance(e, dict) else None
             text = single_line(e.get("text", "")) if isinstance(e, dict) else ""
-            if part not in CONSOLIDATED_PARTS:
-                raise Refused(f"delta: add to {part!r}: use one of {', '.join(CONSOLIDATED_PARTS)}")
+            if part not in consolidated:
+                raise Refused(f"delta: add to {part!r}: use one of {', '.join(consolidated)}")
             if not text:
                 raise Refused("delta: an added item has no text")
             parts[part].append((new_item_id(new_front, part), text))
-        for k in CONSOLIDATED_PARTS:
+        for k in consolidated:
             if front["parts"][k] and not parts[k]:
-                raise Refused(f"delta: it would empty \"{PART_BY_KEY[k][0]}\"; keep at least one item")
+                raise Refused(f"delta: it would empty \"{part_by_key(parts_def)[k][0]}\"; keep at least one item")
         # Claims and skills are validated in full before anything is written.
         known = set(claim_files())
         staged_claims = []
@@ -3404,7 +3632,7 @@ def apply_delta(path: Path) -> None:
                 # the same page is kept as it is, a different one is refused.
                 kept = read_front(old)
                 if kept["page"] != front["page"] or any(
-                        kept["parts"][k] != front["parts"][k] for k in CONSOLIDATED_PARTS):
+                        kept["parts"][k] != front["parts"][k] for k in consolidated):
                     raise Refused(f"{old} exists already and is not front.md's page "
                                   f"{front['page']}; look at both before going on")
             else:
@@ -3932,6 +4160,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: "list[str] | None" = None) -> int:
     a = build_parser().parse_args(argv)
     try:
+        refuse_both_kinds()
         a.fn(a)
         if not getattr(a, "hook", False):
             print_page_problems()
