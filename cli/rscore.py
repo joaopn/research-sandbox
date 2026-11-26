@@ -23715,6 +23715,215 @@ def search_clear(deadline: float | None = None) -> dict:
     return {"cleared": out["cleared"], "problems": [str(p)[:300] for p in problems]}
 
 
+# --- the operator's list, view, stop and sign-in test (Services → Search) -----
+# Each takes ONE deadline first, refuses plainly when the service is not
+# running or does not answer, and checks again what the service answers (its
+# container runs search agents, so it is less trusted than the host): types
+# checked, a reply of the wrong shape refused, strings cut at the service's
+# own caps (MIRRORS of container/search/service.py, named there).
+
+# The search id the service mints (service.py ID_RE — MIRROR).
+_SEARCH_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+# service.py ADMIN_REFUSED_EXIT — MIRROR: the service answered "no such search".
+_SEARCH_ADMIN_REFUSED_EXIT = 3
+_SEARCH_LIST_QUESTION_MAX = 200          # service.py LIST_QUESTION_MAX_CHARS
+_SEARCH_QUESTION_MAX = 32 * 1024         # service.py QUESTION_MAX_CHARS
+_SEARCH_WORK_MAX = 200                   # service.py WORK_MAX_ENTRIES
+_SEARCH_TRACE_NAME_MAX = 40              # service.py TRACE_NAME_MAX_CHARS
+_SEARCH_TRACE_TARGET_MAX = 300           # service.py TRACE_TARGET_MAX_CHARS
+_SEARCH_TEXT_MAX = 2000                  # service.py AGENT_TEXT_MAX_CHARS
+# A reason or a test's answer: RS's own sentence (under 300 characters) plus
+# up to AGENT_TEXT_MAX_CHARS of the agent's own words.
+_SEARCH_REASON_MAX = _SEARCH_TEXT_MAX + 500
+# A name the service passes back (project, consumer, searcher). A project
+# and a searcher name are short words; the consumer is what the gateway put in
+# its caller header (a box or agent name). 200 keeps every real one whole and
+# bounds a header nobody checked for length.
+_SEARCH_NAME_MAX = 200
+_SEARCH_ACTIVE_STATES = ("queued", "starting", "running")
+_SEARCH_STATES = _SEARCH_ACTIVE_STATES + ("done", "failed")
+
+SEARCH_OFF = "the search service is not running (turn it on under Services → Search)"
+SEARCH_NO_ANSWER = "the search service did not answer"
+SEARCH_BAD_ANSWER = ("the search service answered with something RS cannot read, "
+                     "so nothing of it is shown")
+SEARCH_NOT_ACTIVE = "no search with that id is waiting or running"
+SEARCH_NOT_IN_SERVICE = "no search with that id is in the search service"
+SEARCH_NO_TOKEN = ("no token is stored for the search service; store a long-lived "
+                   "Claude token first")
+
+
+@dataclass(frozen=True)
+class SearchIdRequest:
+    # One search in the service, by the id it minted.
+    id: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "SearchIdRequest":
+        sid = kw.get("id")
+        if not isinstance(sid, str) or not _SEARCH_ID_RE.match(sid):
+            raise ValidationError("that is not the id of a search (16 characters, "
+                                  "digits and a-f)")
+        return cls(id=sid)
+
+
+def _search_ask(args: list[str], deadline: float) -> tuple[str, Any]:
+    """One admin request to the running service: ("ok", its JSON), or
+    ("refused", None) when it answered that there is no such search. Refuses
+    (ValidationError) when the service is not running or does not answer."""
+    try:
+        state, labels = _search_container(deadline)
+        if state != "running" or labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
+            raise search.SearchError(SEARCH_OFF)
+        r = _search_docker(["docker", "exec", search.SERVICE_CONTAINER, *_SEARCH_PY,
+                            "admin", *args], deadline)
+    except search.SearchError as e:
+        raise ValidationError(str(e)) from None
+    if r.returncode == _SEARCH_ADMIN_REFUSED_EXIT:
+        return "refused", None
+    if r.returncode != 0:
+        raise ValidationError(SEARCH_NO_ANSWER)
+    try:
+        out = json.loads(r.stdout)
+    except (ValueError, RecursionError):
+        raise ValidationError(SEARCH_NO_ANSWER) from None
+    return "ok", out
+
+
+def _search_reply_int(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise ValidationError(SEARCH_BAD_ANSWER)
+
+
+def _search_reply_str(value: Any, cap: int) -> str:
+    if isinstance(value, str):
+        return value[:cap]
+    raise ValidationError(SEARCH_BAD_ANSWER)
+
+
+def _search_reply_choice(value: Any, choices: Sequence[str]) -> str:
+    if isinstance(value, str) and value in choices:
+        return value
+    raise ValidationError(SEARCH_BAD_ANSWER)
+
+
+def _search_reply_ts(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and math.isfinite(value):
+        return value
+    raise ValidationError(SEARCH_BAD_ANSWER)
+
+
+def _search_reply_id(value: Any) -> str:
+    if isinstance(value, str) and _SEARCH_ID_RE.match(value):
+        return value
+    raise ValidationError(SEARCH_BAD_ANSWER)
+
+
+def _search_reply_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    raise ValidationError(SEARCH_BAD_ANSWER)
+
+
+def search_list(deadline: float | None = None) -> dict:
+    """The operator's list: every waiting and running search, oldest first,
+    with how long it waited and ran and its tokens so far (the page counts
+    the times up from these)."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    _how, out = _search_ask(["list"], deadline)
+    items = _search_reply_dict(out).get("searches")
+    if not isinstance(items, list):
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    searches = []
+    for raw in items:
+        s = _search_reply_dict(raw)
+        searches.append({
+            "id": _search_reply_id(s.get("id")),
+            "project": _search_reply_str(s.get("project"), _SEARCH_NAME_MAX),
+            "consumer": _search_reply_str(s.get("consumer"), _SEARCH_NAME_MAX),
+            "question": _search_reply_str(s.get("question"), _SEARCH_LIST_QUESTION_MAX),
+            "searcher": _search_reply_str(s.get("searcher"), _SEARCH_NAME_MAX),
+            "state": _search_reply_choice(s.get("state"), _SEARCH_ACTIVE_STATES),
+            "waited_s": _search_reply_int(s.get("waited_s")),
+            "ran_s": _search_reply_int(s.get("ran_s")),
+            "tokens": _search_reply_int(s.get("tokens"))})
+    return {"searches": searches}
+
+
+def _search_work_entry(raw: Any) -> dict:
+    e = _search_reply_dict(raw)
+    kind = _search_reply_choice(e.get("kind"), ("tool", "text"))
+    if kind == "text":
+        return {"ts": _search_reply_ts(e.get("ts")), "kind": kind,
+                "text": _search_reply_str(e.get("text"), _SEARCH_TEXT_MAX)}
+    return {"ts": _search_reply_ts(e.get("ts")), "kind": kind,
+            **{k: _search_reply_str(e.get(k), _SEARCH_TRACE_NAME_MAX)
+               for k in ("tool", "tier", "outcome")},
+            **{k: _search_reply_str(e.get(k), _SEARCH_TRACE_TARGET_MAX)
+               for k in ("target", "detail")}}
+
+
+def search_view(req: SearchIdRequest, deadline: float | None = None) -> dict:
+    """The operator's read-only view of one search still in the service (an
+    ended one not collected yet too): its question, state, times, tokens,
+    the reason once it ended, and its work — the tool calls and the agent's
+    text, oldest first, the newest that fit (`truncated` when some were
+    left out). Every string is text to show as it is."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    how, out = _search_ask(["view", req.id], deadline)
+    if how == "refused":
+        raise ValidationError(SEARCH_NOT_IN_SERVICE)
+    v = _search_reply_dict(out)
+    if v.get("id") != req.id or not isinstance(v.get("work"), list) \
+            or not isinstance(v.get("truncated"), bool):
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    work = [_search_work_entry(e) for e in v["work"]]
+    reason = v.get("reason")
+    return {"id": req.id,
+            "state": _search_reply_choice(v.get("state"), _SEARCH_STATES),
+            "question": _search_reply_str(v.get("question"), _SEARCH_QUESTION_MAX),
+            "searcher": _search_reply_str(v.get("searcher"), _SEARCH_NAME_MAX),
+            "tokens": _search_reply_int(v.get("tokens")),
+            "waited_s": _search_reply_int(v.get("waited_s")),
+            "ran_s": _search_reply_int(v.get("ran_s")),
+            "reason": None if reason is None else _search_reply_str(reason, _SEARCH_REASON_MAX),
+            "work": work[-_SEARCH_WORK_MAX:],
+            "truncated": v["truncated"] or len(work) > _SEARCH_WORK_MAX}
+
+
+def search_stop(req: SearchIdRequest, deadline: float | None = None) -> dict:
+    """The operator's stop of one search: a waiting one ends at once, a
+    running one has its agent killed; either ends as stopped by the operator,
+    which its caller reads when it checks or collects it."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    how, out = _search_ask(["stop", req.id], deadline)
+    if how == "refused":
+        raise ValidationError(SEARCH_NOT_ACTIVE)
+    s = _search_reply_dict(out)
+    if s.get("id") != req.id or s.get("stopped") is not True:
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    return {"id": req.id, "state": _search_reply_choice(s.get("state"), _SEARCH_STATES),
+            "stopped": True}
+
+
+def search_test(deadline: float | None = None) -> dict:
+    """The operator's Test of the stored sign-in: one minimal call to the
+    cheapest model with the token the service holds. {"ok", "text"}."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    try:
+        if search.read_token_file() is None:
+            raise ValidationError(SEARCH_NO_TOKEN)
+    except search.SearchError as e:
+        raise ValidationError(str(e)) from None
+    _how, out = _search_ask(["test"], deadline)
+    t = _search_reply_dict(out)
+    if not isinstance(t.get("ok"), bool):
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    return {"ok": t["ok"], "text": _search_reply_str(t.get("text"), _SEARCH_REASON_MAX)}
+
+
 def _supervisor_mcp_reload(container_name: str) -> None:
     """Re-render the supervisor's proxy config and SIGHUP the proxy."""
     if not container_running(container_name):

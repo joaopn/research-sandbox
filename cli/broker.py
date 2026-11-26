@@ -666,6 +666,33 @@ def _verb_search_clear(_args: dict, _progress=None) -> dict:
     return rscore.search_clear(deadline)
 
 
+def _verb_search_list(_args: dict, _progress=None) -> dict:
+    """The operator's list of waiting and running searches."""
+    return rscore.search_list(rscore._mcp_deadline())
+
+
+def _verb_search_view(args: dict, _progress=None) -> dict:
+    """A read-only view of one search's work (field `id`)."""
+    deadline = rscore._mcp_deadline()
+    safe = {k: v for k, v in args.items() if k in SEARCH_ID_WEBUI_FIELDS}
+    req = rscore.SearchIdRequest.from_kwargs(**safe)
+    return rscore.search_view(req, deadline)
+
+
+def _verb_search_stop(args: dict, _progress=None) -> dict:
+    """The operator's stop of one waiting or running search (field `id`)."""
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    safe = {k: v for k, v in args.items() if k in SEARCH_ID_WEBUI_FIELDS}
+    req = rscore.SearchIdRequest.from_kwargs(**safe)
+    return rscore.search_stop(req, deadline)
+
+
+def _verb_search_test(_args: dict, _progress=None) -> dict:
+    """The sign-in Test: one minimal call with the stored token."""
+    return rscore.search_test(rscore._mcp_deadline())
+
+
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
@@ -1506,6 +1533,8 @@ MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
 # The one searcher and the contact address, saved whole.
 SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact"})
+# One search in the service (view, stop), by its id.
+SEARCH_ID_WEBUI_FIELDS = frozenset({"id"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # Put one version pin back to the shipped value (the Host → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
@@ -1779,6 +1808,10 @@ VERBS = {
     "search_settings": _verb_search_settings,
     "search_settings_set": _verb_search_settings_set,
     "search_clear": _verb_search_clear,
+    "search_list": _verb_search_list,
+    "search_view": _verb_search_view,
+    "search_stop": _verb_search_stop,
+    "search_test": _verb_search_test,
     "mcp_server_add": _verb_mcp_server_add,
     "mcp_server_draft": _verb_mcp_server_draft,
     "mcp_server_edit": _verb_mcp_server_edit,
