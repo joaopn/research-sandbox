@@ -84,6 +84,7 @@ import defaults  # noqa: E402
 import image_registry  # noqa: E402  (the image shelf's registry client; stdlib only)
 import mcp_registry  # noqa: E402
 import mcp_servers  # noqa: E402  (the MCP gateway's server list; stdlib only)
+import mcp_run  # noqa: E402  (MCP servers RS runs from an image: names, file, argv)
 import model_catalog  # noqa: E402  (agent model/effort catalog + per-type defaults; HOST-side only — never staged/baked into a container, see _read_models)
 import role_mcp  # noqa: E402
 import extension  # noqa: E402
@@ -19981,17 +19982,19 @@ def _mcp_deadline() -> float:
     return time.monotonic() + MCP_INLINE_DEADLINE_S
 
 
-def _mcp_docker(cmd: list[str], deadline: float | None) -> subprocess.CompletedProcess:
+def _mcp_docker(cmd: list[str], deadline: float | None,
+                input: str | None = None) -> subprocess.CompletedProcess:
     """One docker call that takes what is left of the verb's deadline (None =
     unbounded: the host command and the build-lane child). Never run_check:
-    its refusal carries the command line."""
+    its refusal carries the command line. `input` is fed to its stdin."""
+    extra = {} if input is None else {"input": input}
     try:
         if deadline is None:
-            return run(cmd, capture_output=True)
+            return run(cmd, capture_output=True, **extra)
         left = deadline - time.monotonic()
         if left <= 0:
             raise ValidationError(_MCP_HOST_SLOW)
-        return run(cmd, capture_output=True, timeout=left)
+        return run(cmd, capture_output=True, timeout=left, **extra)
     except subprocess.TimeoutExpired:
         raise ValidationError(_MCP_HOST_SLOW) from None
     except OSError:
@@ -20046,6 +20049,7 @@ def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
     if state == "running":
         _mcp_docker(["docker", "kill", "-s", "HUP", MCP_GATEWAY_CONTAINER], deadline)
         _mcp_gateway_aldine_front(deadline)
+        _mcp_gateway_run_networks(deadline)
         return True, "the MCP gateway is running"
     if state == "stopped":
         r = _mcp_docker(["docker", "start", MCP_GATEWAY_CONTAINER], deadline)
@@ -20078,11 +20082,18 @@ def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
     # A created gateway is on rs-sandbox only: back onto Aldine's front
     # network when Aldine is on (every gateway (re)creation passes here).
     _mcp_gateway_aldine_front(deadline)
+    # ... and onto the network of every MCP server RS runs.
+    _mcp_gateway_run_networks(deadline)
     return True, "the MCP gateway was started"
 
 
 def _mcp_gateway_aldine_front(deadline: float | None) -> None:
     for problem in aldine_connect_front(deadline):
+        print(f"warning: {problem}", file=sys.stderr)
+
+
+def _mcp_gateway_run_networks(deadline: float | None) -> None:
+    for problem in _mcp_run_gateway_attach_all(deadline):
         print(f"warning: {problem}", file=sys.stderr)
 
 
@@ -20286,8 +20297,28 @@ def mcp_server_list(deadline: float | None = None) -> dict:
         error = mcp_servers.DAMAGED_TEXT.format(why=why)
     elif state == mcp_servers.NEWER:
         error = mcp_servers.NEWER_TEXT
+    rows = mcp_servers.public_view(data)
+    if state == mcp_servers.OK:
+        # Each run server's state, and what RS made for a run server whose
+        # name is not on the list (left from an earlier one, e.g. after the
+        # list was replaced): one listing per object type for all of them.
+        try:
+            found, ps_out = _mcp_run_found(deadline)
+            states, known = _mcp_run_states(deadline, ps_out), True
+        except ValidationError:
+            found, states, known = {}, {}, False
+        for row in rows:
+            if row.get("kind") == "run":
+                row["state"], row["reason"] = (states.get(row["name"], ("absent", ""))
+                                               if known else ("unknown", _MCP_HOST_DOWN))
+        for name in sorted(set(found) - set(data["servers"])):
+            rows.append({"name": name, "kind": "run", "url": "", "description": "",
+                         "headers": [], "run": None, "state": "leftover",
+                         "reason": _mcp_run_leftover_reason(found[name])})
+        rows.sort(key=lambda r: r["name"])
+    rows = _mcp_servers_with_wiring(rows)
     return {
-        "servers": _mcp_servers_with_wiring(mcp_servers.public_view(data)),
+        "servers": rows,
         "gateway": mcp_gateway_state(deadline),
         "list": state,
         "error": error,
@@ -20317,6 +20348,11 @@ def mcp_server_edit(req: McpServerEditRequest, *, blocking: bool = True,
         entry = data["servers"].get(req.name)
         if entry is None:
             raise mcp_servers.ServerListError(f"no server named {req.name} is on the list")
+        if mcp_servers.is_run(entry):
+            # Its changes re-create its container: the run server's own Edit.
+            raise mcp_servers.ServerListError(
+                f"the server {req.name} is one RS runs; it is changed with the "
+                "edit of a server RS runs")
         if req.url is not None:
             entry["url"] = req.url
         if req.description is not None:
@@ -20351,6 +20387,29 @@ def mcp_server_remove(req: McpServerNameRequest, *, blocking: bool = True,
     the list at exactly that address, and otherwise change nothing — an
     absent one included — instead of refusing."""
     removed = False
+    if if_url is None:
+        # A server RS runs: everything RS made for it goes FIRST, each by its
+        # name, while it is still on the list — a refusal half-way leaves it
+        # listed, so Remove can simply be run again. A wiring table that
+        # cannot be used refuses before anything is touched.
+        lstate, ldata, _lwhy = mcp_servers.read()
+        if lstate == mcp_servers.OK and mcp_servers.is_run(
+                ldata["servers"].get(req.name) or {}):
+            try:
+                mcp_servers.load_grants()
+                _mcp_run_teardown(req.name, deadline)
+            except (mcp_servers.ServerListError, mcp_run.RunError) as e:
+                raise ValidationError(str(e)) from None
+        elif lstate == mcp_servers.OK and req.name not in ldata["servers"]:
+            # Not on the list, but RS's things of a run server of that name
+            # remain (a leftover row): they go, by name; the list and the
+            # wiring are not touched. Nothing at all refuses below, as before.
+            try:
+                if _mcp_run_leftovers_of(req.name, deadline):
+                    _mcp_run_teardown(req.name, deadline)
+                    return mcp_server_list(deadline)
+            except mcp_run.RunError as e:
+                raise ValidationError(str(e)) from None
     try:
         with mcp_servers.lock(blocking=blocking):
             data = mcp_servers.load()
@@ -20450,6 +20509,976 @@ def mcp_server_test(req: McpServerNameRequest) -> dict:
         return row("unreachable", "the MCP gateway gave an answer that could not be read")
     return row(outcome, detail[:_MCP_PROBE_DETAIL_MAX], status)
 
+
+# ---------------------------------------------------------------------------
+# MCP servers RS runs itself (a `run` entry of the server list)
+# ---------------------------------------------------------------------------
+# Names, shapes, the settings file and the docker argv are in cli/mcp_run.py;
+# the lifecycle is here. A run server's container sits on its own `--internal`
+# network shared only with the gateway and the router; its only way out is the
+# default route RS injects through the router (after every container start),
+# under the router's locked rules plus one allow per named destination.
+#
+# Add, Edit, Start, Restart and Update pull or (re)create, so they run on the
+# broker's build lane and refuse with die(). Stop, Logs and Remove are inline
+# under ONE deadline. The list lock is held for file work only.
+
+# How many of a server's last output lines Logs returns. A server that will not
+# start prints its reason and usually a traceback (tens of lines); 200 keeps a
+# whole traceback plus the lines that led to it. At 20 a long traceback loses
+# its cause; at 2000 the panel is a scroll nobody reads and the reply grows
+# tenfold. The output is the server's own: a server may print its own secrets
+# there, and it goes only to the authenticated operator who asked.
+MCP_RUN_LOG_LINES = 200
+# The reply's byte cap (the LAST bytes are kept). docker splits a stored log
+# line at 16 KiB, so 200 lines can reach 3 MiB from a server printing long
+# lines; 64 KiB holds 200 lines of 300 characters, more than a readable panel,
+# and stays small on the webui's 30 s relay. At half, tracebacks with long
+# paths start losing lines; at ten times, one click ships most of a megabyte.
+MCP_RUN_LOG_MAX_BYTES = 64 * 1024
+MCP_RUN_ROUTER_DOWN = ("RS's egress router is not running, so the server was not "
+                       "started; it is started with RS")
+MCP_RUN_ENV_MISMATCH = ("the settings kept on the host for the server {name} do not "
+                        "match its settings on the list, so it was not started; "
+                        "edit the server and enter its secret settings again, or "
+                        "remove it and add it again")
+MCP_RUN_NOT_FOUND = "no server RS runs named {name} is on the list"
+_MCP_RUN_FOREIGN = ("a {kind} named {obj} exists that RS did not make for the "
+                    "MCP server {name}, so nothing was changed; {remedy}")
+_MCP_RUN_FOREIGN_REMEDY = ("RS neither uses nor removes it: it has to be removed "
+                           "on the host before this server can run")
+# Docker exit codes of a container stopped on purpose (`docker stop`: SIGTERM,
+# then SIGKILL after the grace) or one whose program ended cleanly.
+_MCP_RUN_STOP_CODES = frozenset({0, 137, 143})
+_MCP_RUN_EXIT_RE = re.compile(r"\((-?\d+)\)")
+
+
+def _mcp_run_name(value: Any) -> str:
+    name = _mcp_name(value)
+    # NAME_RE's `$` also matches before a final newline: the name becomes a
+    # container, network and volume name, so the whole string must match.
+    if not mcp_servers.NAME_RE.fullmatch(name):
+        raise ValidationError(
+            "a server name starts with a lowercase letter and holds only "
+            "lowercase letters, digits and dashes")
+    return name
+
+
+def _mcp_run_check(problem: str | None) -> None:
+    if problem:
+        raise ValidationError(problem)
+
+
+def _mcp_run_settings(value: Any) -> dict:
+    """{NAME: {"secret": bool, "value": str}} — every setting carries its
+    value here (a request); the list keeps only the non-secret ones."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValidationError("the settings must be given as names, each with a "
+                              "secret flag and a value")
+    out = {}
+    for sn, spec in value.items():
+        _mcp_run_check(mcp_run.setting_name_problem(sn))
+        if not isinstance(spec, dict) or set(spec) != {"secret", "value"} \
+                or not isinstance(spec["secret"], bool):
+            raise ValidationError(f"the setting {sn} needs a secret flag and a value")
+        _mcp_run_check(mcp_run.setting_value_problem(sn, spec["value"]))
+        out[sn] = {"secret": spec["secret"], "value": spec["value"]}
+    return out
+
+
+def _mcp_run_args(value: Any) -> list:
+    if value is None:
+        return []
+    _mcp_run_check(mcp_run.args_problem(value))
+    return list(value)
+
+
+def _mcp_run_destinations(value: Any) -> list:
+    if value is None:
+        return []
+    _mcp_run_check(mcp_run.destinations_problem(value))
+    return list(value)
+
+
+def _mcp_run_data(value: Any) -> str:
+    """"" = no data folder."""
+    if value is None or value == "":
+        return ""
+    _mcp_run_check(mcp_run.data_problem(value))
+    return value
+
+
+@dataclass(frozen=True)
+class McpRunAddRequest:
+    """A server RS runs from an image. `settings` and `headers` carry secret
+    values: never repr'd, never logged."""
+    name: str
+    image: str
+    port: int
+    path: str = "/mcp"
+    args: list = field(default_factory=list)
+    data: str = ""
+    settings: dict = field(default_factory=dict, repr=False)
+    headers: dict = field(default_factory=dict, repr=False)
+    destinations: list = field(default_factory=list)
+    description: str = ""
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "McpRunAddRequest":
+        _mcp_run_check(mcp_run.image_problem(kw.get("image")))
+        _mcp_run_check(mcp_run.port_problem(kw.get("port")))
+        path = "/mcp" if kw.get("path") is None else kw.get("path")
+        _mcp_run_check(mcp_run.path_problem(path))
+        return cls(name=_mcp_run_name(kw.get("name")), image=kw["image"],
+                   port=kw["port"], path=path, args=_mcp_run_args(kw.get("args")),
+                   data=_mcp_run_data(kw.get("data")),
+                   settings=_mcp_run_settings(kw.get("settings")),
+                   headers=_mcp_headers(kw.get("headers")),
+                   destinations=_mcp_run_destinations(kw.get("destinations")),
+                   description=_mcp_description(kw.get("description")))
+
+
+@dataclass(frozen=True)
+class McpRunEditRequest:
+    """An absent (None) field is left as it is. `data` "" drops the data
+    folder (the volume stays until the server is removed). `settings_set`
+    adds or replaces settings, each with its value; `settings_remove` names
+    the ones to drop; a setting named in neither keeps its value, secret or
+    not. `destinations` replaces the whole list. Headers as for an address
+    server."""
+    name: str
+    description: str | None = None
+    args: list | None = None
+    port: int | None = None
+    path: str | None = None
+    data: str | None = None
+    settings_set: dict = field(default_factory=dict, repr=False)
+    settings_remove: tuple = ()
+    headers_set: dict = field(default_factory=dict, repr=False)
+    headers_remove: tuple = ()
+    destinations: list | None = None
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "McpRunEditRequest":
+        if kw.get("port") is not None:
+            _mcp_run_check(mcp_run.port_problem(kw["port"]))
+        if kw.get("path") is not None:
+            _mcp_run_check(mcp_run.path_problem(kw["path"]))
+        remove = kw.get("settings_remove")
+        remove = [] if remove is None else remove
+        if not isinstance(remove, (list, tuple)) or any(
+                mcp_run.setting_name_problem(sn) for sn in remove):
+            raise ValidationError("the settings to remove must be a list of setting names")
+        settings_set = _mcp_run_settings(kw.get("settings_set"))
+        if set(remove) & set(settings_set):
+            raise ValidationError("a setting cannot be both set and removed")
+        hremove = kw.get("headers_remove")
+        hremove = [] if hremove is None else hremove
+        if not isinstance(hremove, (list, tuple)) or not all(
+                isinstance(h, str) and mcp_servers.HEADER_NAME_RE.match(h) for h in hremove):
+            raise ValidationError("the headers to remove must be a list of header names")
+        headers_set = _mcp_headers(kw.get("headers_set"))
+        if {h.lower() for h in hremove} & {h.lower() for h in headers_set}:
+            raise ValidationError("a header cannot be both set and removed")
+        return cls(
+            name=_mcp_run_name(kw.get("name")),
+            description=(None if kw.get("description") is None
+                         else _mcp_description(kw.get("description"))),
+            args=None if kw.get("args") is None else _mcp_run_args(kw["args"]),
+            port=kw.get("port"), path=kw.get("path"),
+            data=None if kw.get("data") is None else _mcp_run_data(kw["data"]),
+            settings_set=settings_set, settings_remove=tuple(remove),
+            headers_set=headers_set, headers_remove=tuple(hremove),
+            destinations=(None if kw.get("destinations") is None
+                          else _mcp_run_destinations(kw["destinations"])))
+
+
+def _mcp_run_entry(data: dict, name: str) -> dict:
+    entry = data["servers"].get(name)
+    if entry is None or not mcp_servers.is_run(entry):
+        raise mcp_servers.ServerListError(MCP_RUN_NOT_FOUND.format(name=name))
+    return entry
+
+
+def _mcp_run_foreign(kind: str, obj: str, name: str, remedy: str = "") -> mcp_run.RunError:
+    return mcp_run.RunError(_MCP_RUN_FOREIGN.format(
+        kind=kind, obj=obj, name=name, remedy=remedy or _MCP_RUN_FOREIGN_REMEDY))
+
+
+def _mcp_run_labels(raw: str) -> dict:
+    try:
+        labels = json.loads(raw or "null")
+    except (ValueError, RecursionError):
+        return {}
+    return labels if isinstance(labels, dict) else {}
+
+
+def _mcp_run_container(name: str, deadline: float | None) -> tuple[str, str | None]:
+    """(docker state | "absent", the server name its label names)."""
+    r = _mcp_docker(["docker", "container", "inspect", "-f",
+                     "{{.State.Status}}|{{json .Config.Labels}}",
+                     mcp_run.container_name(name)], deadline)
+    if r.returncode != 0:
+        return "absent", None
+    status, _, raw = r.stdout.strip().partition("|")
+    return status, _mcp_run_labels(raw).get(mcp_run.NAME_LABEL)
+
+
+def _mcp_run_network(name: str, deadline: float | None) -> dict | None:
+    """The server's network as {internal, owner, members, subnet}, or None."""
+    r = _mcp_docker(["docker", "network", "inspect", "-f",
+                     "{{json .Internal}}|{{json .Labels}}|{{json .Containers}}|"
+                     "{{range .IPAM.Config}}{{.Subnet}} {{end}}",
+                     mcp_run.network_name(name)], deadline)
+    if r.returncode != 0:
+        return None
+    internal, labels, members, subnets = (r.stdout.strip().split("|") + ["", "", ""])[:4]
+    try:
+        found = json.loads(members or "null")
+    except (ValueError, RecursionError):
+        found = None
+    names = sorted(c.get("Name", "") for c in found.values()
+                   if isinstance(c, dict)) if isinstance(found, dict) else []
+    return {"internal": internal.strip() == "true",
+            "owner": _mcp_run_labels(labels).get(mcp_run.NAME_LABEL),
+            "members": names,
+            "subnet": (subnets.split() or [""])[0]}
+
+
+def _mcp_run_check_network(name: str, info: dict) -> None:
+    """Refuse a network of the server's name that RS did not make for it, one
+    with a route out, or one with any member but the server, the gateway and
+    the router."""
+    net = mcp_run.network_name(name)
+    if info["owner"] != name or not info["internal"]:
+        raise _mcp_run_foreign("network", net, name)
+    others = [m for m in info["members"]
+              if m not in (mcp_run.container_name(name), MCP_GATEWAY_CONTAINER,
+                           ROUTER_CONTAINER)]
+    if others:
+        raise mcp_run.RunError(
+            f"the network of the MCP server {name} also holds {', '.join(others)}, "
+            "which RS never connects to it, so nothing was changed; it has to be "
+            "disconnected on the host before this server can run")
+
+
+def _mcp_run_volume(name: str, deadline: float | None) -> str | None:
+    """The server name the data volume's label names; None = no volume."""
+    r = _mcp_docker(["docker", "volume", "inspect", "-f", "{{json .Labels}}",
+                     mcp_run.volume_name(name)], deadline)
+    if r.returncode != 0:
+        return None
+    return _mcp_run_labels(r.stdout.strip()).get(mcp_run.NAME_LABEL) or ""
+
+
+def _mcp_run_failed(what: str, r: subprocess.CompletedProcess) -> mcp_run.RunError:
+    """A refusal for a docker step that failed: its FIRST line is the cause."""
+    err = [l for l in (r.stderr or r.stdout or "").splitlines() if l.strip()]
+    return mcp_run.RunError(what + (f" ({err[0].strip()[:200]})" if err else ""))
+
+
+# A leftover: what RS made for a run server (labelled with its name, or its
+# settings file) whose name is not on the list.
+MCP_RUN_LEFTOVER_REASON = ("left from an earlier server of this name ({what}); "
+                           "Remove clears it")
+MCP_RUN_LEFTOVER_ADD = ("something is left from an earlier MCP server named {name} "
+                        "({what}), so nothing was added; Remove on its row clears "
+                        "it, then add the server again")
+
+
+def _mcp_run_kinds_text(kinds: list) -> str:
+    return "its " + (kinds[0] if len(kinds) == 1
+                     else ", ".join(kinds[:-1]) + " and " + kinds[-1])
+
+
+def _mcp_run_leftover_reason(kinds: list) -> str:
+    return MCP_RUN_LEFTOVER_REASON.format(what=_mcp_run_kinds_text(kinds))
+
+
+def _mcp_run_env_names() -> list[str]:
+    """The server names of the settings files RS wrote (by file name only;
+    none is opened)."""
+    names = []
+    try:
+        with os.scandir(mcp_run.ENV_DIR) as it:
+            for e in it:
+                n = e.name[:-len(mcp_run.ENV_SUFFIX)]
+                if e.name.endswith(mcp_run.ENV_SUFFIX) and mcp_servers.NAME_RE.fullmatch(n):
+                    names.append(n)
+    except OSError:
+        pass
+    return names
+
+
+def _mcp_run_found(deadline: float | None) -> tuple[dict, str]:
+    """({server name: [kinds found]}, the container listing's output) of
+    everything RS made for any run server: one listing by label each for
+    containers, networks and volumes, and the settings files' names. A
+    listing that fails raises ValidationError (nothing can be said then)."""
+    found: dict = {}
+
+    def note(name: str, kind: str) -> None:
+        if mcp_servers.NAME_RE.fullmatch(name) and kind not in found.setdefault(name, []):
+            found[name].append(kind)
+    label = "{{.Label \"" + mcp_run.NAME_LABEL + "\"}}"
+    ps_out = ""
+    for argv, kind, fmt, made in (
+            (["docker", "ps", "-a"], "container",
+             "{{.Names}}\t" + label + "\t{{.State}}\t{{.Status}}", mcp_run.container_name),
+            (["docker", "network", "ls"], "network", "{{.Name}}\t" + label,
+             mcp_run.network_name),
+            (["docker", "volume", "ls"], "volume", "{{.Name}}\t" + label,
+             mcp_run.volume_name)):
+        r = _mcp_docker(argv + ["--filter", f"label={mcp_run.RUN_LABEL}=1",
+                                "--format", fmt], deadline)
+        if r.returncode != 0:
+            raise ValidationError(_MCP_HOST_DOWN)
+        if kind == "container":
+            ps_out = r.stdout or ""
+        for line in (r.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0] == made(parts[1]):
+                note(parts[1], kind)
+    for name in _mcp_run_env_names():
+        note(name, "settings file")
+    return found, ps_out
+
+
+def _mcp_run_leftovers_of(name: str, deadline: float | None) -> list[str]:
+    """What RS made for a run server of this name that still exists: the
+    container, network and volume carrying its name label, its settings
+    file. Something of that name without the label is not counted here
+    (it is foreign, and the teardown refuses it)."""
+    kinds = []
+    if _mcp_run_container(name, deadline)[1] == name:
+        kinds.append("container")
+    info = _mcp_run_network(name, deadline)
+    if info is not None and info["owner"] == name:
+        kinds.append("network")
+    if _mcp_run_volume(name, deadline) == name:
+        kinds.append("volume")
+    try:
+        os.lstat(mcp_run.env_path(name))
+        kinds.append("settings file")
+    except OSError:
+        pass
+    return kinds
+
+
+def _mcp_run_names_free(name: str) -> None:
+    """Before an Add: nothing of the server's names may exist yet. What RS
+    made for an earlier server of that name is named as a leftover (Remove on
+    its row clears it); anything else of that name is foreign."""
+    remedy = "choose another name"
+    left = _mcp_run_leftovers_of(name, None)
+    if left:
+        raise mcp_run.RunError(MCP_RUN_LEFTOVER_ADD.format(
+            name=name, what=_mcp_run_kinds_text(left)))
+    if _mcp_run_container(name, None)[0] != "absent":
+        raise _mcp_run_foreign("container", mcp_run.container_name(name), name, remedy)
+    if _mcp_run_network(name, None) is not None:
+        raise _mcp_run_foreign("network", mcp_run.network_name(name), name, remedy)
+    if _mcp_run_volume(name, None) is not None:
+        raise _mcp_run_foreign("volume", mcp_run.volume_name(name), name, remedy)
+
+
+def _mcp_run_pin(ref: str) -> str:
+    """Pull `ref` and return what to run: its content digest
+    (`repo@sha256:…`, the first repo digest), or, for an image with none, its
+    image Id. Never the floating tag."""
+    print(f"pulling {ref} ...", flush=True)
+    try:
+        pulled = run(["docker", "pull", ref]).returncode == 0
+    except OSError:
+        raise mcp_run.RunError(_MCP_HOST_DOWN) from None
+    r = _mcp_docker(["docker", "image", "inspect", "-f", "{{json .RepoDigests}}|{{.Id}}",
+                     ref], None)
+    if r.returncode != 0:
+        raise mcp_run.RunError(f"the image {ref} could not be downloaded (the "
+                               "operation's log has docker's reason)")
+    raw, _, image_id = r.stdout.strip().partition("|")
+    try:
+        digests = json.loads(raw or "null")
+    except (ValueError, RecursionError):
+        digests = None
+    digests = [d for d in digests if isinstance(d, str)] if isinstance(digests, list) else []
+    if not pulled:
+        # An image built on this host (a registry does not have it), or one
+        # whose registry cannot be reached now: the copy on this host is what
+        # is pinned, and the operation's log says so. (On Docker's containerd
+        # image store a locally built image carries a repo digest too, so the
+        # two cannot be told apart here.)
+        print(f"note: {ref} could not be fetched; the image of that name on this "
+              "host is pinned", flush=True)
+    pinned = digests[0] if digests else image_id.strip()
+    if mcp_run.pinned_problem(pinned):
+        raise mcp_run.RunError(f"the image {ref} has no content digest RS can pin")
+    return pinned
+
+
+def _mcp_run_resolve(destinations: list) -> dict:
+    """Each destination's host as one IPv4 address, resolved once, here (the
+    router's allow is by address)."""
+    resolved = {}
+    for dest in destinations:
+        host, _port = mcp_run.split_destination(dest)
+        try:
+            resolved[dest] = _resolve_mcp_host(host)
+        except (OSError, UnicodeError):
+            raise mcp_run.RunError(f"the destination {host} could not be resolved "
+                                   "on the host") from None
+    return resolved
+
+
+def _mcp_run_save(name: str, change: Callable[[dict], "dict | None"]) -> dict:
+    """Change the list under its lock (file work only); `change` returns the
+    server's setting values when the settings file is to be rewritten (it is
+    written BEFORE the list, so the list never names settings the file lacks).
+    Signals the gateway after the lock. Returns the server's saved entry."""
+    with mcp_servers.lock():
+        data = mcp_servers.load()
+        values = change(data)
+        if values is not None:
+            try:
+                mcp_run.write_env(name, values)
+            except OSError as e:
+                raise mcp_servers.ServerListError(
+                    "cannot write the server's settings on the host "
+                    f"({e.strerror or 'write failed'})") from None
+        mcp_servers.save(data)
+        mcp_servers.render(data)
+        entry = data["servers"][name]
+    _mcp_gateway_hup(None)
+    return entry
+
+
+def _mcp_run_router_rules(name: str, run_: dict, network: str) -> None:
+    """Connect the router, clear whatever it still holds for the network's
+    range, apply the locked rules and one allow per named destination."""
+    if not container_running(ROUTER_CONTAINER):
+        raise mcp_run.RunError(MCP_RUN_ROUTER_DOWN)
+    # Already connected is a harmless refusal.
+    run(["docker", "network", "connect", network, ROUTER_CONTAINER], capture_output=True)
+    resolvers = load_config().sandbox_dns
+    try:
+        # Before the apply (the purge's sweep would take the fresh rules), as
+        # ensure_project_network does: docker hands a freed range to the next
+        # network, and an allow left on it must not reach this server.
+        purge_router_range(network, strict=True)
+        apply_firewall_rules(network, "locked", resolvers)
+        subnet = get_network_subnet(network)
+        for dest in run_["destinations"]:
+            _host, port = mcp_run.split_destination(dest)
+            run_check(["docker", "exec", ROUTER_CONTAINER, "/scripts/mcp-allow.sh",
+                       subnet, run_["resolved"][dest], str(port)])
+    except SystemExit:
+        raise mcp_run.RunError(f"the egress rules of the MCP server {name} could not "
+                               "be set on RS's router (the operation's log has the "
+                               "router's answer)") from None
+
+
+def _mcp_run_connect_gateway(name: str, deadline: float | None) -> None:
+    """Put the gateway (when it exists) on the server's network."""
+    if _mcp_gateway_container(deadline)[0] == "absent":
+        return
+    net = mcp_run.network_name(name)
+    r = _mcp_docker(["docker", "container", "inspect", "-f",
+                     "{{json .NetworkSettings.Networks}}", MCP_GATEWAY_CONTAINER], deadline)
+    nets = _mcp_run_labels(r.stdout.strip()) if r.returncode == 0 else {}
+    if net in nets:
+        return
+    c = _mcp_docker(["docker", "network", "connect", net, MCP_GATEWAY_CONTAINER], deadline)
+    if c.returncode != 0:
+        raise _mcp_run_failed(f"the MCP gateway could not be connected to the "
+                              f"network of the MCP server {name}", c)
+
+
+def _mcp_run_gateway_attach_all(deadline: float | None) -> list[str]:
+    """Connect the gateway to every run server's network (a re-created gateway
+    is on rs-sandbox only). Never raises; returns the problems."""
+    problems: list[str] = []
+    try:
+        r = _mcp_docker(["docker", "network", "ls", "--filter",
+                         f"label={mcp_run.RUN_LABEL}=1", "--format", "{{.Name}}"], deadline)
+        nets = [n for n in (r.stdout or "").split() if n.startswith(mcp_run.PREFIX)] \
+            if r.returncode == 0 else []
+        for net in nets:
+            try:
+                _mcp_run_connect_gateway(net[len(mcp_run.PREFIX):], deadline)
+            except mcp_run.RunError as e:
+                problems.append(str(e))
+    except ValidationError as e:
+        problems.append(str(e))
+    return problems
+
+
+def _mcp_run_inject_route(name: str, network: str) -> None:
+    """The server's default route via the router (after every start: a fresh
+    network namespace has none, `--internal` gives none)."""
+    try:
+        inject_route(mcp_run.container_name(name), get_router_ip(network))
+    except SystemExit:
+        # Not running, or running again after docker restarted it (it exited).
+        r = _mcp_docker(["docker", "container", "inspect", "-f",
+                         "{{.State.Status}} {{.RestartCount}}",
+                         mcp_run.container_name(name)], None)
+        if r.returncode != 0 or r.stdout.split()[:2] != ["running", "0"]:
+            raise mcp_run.RunError(f"the MCP server {name} stopped right after it "
+                                   "started; its last output (Logs) shows why") from None
+        raise mcp_run.RunError(f"the MCP server {name}'s route out through RS's "
+                               "router could not be set") from None
+
+
+def _mcp_run_up(name: str, entry: dict, *, recreate: bool) -> None:
+    """Make the server run what its entry says: network, router rules, data
+    volume, container (re-created when `recreate`, else started as it is),
+    the gateway on its network, its route out. Unbounded (the build lane, the
+    host command, `research start`). Every refusal is a RunError."""
+    run_ = entry["run"]
+    cname, net = mcp_run.container_name(name), mcp_run.network_name(name)
+    values = mcp_run.read_env(name)
+    if values is None or not mcp_run.env_matches(run_, values):
+        raise mcp_run.RunError(MCP_RUN_ENV_MISMATCH.format(name=name))
+    state, owner = _mcp_run_container(name, None)
+    if state != "absent" and owner != name:
+        raise _mcp_run_foreign("container", cname, name)
+    info = _mcp_run_network(name, None)
+    if info is None:
+        r = _mcp_docker(mcp_run.network_create_argv(name, network_create_args(net)), None)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the network of the MCP server {name} could not "
+                                  "be created", r)
+    else:
+        _mcp_run_check_network(name, info)
+    _mcp_run_router_rules(name, run_, net)
+    if "data" in run_:
+        vowner = _mcp_run_volume(name, None)
+        if vowner is None:
+            r = _mcp_docker(mcp_run.volume_create_argv(name), None)
+            if r.returncode != 0:
+                raise _mcp_run_failed(f"the data volume of the MCP server {name} "
+                                      "could not be created", r)
+        elif vowner != name:
+            raise _mcp_run_foreign("volume", mcp_run.volume_name(name), name)
+    if state != "absent" and recreate:
+        r = _mcp_docker(["docker", "rm", "-f", cname], None)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the old container of the MCP server {name} could "
+                                  "not be removed", r)
+        state = "absent"
+    if state == "absent":
+        r = _mcp_docker(mcp_run.run_argv(name, run_, load_config().sandbox_dns), None)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the MCP server {name} could not be started", r)
+    elif state not in ("running", "restarting"):
+        r = _mcp_docker(["docker", "start", cname], None)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the MCP server {name} could not be started", r)
+    _mcp_run_connect_gateway(name, None)
+    _mcp_run_inject_route(name, net)
+    # A server that exits at once (a missing setting, a wrong argument) is
+    # reported now rather than left for its row to show. One look, no wait:
+    # one that fails later shows as failed on its row.
+    if _mcp_run_container(name, None)[0] != "running":
+        raise mcp_run.RunError(f"the MCP server {name} stopped right after it "
+                               "started; its last output (Logs) shows why")
+
+
+def _mcp_run_drop_container(name: str, deadline: float | None) -> None:
+    """Remove the server's container (one RS made for it), so its next start
+    runs the current settings and image."""
+    state, owner = _mcp_run_container(name, deadline)
+    if state == "absent":
+        return
+    if owner != name:
+        raise _mcp_run_foreign("container", mcp_run.container_name(name), name)
+    r = _mcp_docker(["docker", "rm", "-f", mcp_run.container_name(name)], deadline)
+    if r.returncode != 0:
+        raise _mcp_run_failed(f"the container of the MCP server {name} could not "
+                              "be removed", r)
+
+
+def _mcp_run_apply(name: str, entry: dict) -> str:
+    """After a change: a running server is re-created on it; a stopped one
+    only loses its container, so its next Start runs the change."""
+    if entry["run"]["stopped"]:
+        _mcp_run_drop_container(name, None)
+        return "stopped"
+    _mcp_run_up(name, entry, recreate=True)
+    return "running"
+
+
+def _mcp_run_lane(work: Callable[[], dict]) -> dict:
+    """The build-lane verbs' refusal: every one is a die() (the lane shows its
+    line; a ValidationError would end as a bare "invalid request")."""
+    try:
+        return work()
+    except (mcp_run.RunError, mcp_servers.ServerListError, ValidationError) as e:
+        die(str(e))
+
+
+def mcp_run_add(req: McpRunAddRequest, progress=None) -> dict:
+    """Add a server RS runs: validate, pull and pin the image, write the
+    settings file and the list entry, bring it up."""
+    progress = progress or _NULL_PROGRESS
+
+    def work() -> dict:
+        progress.step("check", f"checking the name {req.name}")
+        if req.name in mcp_servers.load()["servers"]:
+            raise mcp_servers.ServerListError(
+                f"a server named {req.name} is already on the list")
+        _mcp_run_names_free(req.name)
+        progress.step("pull", "fetching the server's image")
+        pinned = _mcp_run_pin(req.image)
+        resolved = _mcp_run_resolve(req.destinations)
+        run_: dict = {"image": req.image, "digest": pinned, "args": list(req.args),
+                      "port": req.port, "path": req.path,
+                      "settings": {sn: ({"secret": True} if spec["secret"]
+                                        else {"secret": False, "value": spec["value"]})
+                                   for sn, spec in req.settings.items()},
+                      "destinations": list(req.destinations), "resolved": resolved,
+                      "stopped": False}
+        if req.data:
+            run_["data"] = req.data
+        entry: dict = {"run": run_}
+        if req.description:
+            entry["description"] = req.description
+        if req.headers:
+            entry["headers"] = dict(req.headers)
+        _mcp_run_check(mcp_servers.entry_problem(req.name, entry))
+
+        def change(data: dict) -> dict:
+            if req.name in data["servers"]:
+                raise mcp_servers.ServerListError(
+                    f"a server named {req.name} is already on the list")
+            data["servers"][req.name] = entry
+            return {sn: spec["value"] for sn, spec in req.settings.items()}
+        entry = _mcp_run_save(req.name, change)
+        progress.step("start", f"starting the MCP server {req.name}")
+        _mcp_run_up(req.name, entry, recreate=False)
+        print(f"the MCP server {req.name} runs {pinned}", flush=True)
+        return {"server": req.name, "state": "running", "digest": pinned}
+    return _mcp_run_lane(work)
+
+
+def mcp_run_edit(req: McpRunEditRequest, progress=None) -> dict:
+    """Change a server RS runs, then re-create it on the change (a stopped one
+    stays stopped and runs the change at its next Start)."""
+    progress = progress or _NULL_PROGRESS
+
+    def work() -> dict:
+        progress.step("check", f"checking the MCP server {req.name}")
+        _mcp_run_entry(mcp_servers.load(), req.name)
+        resolved = (None if req.destinations is None
+                    else _mcp_run_resolve(req.destinations))
+
+        def change(data: dict) -> dict:
+            entry = _mcp_run_entry(data, req.name)
+            new = json.loads(json.dumps(entry))          # a deep copy
+            run_ = new["run"]
+            if req.description is not None:
+                if req.description:
+                    new["description"] = req.description
+                else:
+                    new.pop("description", None)
+            for key in ("args", "port", "path"):
+                if getattr(req, key) is not None:
+                    run_[key] = getattr(req, key)
+            if req.data is not None:
+                if req.data:
+                    run_["data"] = req.data
+                else:
+                    run_.pop("data", None)
+            if req.destinations is not None:
+                run_["destinations"] = list(req.destinations)
+                run_["resolved"] = resolved
+            old_values = mcp_run.read_env(req.name) or {}
+            settings = dict(run_["settings"])
+            for sn in req.settings_remove:
+                if settings.pop(sn, None) is None:
+                    raise mcp_servers.ServerListError(
+                        f"the MCP server {req.name} has no setting {sn}")
+            for sn, spec in req.settings_set.items():
+                settings[sn] = ({"secret": True} if spec["secret"]
+                                else {"secret": False, "value": spec["value"]})
+            values = {}
+            for sn, spec in settings.items():
+                if sn in req.settings_set:
+                    values[sn] = req.settings_set[sn]["value"]
+                elif not spec["secret"]:
+                    values[sn] = spec["value"]
+                elif sn in old_values:
+                    values[sn] = old_values[sn]
+                else:
+                    raise mcp_servers.ServerListError(
+                        f"the secret setting {sn} has no value kept on the host; "
+                        "enter it again")
+            run_["settings"] = settings
+            headers = dict(new.get("headers", {}))
+            drop = {h.lower() for h in req.headers_remove} | {h.lower() for h in req.headers_set}
+            headers = {h: v for h, v in headers.items() if h.lower() not in drop}
+            headers.update(req.headers_set)
+            if headers:
+                new["headers"] = headers
+            else:
+                new.pop("headers", None)
+            problem = mcp_servers.entry_problem(req.name, new)
+            if problem:
+                raise mcp_servers.ServerListError(problem)
+            data["servers"][req.name] = new
+            return values
+        entry = _mcp_run_save(req.name, change)
+        progress.step("start", f"applying the change to the MCP server {req.name}")
+        state = _mcp_run_apply(req.name, entry)
+        print(f"changed the MCP server {req.name} ({state})", flush=True)
+        return {"server": req.name, "state": state}
+    return _mcp_run_lane(work)
+
+
+def _mcp_run_set_stopped(name: str, stopped: bool, *, blocking: bool = True) -> dict:
+    def change(data: dict) -> None:
+        _mcp_run_entry(data, name)["run"]["stopped"] = stopped
+    with mcp_servers.lock(blocking=blocking):
+        data = mcp_servers.load()
+        change(data)
+        mcp_servers.save(data)
+        mcp_servers.render(data)
+        return data["servers"][name]
+
+
+def mcp_server_start(req: McpServerNameRequest, progress=None, *,
+                     recreate: bool = False) -> dict:
+    """Start a server RS runs (and clear its "stopped" mark, so `research
+    start` brings it back from now on)."""
+    progress = progress or _NULL_PROGRESS
+
+    def work() -> dict:
+        _mcp_run_entry(mcp_servers.load(), req.name)
+        entry = _mcp_run_set_stopped(req.name, False)
+        progress.step("start", f"{'restarting' if recreate else 'starting'} the MCP "
+                               f"server {req.name}")
+        _mcp_run_up(req.name, entry, recreate=recreate)
+        print(f"the MCP server {req.name} is running", flush=True)
+        return {"server": req.name, "state": "running"}
+    return _mcp_run_lane(work)
+
+
+def mcp_server_restart(req: McpServerNameRequest, progress=None) -> dict:
+    """Re-create the server's container on its saved settings and image."""
+    return mcp_server_start(req, progress, recreate=True)
+
+
+def mcp_run_update(req: McpServerNameRequest, progress=None) -> dict:
+    """Pull the server's image reference again, pin the digest it now names
+    (old and new shown), re-create the server on it."""
+    progress = progress or _NULL_PROGRESS
+
+    def work() -> dict:
+        entry = _mcp_run_entry(mcp_servers.load(), req.name)
+        ref, old = entry["run"]["image"], entry["run"]["digest"]
+        progress.step("pull", f"fetching {ref} again")
+        new = _mcp_run_pin(ref)
+        progress.step("digest", f"was {old}, now {new}" if new != old
+                      else f"unchanged: {new}")
+        print(f"{ref}: {old} -> {new}" if new != old else f"{ref}: unchanged ({new})",
+              flush=True)
+
+        def change(data: dict) -> None:
+            e = _mcp_run_entry(data, req.name)
+            if e["run"]["image"] != ref:
+                raise mcp_servers.ServerListError(
+                    f"the MCP server {req.name} was changed meanwhile; try again")
+            e["run"]["digest"] = new
+        entry = _mcp_run_save(req.name, change)
+        progress.step("start", f"applying the image to the MCP server {req.name}")
+        state = _mcp_run_apply(req.name, entry)
+        return {"server": req.name, "state": state, "old": old, "new": new}
+    return _mcp_run_lane(work)
+
+
+def mcp_server_stop(req: McpServerNameRequest, *, blocking: bool = True,
+                    deadline: float | None = None) -> dict:
+    """Stop a server RS runs and mark it stopped, so `research start` leaves
+    it stopped until its Start. Inline: one deadline for every docker call."""
+    try:
+        _mcp_run_entry(mcp_servers.load(), req.name)
+        state, owner = _mcp_run_container(req.name, deadline)
+        if state != "absent" and owner != req.name:
+            raise _mcp_run_foreign("container", mcp_run.container_name(req.name), req.name)
+        if state in ("running", "restarting", "paused"):
+            r = _mcp_docker(["docker", "stop", mcp_run.container_name(req.name)], deadline)
+            if r.returncode != 0:
+                raise _mcp_run_failed(f"the MCP server {req.name} could not be stopped", r)
+        _mcp_run_set_stopped(req.name, True, blocking=blocking)
+    except (mcp_run.RunError, mcp_servers.ServerListError) as e:
+        raise ValidationError(str(e)) from None
+    return mcp_server_list(deadline)
+
+
+def mcp_server_logs(req: McpServerNameRequest, deadline: float | None = None) -> dict:
+    """The last MCP_RUN_LOG_LINES lines (at most MCP_RUN_LOG_MAX_BYTES, the
+    last ones kept) of a server RS runs, its output and error streams
+    together. The server's own text: it may hold what the server chose to
+    print, its own secrets included, and goes only to the authenticated
+    operator who asked."""
+    try:
+        _mcp_run_entry(mcp_servers.load(), req.name)
+        cstate, owner = _mcp_run_container(req.name, deadline)
+        if cstate == "absent":
+            return {"name": req.name, "state": "absent", "log": ""}
+        if owner != req.name:
+            raise _mcp_run_foreign("container", mcp_run.container_name(req.name), req.name)
+    except (mcp_run.RunError, mcp_servers.ServerListError) as e:
+        raise ValidationError(str(e)) from None
+    cmd = ["docker", "logs", "--tail", str(MCP_RUN_LOG_LINES),
+           mcp_run.container_name(req.name)]
+    try:
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            raise ValidationError(_MCP_HOST_SLOW)
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=left)
+    except subprocess.TimeoutExpired:
+        raise ValidationError(_MCP_HOST_SLOW) from None
+    except OSError:
+        raise ValidationError(_MCP_HOST_DOWN) from None
+    if r.returncode != 0:
+        raise ValidationError(f"the output of the MCP server {req.name} could not be read")
+    return {"name": req.name, "state": cstate,
+            "log": r.stdout[-MCP_RUN_LOG_MAX_BYTES:].decode("utf-8", errors="replace")}
+
+
+def _mcp_run_teardown(name: str, deadline: float | None) -> None:
+    """Remove everything RS made for a run server, each by its name: the
+    container, the router's rules for its range, the network (after the
+    gateway and the router leave it), the data volume, the settings file.
+    Idempotent; a thing of that name RS did not make refuses (RunError)."""
+    cname, net = mcp_run.container_name(name), mcp_run.network_name(name)
+    state, owner = _mcp_run_container(name, deadline)
+    if state != "absent":
+        if owner != name:
+            raise _mcp_run_foreign("container", cname, name)
+        r = _mcp_docker(["docker", "rm", "-f", cname], deadline)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the container of the MCP server {name} could not "
+                                  "be removed", r)
+    info = _mcp_run_network(name, deadline)
+    if info is not None:
+        _mcp_run_check_network(name, info)
+        router = _mcp_docker(["docker", "container", "inspect", "-f", "{{.State.Running}}",
+                              ROUTER_CONTAINER], deadline)
+        if info["subnet"] and router.stdout.strip() == "true":
+            # The range's rules and every allow on it, by RANGE (never from the
+            # destinations list). Best effort: a range whose rules survive is
+            # purged before any network uses it again (ensure_project_network
+            # and this server's own bring-up purge strictly first).
+            _mcp_docker(["docker", "exec", ROUTER_CONTAINER, "/scripts/remove-rules.sh",
+                         info["subnet"], ",".join(load_config().sandbox_dns)], deadline)
+            try:
+                script = ROUTER_PURGE_SCRIPT_SRC.read_text()
+            except OSError:
+                script = None
+            if script is not None:
+                _mcp_docker(["docker", "exec", "-i", ROUTER_CONTAINER, "sh", "-s", "--",
+                             info["subnet"]], deadline, input=script)
+        for peer in (MCP_GATEWAY_CONTAINER, ROUTER_CONTAINER):
+            if peer in info["members"]:
+                _mcp_docker(["docker", "network", "disconnect", "-f", net, peer], deadline)
+        r = _mcp_docker(["docker", "network", "rm", net], deadline)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the network of the MCP server {name} could not "
+                                  "be removed", r)
+    vowner = _mcp_run_volume(name, deadline)
+    if vowner is not None:
+        if vowner != name:
+            raise _mcp_run_foreign("volume", mcp_run.volume_name(name), name)
+        r = _mcp_docker(["docker", "volume", "rm", mcp_run.volume_name(name)], deadline)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the data volume of the MCP server {name} could "
+                                  "not be removed", r)
+    try:
+        mcp_run.remove_env(name)
+    except OSError as e:
+        raise mcp_run.RunError("cannot delete the server's settings on the host "
+                               f"({e.strerror or 'delete failed'})") from None
+
+
+def _mcp_run_states(deadline: float | None, listing: str | None = None) -> dict:
+    """{server name: (state, reason)} of every container RS runs a server in:
+    one listing by label (`listing`: that listing's output, already taken by
+    _mcp_run_found). state: running | stopped | failed (reason given); a
+    server with no container is absent (not in the result)."""
+    out: dict = {}
+    if listing is None:
+        r = _mcp_docker(["docker", "ps", "-a", "--filter", f"label={mcp_run.RUN_LABEL}=1",
+                         "--format", "{{.Names}}\t{{.Label \"" + mcp_run.NAME_LABEL + "\"}}\t"
+                         "{{.State}}\t{{.Status}}"], deadline)
+        if r.returncode != 0:
+            return out
+        listing = r.stdout or ""
+    for line in listing.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4 or parts[0] != mcp_run.container_name(parts[1]):
+            continue
+        name, state, status = parts[1], parts[2], parts[3]
+        m = _MCP_RUN_EXIT_RE.search(status)
+        code = int(m.group(1)) if m else None
+        if state == "running":
+            out[name] = ("running", "")
+        elif state == "restarting":
+            out[name] = ("failed", f"it keeps exiting (code {code}) and is being restarted"
+                         if code is not None else "it keeps exiting and is being restarted")
+        elif state == "exited" and code in _MCP_RUN_STOP_CODES:
+            out[name] = ("stopped", "")
+        elif state == "exited":
+            out[name] = ("failed", f"it exited with code {code}" if code is not None
+                         else "it exited")
+        elif state == "created":
+            out[name] = ("failed", "it was created but could not start")
+        else:
+            out[name] = ("failed", f"its container is {state}")
+    return out
+
+
+def resume_mcp_run_servers_with_fleet() -> None:
+    """`research start`'s step, after the gateway: bring every run server not
+    marked stopped back up (route re-injected, gateway re-attached, rules
+    re-applied), or WARN and carry on."""
+    state, data, _why = mcp_servers.read()
+    if state != mcp_servers.OK:
+        return                      # the gateway's own step already warned
+    for name, entry in sorted(data["servers"].items()):
+        if not mcp_servers.is_run(entry) or entry["run"]["stopped"]:
+            continue
+        try:
+            _mcp_run_up(name, entry, recreate=False)
+            print(f"MCP server {name} is running")
+        except (mcp_run.RunError, mcp_servers.ServerListError, ValidationError) as e:
+            print(f"warning: the MCP server {name} could not be started: {e}",
+                  file=sys.stderr)
+        except SystemExit:
+            print(f"warning: the MCP server {name} could not be started", file=sys.stderr)
+
+
+def _stop_mcp_run_servers() -> list[str]:
+    """Stop every running container RS runs an MCP server in (`research stop`),
+    found by label (no list read). The servers' "stopped" marks are not
+    touched: `research start` brings back those the operator did not stop.
+    Returns the names that failed to stop."""
+    r = run(["docker", "ps", "--filter", f"label={mcp_run.RUN_LABEL}=1",
+             "--format", "{{.Names}}"], capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        print(f"warning: could not list the MCP servers RS runs: {err[-200:]}",
+              file=sys.stderr)
+        return [mcp_run.PREFIX + "*"]
+    failed = []
+    for cname in sorted(n for n in r.stdout.strip().splitlines() if n):
+        if not _stop_infra_container(cname):
+            failed.append(cname)
+    return failed
 
 # --- wiring: the gateway in each project, and what each consumer may use ------
 # The gateway is attached to every project network at ONE fixed address — the

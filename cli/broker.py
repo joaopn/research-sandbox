@@ -414,9 +414,77 @@ def _verb_mcp_server_edit(args: dict, _progress=None) -> dict:
 
 
 def _verb_mcp_server_remove(args: dict, _progress=None) -> dict:
+    # Taken FIRST: a server RS runs is torn down too, every docker call under it.
+    deadline = rscore._mcp_deadline()
     safe = {k: v for k, v in args.items() if k in MCP_SERVER_NAME_WEBUI_FIELDS}
     req = rscore.McpServerNameRequest.from_kwargs(**safe)
-    return rscore.mcp_server_remove(req, blocking=False, deadline=rscore._mcp_deadline())
+    _mcp_run_refuse_busy(req.name)
+    return rscore.mcp_server_remove(req, blocking=False, deadline=deadline)
+
+
+# --- MCP servers RS runs itself (a `run` entry of the list) ---------------------
+# Add, Edit, Start, Restart and Update pull an image or (re)create a container,
+# so they are build-lane verbs (BUILD_DISPATCH, target "mcp-run:<name>"); their
+# args (which carry setting and header VALUES) reach the build child over its
+# stdin, never its command line. Stop and Logs are inline under ONE deadline.
+
+MCP_RUN_BUSY = "the MCP server {name} is being changed; try again when that has finished"
+
+
+def _mcp_run_refuse_busy(name: str) -> None:
+    """Refuse an inline change while a build-lane op works on that server."""
+    if any(op.get("target") == f"{_MCP_RUN_TARGET}:{name}" for op in _live_build_ops()):
+        raise rscore.ValidationError(MCP_RUN_BUSY.format(name=name))
+
+
+def _verb_mcp_server_stop(args: dict, _progress=None) -> dict:
+    # Taken FIRST: every docker call below shares it.
+    deadline = rscore._mcp_deadline()
+    safe = {k: v for k, v in args.items() if k in MCP_SERVER_NAME_WEBUI_FIELDS}
+    req = rscore.McpServerNameRequest.from_kwargs(**safe)
+    _mcp_run_refuse_busy(req.name)
+    return rscore.mcp_server_stop(req, blocking=False, deadline=deadline)
+
+
+def _verb_mcp_server_logs(args: dict, _progress=None) -> dict:
+    deadline = rscore._mcp_deadline()
+    safe = {k: v for k, v in args.items() if k in MCP_SERVER_NAME_WEBUI_FIELDS}
+    req = rscore.McpServerNameRequest.from_kwargs(**safe)
+    return rscore.mcp_server_logs(req, deadline)
+
+
+def _mcp_run_request(verb: str, args: dict):
+    """The build child's request: the same field allowlist and shape check the
+    dispatch ran before spawning it; a refusal here is a die() (the lane's)."""
+    fields, cls = _MCP_RUN_BUILD_REQUESTS[verb]
+    safe = {k: v for k, v in args.items() if k in fields}
+    try:
+        return cls.from_kwargs(**safe)
+    except rscore.ValidationError as e:
+        rscore.die(str(e))
+
+
+def _verb_mcp_run_add(args: dict, progress=None) -> dict:
+    return rscore.mcp_run_add(_mcp_run_request("mcp_run_add", args), progress=progress)
+
+
+def _verb_mcp_run_edit(args: dict, progress=None) -> dict:
+    return rscore.mcp_run_edit(_mcp_run_request("mcp_run_edit", args), progress=progress)
+
+
+def _verb_mcp_server_start(args: dict, progress=None) -> dict:
+    return rscore.mcp_server_start(_mcp_run_request("mcp_server_start", args),
+                                   progress=progress)
+
+
+def _verb_mcp_server_restart(args: dict, progress=None) -> dict:
+    return rscore.mcp_server_restart(_mcp_run_request("mcp_server_restart", args),
+                                     progress=progress)
+
+
+def _verb_mcp_run_update(args: dict, progress=None) -> dict:
+    return rscore.mcp_run_update(_mcp_run_request("mcp_run_update", args),
+                                 progress=progress)
 
 
 MCP_GATEWAY_RESTARTING = "the MCP gateway is restarting; try again in a moment"
@@ -1337,6 +1405,18 @@ MCP_SERVER_ADD_WEBUI_FIELDS = frozenset({"name", "url", "description", "headers"
 MCP_SERVER_EDIT_WEBUI_FIELDS = frozenset({"name", "url", "description",
                                           "headers_set", "headers_remove"})
 MCP_SERVER_NAME_WEBUI_FIELDS = frozenset({"name"})
+# A server RS runs (an image). The image reference, its arguments, port, path
+# and data folder are operator-supplied docker inputs, each validated by the
+# request (a reference by docker's grammar, the arguments only ever after the
+# image, the data folder only ever a NAMED volume's target, never a bind
+# source). Setting and header VALUES are secrets: they go only into the 0600
+# settings file and the 0600 list on the host.
+MCP_RUN_ADD_WEBUI_FIELDS = frozenset({"name", "image", "args", "port", "path", "data",
+                                      "settings", "headers", "destinations",
+                                      "description"})
+MCP_RUN_EDIT_WEBUI_FIELDS = frozenset({"name", "description", "args", "port", "path",
+                                       "data", "settings_set", "settings_remove",
+                                       "headers_set", "headers_remove", "destinations"})
 # Wiring one consumer (a project's agents, or one of its boxes) to servers.
 MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
@@ -1608,6 +1688,8 @@ VERBS = {
     "mcp_server_add": _verb_mcp_server_add,
     "mcp_server_edit": _verb_mcp_server_edit,
     "mcp_server_remove": _verb_mcp_server_remove,
+    "mcp_server_stop": _verb_mcp_server_stop,
+    "mcp_server_logs": _verb_mcp_server_logs,
     "mcp_server_test": _verb_mcp_server_test,
     "mcp_server_list_reset": _verb_mcp_server_list_reset,
     "mcp_wiring": _verb_mcp_wiring,
@@ -1777,7 +1859,24 @@ BUILD_DISPATCH = {
     "rebuild": _verb_rebuild,
     "mcp_gateway_start": _verb_mcp_gateway_start,
     "aldine_on": _verb_aldine_on,
+    "mcp_run_add": _verb_mcp_run_add,
+    "mcp_run_edit": _verb_mcp_run_edit,
+    "mcp_server_start": _verb_mcp_server_start,
+    "mcp_server_restart": _verb_mcp_server_restart,
+    "mcp_run_update": _verb_mcp_run_update,
 }
+# The build verbs that act on one server RS runs: (field allowlist, request
+# class). The dispatch checks the request's shape BEFORE spawning a child (a
+# bad request must never start one: the client already holds started:true),
+# and the child checks it again from the same table.
+_MCP_RUN_BUILD_REQUESTS = {
+    "mcp_run_add": (MCP_RUN_ADD_WEBUI_FIELDS, rscore.McpRunAddRequest),
+    "mcp_run_edit": (MCP_RUN_EDIT_WEBUI_FIELDS, rscore.McpRunEditRequest),
+    "mcp_server_start": (MCP_SERVER_NAME_WEBUI_FIELDS, rscore.McpServerNameRequest),
+    "mcp_server_restart": (MCP_SERVER_NAME_WEBUI_FIELDS, rscore.McpServerNameRequest),
+    "mcp_run_update": (MCP_SERVER_NAME_WEBUI_FIELDS, rscore.McpServerNameRequest),
+}
+_MCP_RUN_TARGET = "mcp-run"
 
 
 def _build_lock_holder() -> dict | None:
@@ -1833,6 +1932,7 @@ _BUILD_TARGETS = {
     "rebuild": "fleet",
     "mcp_gateway_start": "mcp-gateway",
     "aldine_on": "aldine",
+    **{verb: _MCP_RUN_TARGET for verb in _MCP_RUN_BUILD_REQUESTS},
 }
 # Browser-facing names for the refusal text.
 _BUILD_TARGET_NAMES = {"editor": "the editor download", "reader": "the reader download",
@@ -1846,12 +1946,18 @@ def _build_target(verb: str, args: dict) -> str:
         # The same default the verb applies, so {} and {"agent": "claude"}
         # are one target.
         return f"agent:{args.get('agent', rscore.DEFAULT_AGENT)}"
+    if base == _MCP_RUN_TARGET:
+        # One server at a time; different servers queue (the name was checked
+        # before this is reached).
+        return f"{_MCP_RUN_TARGET}:{args.get('name')}"
     return base
 
 
 def _build_target_name(target: str) -> str:
     if target.startswith("agent:"):
         return f"the {target[len('agent:'):]} agent download"
+    if target.startswith(_MCP_RUN_TARGET + ":"):
+        return f"the MCP server {target[len(_MCP_RUN_TARGET) + 1:]}"
     return _BUILD_TARGET_NAMES.get(target, target)
 
 
@@ -1948,22 +2054,30 @@ def _spawn_build_child(op_id: str, verb: str, args: dict) -> int:
     broker restart) doesn't kill an in-flight build; stdout/stderr → BROKER_LOG is
     only a startup backstop — run_build re-points fd 1/2 at its host-only full log
     once it has an _OpLog. Returns the child pid the parent records in the op's
-    per-op build lock."""
+    per-op build lock. The args JSON rides the child's STDIN, never argv (as the
+    dev lane's): an MCP server's settings carry secret values, and an argv value
+    is readable in /proc/<pid>/cmdline for the child's lifetime. The write+close
+    is BrokenPipe-tolerant (a child dying at exec must not raise on the accept
+    thread)."""
     BROKER_DIR.mkdir(parents=True, exist_ok=True)
     research_py = rscore.SCRIPT_DIR / "research.py"
     log = open(BROKER_LOG, "a")
     try:
         proc = subprocess.Popen(
             [sys.executable, str(research_py), "broker", _BUILD_CHILD_ARG,
-             op_id, verb, json.dumps(args)],
-            stdout=log, stderr=log, start_new_session=True,
+             op_id, verb],
+            stdin=subprocess.PIPE, stdout=log, stderr=log, start_new_session=True,
             cwd=str(rscore.SCRIPT_DIR))
     finally:
         log.close()                               # the child holds its own dup'd fd
+    with contextlib.suppress(BrokenPipeError, OSError):
+        proc.stdin.write(json.dumps(args).encode())
+    with contextlib.suppress(BrokenPipeError, OSError):
+        proc.stdin.close()
     return proc.pid
 
 
-def run_build(op_id: str, verb: str, args_json: str) -> None:
+def run_build(op_id: str, verb: str, args_json: str | None = None) -> None:
     """The DETACHED build child (invoked by `broker __run-build`). Owns the op-log
     for one build: points fd 1/2 at the HOST-ONLY full log (so docker build's
     inherited stdout/stderr + all prints stream there for the authenticated tail),
@@ -1985,8 +2099,11 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
         _release_build_op_lock(op_id)
         return
     try:
-        args = json.loads(args_json)
-    except ValueError:
+        # The daemon sends the args on stdin (_spawn_build_child).
+        args = json.loads(sys.stdin.read() if args_json is None else args_json)
+    except (ValueError, OSError):
+        args = {}
+    if not isinstance(args, dict):
         args = {}
     try:
         op = make_oplog(op_id, verb, args)
@@ -2928,6 +3045,13 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                                 _err("validation",
                                      f"unknown agent {agent!r} (known: "
                                      f"{', '.join(rscore.KNOWN_AGENTS)})"))
+        if verb in _MCP_RUN_BUILD_REQUESTS:
+            fields, request_cls = _MCP_RUN_BUILD_REQUESTS[verb]
+            args = {k: v for k, v in args.items() if k in fields}
+            try:
+                request_cls.from_kwargs(**args)
+            except rscore.ValidationError as e:
+                return _audited(principal, "validation", _err("validation", str(e)))
         # Builds of DIFFERENT targets queue (the child waits on the flock); a
         # second build of the same target, running or waiting, would only redo
         # the same work, so it is refused.

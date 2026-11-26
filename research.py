@@ -193,6 +193,11 @@ def cmd_start(args: argparse.Namespace) -> None:
     # The shared MCP gateway: nothing above or below depends on it, so a
     # failure warns and the start carries on.
     rscore.start_mcp_gateway_with_fleet(rebuild=args.rebuild)
+    # The MCP servers RS runs (each not stopped by the operator): back up with
+    # their route out re-injected and the gateway on their networks. A
+    # failure warns and the start carries on. Rebuild all never touches them
+    # (third-party images, pinned by digest).
+    rscore.resume_mcp_run_servers_with_fleet()
     # Re-attach shared rs-gitea to the projects in the dev-lane attachment record.
     # SELECTIVE (only recorded projects), unlike the registry. No-op until a dev
     # repo has been attached. Runs LAST of the wiring passes: it is the only one
@@ -256,6 +261,7 @@ def cmd_stop(_: argparse.Namespace) -> None:
     if not _stop_infra_container(WEBUI_CONTAINER):
         failed.append(WEBUI_CONTAINER)
     failed += _stop_shared_mcps()
+    failed += _stop_mcp_run_servers()
     if not _stop_infra_container(rscore.MCP_GATEWAY_CONTAINER):
         failed.append(rscore.MCP_GATEWAY_CONTAINER)
     for cname in (aldine.APP_CONTAINER, aldine.COMPILER_CONTAINER,
@@ -1223,6 +1229,19 @@ def _print_mcp_servers(payload: dict) -> None:
         print(f"  {row['name']}  {row['url']}{secrets_note}")
         if row["description"]:
             print(f"      {row['description']}")
+        if row.get("state") == "leftover":
+            print(f"      {row['reason']}")
+        elif row.get("kind") == "run":
+            run_ = row["run"]
+            reason = f" ({row['reason']})" if row.get("reason") else ""
+            print(f"      runs {run_['image']} as {run_['digest']}: "
+                  f"{row.get('state', 'unknown')}{reason}"
+                  + ("  [stopped by the operator]" if run_["stopped"] else ""))
+            for s in run_["settings"]:
+                print(f"      setting {s['name']}" + (" (secret)" if s["secret"]
+                                                      else f" = {s['value']}"))
+            for d in run_["destinations"]:
+                print(f"      may reach {d}")
     if not payload["servers"]:
         print("  (no servers)")
 
@@ -1235,19 +1254,135 @@ def cmd_mcp_server_list(args: argparse.Namespace) -> None:
         _print_mcp_servers(payload)
 
 
+# The flags only a server RS runs takes (its image, its settings, ...).
+_MCP_RUN_FLAGS = ("image", "arg", "port", "path", "data", "setting", "secret_stdin",
+                  "destination", "no_args", "no_data", "no_destinations", "remove_setting")
+
+
+def _mcp_cli_run_flags_given(args: argparse.Namespace) -> list[str]:
+    return ["--" + f.replace("_", "-") for f in _MCP_RUN_FLAGS
+            if getattr(args, f, None) not in (None, False, [])]
+
+
+def _mcp_cli_settings(args: argparse.Namespace) -> dict:
+    """Settings from --setting NAME=VALUE (not secret) and --secret-stdin NAME
+    (secret: one line read from stdin per name, in order, AFTER the
+    --header-stdin lines — read BEFORE any list lock). A secret value is never
+    taken from the command line."""
+    settings: dict = {}
+    for item in args.setting or []:
+        name, sep, value = item.partition("=")
+        if not sep:
+            die("--setting takes NAME=VALUE")
+        settings[name] = {"secret": False, "value": value}
+    for name in args.secret_stdin or []:
+        line = sys.stdin.readline()
+        if not line:
+            die(f"no value on stdin for the secret setting {name}")
+        settings[name] = {"secret": True, "value": line.rstrip("\r\n")}
+    return settings
+
+
 def cmd_mcp_server_add(args: argparse.Namespace) -> None:
-    req = _build(rscore.McpServerAddRequest, name=args.name, url=args.url,
-                 description=args.description, headers=_mcp_cli_headers(args))
-    _call(rscore.mcp_server_add, req)
-    print(f"added MCP server {req.name!r}")
+    if args.image is None:
+        if args.url is None:
+            die("give the server's address (--url) or the image RS runs it from (--image)")
+        given = _mcp_cli_run_flags_given(args)
+        if given:
+            die(f"only a server RS runs (--image) takes {', '.join(given)}")
+        req = _build(rscore.McpServerAddRequest, name=args.name, url=args.url,
+                     description=args.description, headers=_mcp_cli_headers(args))
+        _call(rscore.mcp_server_add, req)
+        print(f"added MCP server {req.name!r}")
+        return
+    if args.url is not None:
+        die("--url and --image exclude each other: a server RS runs has its address "
+            "made from its name")
+    if args.port is None:
+        die("--port is required with --image (the port the server serves MCP on)")
+    headers = _mcp_cli_headers(args)
+    settings = _mcp_cli_settings(args)
+    req = _build(rscore.McpRunAddRequest, name=args.name, image=args.image,
+                 args=args.arg or [], port=args.port, path=args.path, data=args.data,
+                 settings=settings, headers=headers,
+                 destinations=args.destination or [], description=args.description)
+    out = rscore.mcp_run_add(req)
+    print(f"added MCP server {req.name!r}, running {out['digest']}")
+
+
+def _mcp_cli_is_run(name: str) -> bool:
+    state, data, _why = rscore.mcp_servers.read()
+    entry = data["servers"].get(name) if state == rscore.mcp_servers.OK else None
+    return bool(entry) and rscore.mcp_servers.is_run(entry)
 
 
 def cmd_mcp_server_edit(args: argparse.Namespace) -> None:
-    req = _build(rscore.McpServerEditRequest, name=args.name, url=args.url,
-                 description=args.description, headers_set=_mcp_cli_headers(args),
-                 headers_remove=args.remove_header or [])
-    _call(rscore.mcp_server_edit, req)
-    print(f"changed MCP server {req.name!r}")
+    if not _mcp_cli_is_run(args.name):
+        given = _mcp_cli_run_flags_given(args)
+        if given:
+            die(f"only a server RS runs takes {', '.join(given)}")
+        req = _build(rscore.McpServerEditRequest, name=args.name, url=args.url,
+                     description=args.description, headers_set=_mcp_cli_headers(args),
+                     headers_remove=args.remove_header or [])
+        _call(rscore.mcp_server_edit, req)
+        print(f"changed MCP server {req.name!r}")
+        return
+    if args.url is not None:
+        die("a server RS runs has its address made from its name; --url does not apply")
+    if args.image is not None:
+        die("a server RS runs keeps its image; remove it and add it again to run "
+            "another (update re-fetches the same one)")
+    if args.arg and args.no_args:
+        die("--arg and --no-args exclude each other")
+    if args.data is not None and args.no_data:
+        die("--data and --no-data exclude each other")
+    if args.destination and args.no_destinations:
+        die("--destination and --no-destinations exclude each other")
+    headers = _mcp_cli_headers(args)
+    settings = _mcp_cli_settings(args)
+    req = _build(rscore.McpRunEditRequest, name=args.name, description=args.description,
+                 args=[] if args.no_args else (args.arg or None),
+                 port=args.port, path=args.path,
+                 data="" if args.no_data else args.data,
+                 settings_set=settings, settings_remove=args.remove_setting or [],
+                 headers_set=headers, headers_remove=args.remove_header or [],
+                 destinations=[] if args.no_destinations else (args.destination or None))
+    out = rscore.mcp_run_edit(req)
+    print(f"changed MCP server {req.name!r} ({out['state']})")
+
+
+def cmd_mcp_server_start(args: argparse.Namespace) -> None:
+    req = _build(rscore.McpServerNameRequest, name=args.name)
+    rscore.mcp_server_start(req)
+
+
+def cmd_mcp_server_restart(args: argparse.Namespace) -> None:
+    req = _build(rscore.McpServerNameRequest, name=args.name)
+    rscore.mcp_server_restart(req)
+    print(f"restarted MCP server {req.name!r}")
+
+
+def cmd_mcp_server_stop(args: argparse.Namespace) -> None:
+    req = _build(rscore.McpServerNameRequest, name=args.name)
+    _call(rscore.mcp_server_stop, req)
+    print(f"stopped MCP server {req.name!r}")
+
+
+def cmd_mcp_server_update(args: argparse.Namespace) -> None:
+    req = _build(rscore.McpServerNameRequest, name=args.name)
+    out = rscore.mcp_run_update(req)
+    print(f"MCP server {req.name!r}: {out['old']} -> {out['new']} ({out['state']})"
+          if out["old"] != out["new"] else
+          f"MCP server {req.name!r}: image unchanged ({out['state']})")
+
+
+def cmd_mcp_server_logs(args: argparse.Namespace) -> None:
+    req = _build(rscore.McpServerNameRequest, name=args.name)
+    out = _call(rscore.mcp_server_logs, req)
+    if out["state"] == "absent":
+        print("(the server has no container)")
+        return
+    sys.stdout.write(out["log"])
 
 
 def cmd_mcp_server_remove(args: argparse.Namespace) -> None:
@@ -1340,7 +1475,8 @@ def cmd_mcp_server_test(args: argparse.Namespace) -> None:
         payload = _call(rscore.mcp_server_list)
         if payload.get("error"):
             die(payload["error"])
-        names = [row["name"] for row in payload["servers"]]
+        # A leftover row is no server: there is nothing to ask.
+        names = [row["name"] for row in payload["servers"] if row.get("state") != "leftover"]
         if not names:
             print("(no servers)")
             return
@@ -2860,7 +2996,7 @@ def build_parser() -> argparse.ArgumentParser:
     rb = brk_sub.add_parser("__run-build", help=argparse.SUPPRESS)  # detached build child
     rb.add_argument("op_id")
     rb.add_argument("verb")
-    rb.add_argument("args_json")
+    rb.add_argument("args_json", nargs="?")       # absent: the args JSON rides stdin
     rb.set_defaults(func=cmd_broker_run_build)
     rr = brk_sub.add_parser("__run-review", help=argparse.SUPPRESS)  # detached review child
     rr.add_argument("op_id")
@@ -3447,21 +3583,81 @@ def build_parser() -> argparse.ArgumentParser:
     msl.add_argument("--json", action="store_true")
     msl.set_defaults(func=cmd_mcp_server_list)
 
-    msa = msv_sub.add_parser("add", help="add a server at an http:// or https:// address")
+    def _mcp_run_flags(p: argparse.ArgumentParser, *, add: bool) -> None:
+        p.add_argument("--arg", action="append", metavar="ARG",
+                       help="(a server RS runs) an argument given to the server after "
+                            "its image (repeatable, in order)"
+                            + ("" if add else "; replaces the arguments"))
+        p.add_argument("--port", type=int, default=None,
+                       help="(a server RS runs) the port it serves MCP on "
+                            "(streamable HTTP)")
+        p.add_argument("--path", default=None,
+                       help="(a server RS runs) the path it serves MCP on"
+                            + (" (default: /mcp)" if add else ""))
+        p.add_argument("--data", default=None, metavar="PATH",
+                       help="(a server RS runs) a folder inside the server kept "
+                            "across restarts (a docker volume RS makes)")
+        p.add_argument("--setting", action="append", metavar="NAME=VALUE",
+                       help="(a server RS runs) an environment setting that is NOT "
+                            "secret (repeatable)")
+        p.add_argument("--secret-stdin", action="append", metavar="NAME",
+                       help="(a server RS runs) a secret environment setting whose "
+                            "value is one line read from stdin, after the "
+                            "--header-stdin lines (repeatable)")
+        p.add_argument("--destination", action="append", metavar="HOST:PORT",
+                       help="(a server RS runs) a place on the local network or this "
+                            "machine it may reach (repeatable"
+                            + ("" if add else "; replaces the destinations") + ")")
+
+    msa = msv_sub.add_parser("add", help="add a server at an http:// or https:// address "
+                                         "(--url), or one RS runs from a container "
+                                         "image (--image)")
     msa.add_argument("name")
-    msa.add_argument("--url", required=True, metavar="URL")
+    msa.add_argument("--url", default=None, metavar="URL")
+    msa.add_argument("--image", default=None, metavar="REF",
+                     help="run the server from this container image (pinned by "
+                          "content digest at add)")
     msa.add_argument("--description", default=None)
     _mcp_header_flags(msa)
-    msa.set_defaults(func=cmd_mcp_server_add)
+    _mcp_run_flags(msa, add=True)
+    msa.set_defaults(func=cmd_mcp_server_add, no_args=False, no_data=False,
+                     no_destinations=False, remove_setting=None)
 
     mse = msv_sub.add_parser("edit", help="change a server; what is not given stays as it is")
     mse.add_argument("name")
     mse.add_argument("--url", default=None, metavar="URL")
+    mse.add_argument("--image", default=None, help=argparse.SUPPRESS)
     mse.add_argument("--description", default=None)
     _mcp_header_flags(mse)
     mse.add_argument("--remove-header", action="append", metavar="NAME",
                      help="drop a secret header (repeatable)")
+    _mcp_run_flags(mse, add=False)
+    mse.add_argument("--no-args", action="store_true",
+                     help="(a server RS runs) give it no arguments")
+    mse.add_argument("--no-data", action="store_true",
+                     help="(a server RS runs) mount no data folder (the volume is "
+                          "kept until the server is removed)")
+    mse.add_argument("--no-destinations", action="store_true",
+                     help="(a server RS runs) allow it no destination")
+    mse.add_argument("--remove-setting", action="append", metavar="NAME",
+                     help="(a server RS runs) drop a setting (repeatable)")
     mse.set_defaults(func=cmd_mcp_server_edit)
+
+    for verb, fn, text in (
+            ("start", cmd_mcp_server_start, "start a server RS runs (and bring it back "
+                                            "with every research start from now on)"),
+            ("stop", cmd_mcp_server_stop, "stop a server RS runs (research start leaves "
+                                          "it stopped until its start)"),
+            ("restart", cmd_mcp_server_restart, "re-create a server RS runs on its "
+                                                "saved settings"),
+            ("update", cmd_mcp_server_update, "fetch a server's image again, pin the "
+                                              "digest it now names and re-create it"),
+            ("logs", cmd_mcp_server_logs, f"the last {rscore.MCP_RUN_LOG_LINES} lines "
+                                          "of a server RS runs (it may print its own "
+                                          "secrets there)")):
+        mrv = msv_sub.add_parser(verb, help=text)
+        mrv.add_argument("name")
+        mrv.set_defaults(func=fn)
 
     msr = msv_sub.add_parser("remove", help="take a server off the list")
     msr.add_argument("name")

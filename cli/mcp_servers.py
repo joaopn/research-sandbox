@@ -1,9 +1,13 @@
 """mcp_servers — the MCP gateway's server list.
 
 Stdlib only. The list is the set of MCP servers the shared gateway container
-(`rs-mcpgw`) knows: an address and optional secret request headers per name.
-It lives in ~/.research-sandbox/mcp-servers.json (0600) and is rendered,
-unchanged, into the one folder the gateway container mounts read-only.
+(`rs-mcpgw`) knows, each with optional secret request headers. A server is
+either an ADDRESS the operator typed (`url`) or a server RS RUNS from a
+container image (`run`, cli/mcp_run.py), whose address is derived from its
+name. The list lives in ~/.research-sandbox/mcp-servers.json (0600); what the
+gateway needs of it (name, address, headers) is rendered into the one folder
+the gateway container mounts read-only. A run server's setting values are in
+neither file: they live in its own settings file (mcp_run.env_path).
 
 Every value is LITERAL: nothing is expanded from an environment, so the list
 reads the same from the host command and from the broker daemon.
@@ -28,6 +32,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import aldine
+import mcp_run
 
 STATE_DIR = Path.home() / ".research-sandbox"
 LIST_PATH = STATE_DIR / "mcp-servers.json"
@@ -37,12 +42,22 @@ LOCK_PATH = STATE_DIR / "mcp-servers.lock"
 GATEWAY_DIR = STATE_DIR / "mcp-gateway"
 RENDERED_NAME = "servers.json"
 
-VERSION = 1
+# The version the writer writes. 2 added servers RS runs (`run` entries); an
+# address entry is unchanged, so a version-1 file is read as it is and written
+# as 2 at its next change. An RS that knows only 1 reads a 2 as "written by a
+# newer version" (nothing changed), never as damaged.
+VERSION = 2
+READABLE_VERSIONS = (1, 2)
+# What the gateway mounts keeps its own version: its format (name → url,
+# headers, description) did not change, and the gateway program is not
+# rebuilt for it.
+RENDERED_VERSION = 1
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 # RFC 7230 token: what a header field name may be made of.
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 SCHEMES = ("http", "https")
 ENTRY_KEYS = frozenset({"url", "description", "headers"})
+RUN_ENTRY_KEYS = frozenset({"run", "description", "headers"})
 
 OK, DAMAGED, NEWER = "ok", "damaged", "newer"
 
@@ -129,13 +144,25 @@ def entry_problem(name: Any, entry: Any) -> str | None:
                 "lowercase letters, digits and dashes")
     if not isinstance(entry, dict):
         return "a server must be an object"
-    if set(entry) - ENTRY_KEYS:
-        return "a server holds an unknown field"
-    try:
-        if normalize_url(entry.get("url")) != entry.get("url"):
-            return "a server's address is not in its stored form"
-    except ServerListError as e:
-        return str(e)
+    if "run" in entry:
+        if set(entry) - RUN_ENTRY_KEYS:
+            return "a server holds an unknown field"
+        problem = mcp_run.run_problem(entry["run"])
+        if problem:
+            return problem
+        try:
+            if normalize_url(entry_url(name, entry)) != entry_url(name, entry):
+                return "a server's address is not in its stored form"
+        except ServerListError as e:
+            return str(e)
+    else:
+        if set(entry) - ENTRY_KEYS:
+            return "a server holds an unknown field"
+        try:
+            if normalize_url(entry.get("url")) != entry.get("url"):
+                return "a server's address is not in its stored form"
+        except ServerListError as e:
+            return str(e)
     desc = entry.get("description", "")
     if not isinstance(desc, str) or any(c in desc for c in "\r\n\0"):
         return "a description must be a single line of text"
@@ -149,6 +176,18 @@ def entry_problem(name: Any, entry: Any) -> str | None:
     return None
 
 
+def is_run(entry: dict[str, Any]) -> bool:
+    return "run" in entry
+
+
+def entry_url(name: str, entry: dict[str, Any]) -> str:
+    """The address the gateway forwards to: typed for an address server,
+    derived from the name for a server RS runs."""
+    if is_run(entry):
+        return mcp_run.url_for(name, entry["run"])
+    return entry["url"]
+
+
 def judge(raw: bytes) -> tuple[str, dict[str, Any], str | None]:
     """(state, data, why) for the bytes of a list file."""
     try:
@@ -158,15 +197,18 @@ def judge(raw: bytes) -> tuple[str, dict[str, Any], str | None]:
     if not isinstance(data, dict):
         return DAMAGED, empty(), "it does not hold a list object"
     version = data.get("version")
-    if isinstance(version, int) and not isinstance(version, bool) and version > VERSION:
+    if isinstance(version, int) and not isinstance(version, bool) \
+            and version > max(READABLE_VERSIONS):
         return NEWER, empty(), None
     # `True == 1`: a boolean is not a version.
-    if isinstance(version, bool) or version != VERSION \
+    if isinstance(version, bool) or version not in READABLE_VERSIONS \
             or set(data) != {"version", "servers"} \
             or not isinstance(data["servers"], dict):
         return DAMAGED, empty(), "it does not have the expected shape"
     for name, entry in data["servers"].items():
         if entry_problem(name, entry):
+            return DAMAGED, empty(), "it holds a server that is not valid"
+        if version == 1 and is_run(entry):
             return DAMAGED, empty(), "it holds a server that is not valid"
     return OK, data, None
 
@@ -215,11 +257,26 @@ def _dump(data: dict[str, Any]) -> str:
 
 
 def save(data: dict[str, Any]) -> None:
+    """Always written at VERSION, whatever version it was read at."""
     try:
-        _write_private(LIST_PATH, _dump(data))
+        _write_private(LIST_PATH, _dump(dict(data, version=VERSION)))
     except OSError as e:
         raise ServerListError("cannot save the MCP server list on the host "
                               f"({e.strerror or 'write failed'})") from e
+
+
+def rendered(data: dict[str, Any]) -> dict[str, Any]:
+    """What the gateway mounts: per server its address (derived for a server
+    RS runs), its secret headers and its description — never a run server's
+    image, settings or anything else of its `run` record."""
+    servers: dict[str, Any] = {}
+    for name, entry in data["servers"].items():
+        out: dict[str, Any] = {"url": entry_url(name, entry)}
+        for key in ("description", "headers"):
+            if key in entry:
+                out[key] = entry[key]
+        servers[name] = out
+    return {"version": RENDERED_VERSION, "servers": servers}
 
 
 def render(data: dict[str, Any]) -> None:
@@ -227,7 +284,7 @@ def render(data: dict[str, Any]) -> None:
     try:
         GATEWAY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(GATEWAY_DIR, 0o700)
-        _write_private(GATEWAY_DIR / RENDERED_NAME, _dump(data))
+        _write_private(GATEWAY_DIR / RENDERED_NAME, _dump(rendered(data)))
     except OSError as e:
         raise ServerListError("cannot write the MCP gateway's server list on "
                               f"the host ({e.strerror or 'write failed'})") from e
@@ -258,12 +315,30 @@ def lock(blocking: bool = True) -> Iterator[None]:
 
 
 def public_view(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """The rows a page or a listing may show: header NAMES only."""
-    return [{"name": name,
-             "url": e["url"],
-             "description": e.get("description", ""),
-             "headers": sorted(e.get("headers", {}))}
-            for name, e in sorted(data["servers"].items())]
+    """The rows a page or a listing may show: header NAMES only; for a server
+    RS runs, its image, arguments, port, path, data folder, destinations and
+    settings — each setting's name and secret flag, and the value only of one
+    that is not secret (a secret value is not on the list at all)."""
+    rows = []
+    for name, e in sorted(data["servers"].items()):
+        row: dict[str, Any] = {"name": name,
+                               "kind": "run" if is_run(e) else "address",
+                               "url": entry_url(name, e),
+                               "description": e.get("description", ""),
+                               "headers": sorted(e.get("headers", {}))}
+        if is_run(e):
+            run = e["run"]
+            row["run"] = {
+                "image": run["image"], "digest": run["digest"],
+                "args": list(run["args"]), "port": run["port"], "path": run["path"],
+                "data": run.get("data"),
+                "settings": [dict({"name": sn, "secret": spec["secret"]},
+                                  **({} if spec["secret"] else {"value": spec["value"]}))
+                             for sn, spec in sorted(run["settings"].items())],
+                "destinations": list(run["destinations"]),
+                "stopped": run["stopped"]}
+        rows.append(row)
+    return rows
 
 
 # --- wiring: which consumer may use which server ------------------------------

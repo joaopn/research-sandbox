@@ -5,6 +5,26 @@ nav_order: 14
 ---
 # Authoring an MCP server
 
+## An image RS runs (Services → MCP)
+
+A server RS runs from a container image (Add server → a server RS runs) is reached by the MCP gateway at `http://rs-mcpsrv-<name>:<port><path>`. Its image's contract:
+
+1. **Serve streamable HTTP** (JSON-RPC over POST) on the port and path you give at Add (default path `/mcp`), listening on all addresses of the container.
+2. **Accept its own container name as `Host`.** Requests arrive with `Host: rs-mcpsrv-<name>:<port>`; a server with DNS-rebinding protection lists that value (for the Python SDK, `mcp.settings.transport_security.allowed_hosts`).
+3. **Read its settings from the environment.** Each setting is an environment value, read literally (no `$` expansion). A secret that only works on the command line or from a file is not supported.
+4. **Work without extra privileges.** The container runs with every capability dropped, no privilege escalation, no published port and no host folder. A data folder you name at Add is a docker volume kept across restarts.
+5. **Expect a narrow way out.** It reaches ports 80 and 443 on the internet and DNS; anything on the local network or this machine only when you name it as a destination (`host:port`).
+
+From the host:
+
+```bash
+printf '%s\n' "$API_KEY" | python research.py mcp server add myserver --image ghcr.io/owner/server:1.2 \
+    --port 8080 --path /mcp --setting LIBRARY_ID=123 --secret-stdin API_KEY \
+    --destination db.lab.example:5432
+```
+
+## A server for the per-project registry (host commands)
+
 Three constraints define the contract between the research-sandbox and an MCP server:
 
 1. **Streamable-HTTP transport.** Stdio MCPs are deferred. The Python SDK's `FastMCP("name").run(transport="streamable-http")` works out of the box; in any SDK, the server must speak JSON-RPC over POST.
