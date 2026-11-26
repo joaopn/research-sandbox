@@ -679,6 +679,15 @@ def _verb_search_view(args: dict, _progress=None) -> dict:
     return rscore.search_view(req, deadline)
 
 
+def _verb_search_report(args: dict, _progress=None) -> dict:
+    """The report of one search that ended with one (field `id`): its
+    summary, sources and tiers, as text."""
+    deadline = rscore._mcp_deadline()
+    safe = {k: v for k, v in args.items() if k in SEARCH_ID_WEBUI_FIELDS}
+    req = rscore.SearchIdRequest.from_kwargs(**safe)
+    return rscore.search_report(req, deadline)
+
+
 def _verb_search_stop(args: dict, _progress=None) -> dict:
     """The operator's stop of one waiting or running search (field `id`)."""
     deadline = rscore._mcp_deadline()
@@ -1534,7 +1543,7 @@ SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
 # The one searcher and the contact address, saved whole.
 SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact",
                                           "recent"})
-# One search in the service (view, stop), by its id.
+# One search in the service (view, report, stop), by its id.
 SEARCH_ID_WEBUI_FIELDS = frozenset({"id"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # Put one version pin back to the shipped value (the Host → Software tab's "Use repo
@@ -1811,6 +1820,7 @@ VERBS = {
     "search_clear": _verb_search_clear,
     "search_list": _verb_search_list,
     "search_view": _verb_search_view,
+    "search_report": _verb_search_report,
     "search_stop": _verb_search_stop,
     "search_test": _verb_search_test,
     "mcp_server_add": _verb_mcp_server_add,

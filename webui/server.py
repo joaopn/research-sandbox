@@ -1075,6 +1075,16 @@ async def broker_search_view_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_search_report_handler(request: web.Request) -> web.Response:
+    """GET /broker/search/report?id=<id> — the report of one search that ended
+    with one: its summary, sources and tiers, as text (read-only). The broker
+    validates the id; an absent one is sent as absent."""
+    sid = request.query.get("id")
+    args = {"id": sid} if sid is not None else {}
+    status, body = await _relay(request, "search_report", args)
+    return web.json_response(body, status=status)
+
+
 async def broker_search_stop_handler(request: web.Request) -> web.Response:
     """POST /broker/search/stop {id} — stop a waiting or running search."""
     if not origin_ok(request):
@@ -4859,6 +4869,7 @@ def main() -> None:
     app.router.add_post("/broker/search/clear", _search_plain_post("search_clear"))
     app.router.add_get("/broker/search/list", broker_search_list_handler)
     app.router.add_get("/broker/search/view", broker_search_view_handler)
+    app.router.add_get("/broker/search/report", broker_search_report_handler)
     app.router.add_post("/broker/search/stop", broker_search_stop_handler)
     app.router.add_post("/broker/search/test", _search_plain_post("search_test"))
     app.router.add_get("/broker/software", broker_software_handler)

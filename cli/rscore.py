@@ -23756,6 +23756,7 @@ SEARCH_BAD_ANSWER = ("the search service answered with something RS cannot read,
                      "so nothing of it is shown")
 SEARCH_NOT_ACTIVE = "no search with that id is waiting or running"
 SEARCH_NOT_IN_SERVICE = "no search with that id is in the search service"
+SEARCH_NO_REPORT = "no report is kept for that search"
 SEARCH_NO_TOKEN = ("no token is stored for the search service; store a long-lived "
                    "Claude token first")
 
@@ -23834,6 +23835,12 @@ def _search_reply_dict(value: Any) -> dict:
     raise ValidationError(SEARCH_BAD_ANSWER)
 
 
+def _search_reply_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValidationError(SEARCH_BAD_ANSWER)
+
+
 def search_list(deadline: float | None = None) -> dict:
     """The operator's list: every waiting and running search, oldest first,
     with how long it waited and ran and its tokens so far (the page counts
@@ -23874,7 +23881,8 @@ def search_list(deadline: float | None = None) -> dict:
             "reason": _search_reply_str(s.get("reason"), _SEARCH_RECENT_REASON_MAX),
             "ended_at": _search_reply_ts(s.get("ended_at")),
             "ran_s": _search_reply_int(s.get("ran_s")),
-            "tokens": _search_reply_int(s.get("tokens"))})
+            "tokens": _search_reply_int(s.get("tokens")),
+            "has_report": _search_reply_bool(s.get("has_report"))})
     return {"searches": searches, "recent": recent, "recent_kept": kept}
 
 
@@ -23918,6 +23926,79 @@ def search_view(req: SearchIdRequest, deadline: float | None = None) -> dict:
             "reason": None if reason is None else _search_reply_str(reason, _SEARCH_REASON_MAX),
             "work": work[-_SEARCH_WORK_MAX:],
             "truncated": v["truncated"] or len(work) > _SEARCH_WORK_MAX}
+
+
+# A search's report is what the search agent wrote (its container can write
+# anything): the host keeps every part of it, in full (the service read it
+# with its own cap), but only as text. Each source and each tier becomes an
+# object of these string fields, read from the keys the agent is told to use
+# (container/search/agent/tools.py finish, instructions.md) and their likely
+# variants, first present key wins; every other key of the item lands in
+# `other` as "key: value; …". An item that is not an object is {"text": …}.
+_SEARCH_SOURCE_FIELDS = (("n", ("n", "number")),       # the number the summary cites
+                         ("title", ("title", "name")),
+                         ("address", ("url", "address", "link")),
+                         ("doi", ("doi",)),
+                         ("contributed", ("contributed", "contribution")),
+                         ("file", ("saved_as", "file", "saved")))
+_SEARCH_TIER_FIELDS = (("tier", ("tier", "tool", "database")),
+                       ("asked", ("asked", "query")),
+                       ("result", ("hit", "result", "results", "outcome")))
+
+
+def _search_report_text(value: Any) -> str:
+    """A value of the report as text: a string as it is, anything else as
+    its JSON."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (ValueError, TypeError, RecursionError):
+        raise ValidationError(SEARCH_BAD_ANSWER) from None
+
+
+def _search_report_items(value: Any, fields: tuple) -> list[dict]:
+    """A report's sources or tiers as text-only objects, nothing dropped."""
+    items = value if isinstance(value, list) else [value]
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            out.append({"text": _search_report_text(item)})
+            continue
+        used: set = set()
+        entry = {}
+        for name, keys in fields:
+            key = next((k for k in keys if k in item), None)
+            entry[name] = "" if key is None else _search_report_text(item[key])
+            if key is not None:
+                used.add(key)
+        entry["other"] = "; ".join(f"{k}: {_search_report_text(v)}"
+                                   for k, v in item.items() if k not in used)
+        out.append(entry)
+    return out
+
+
+def search_report(req: SearchIdRequest, deadline: float | None = None) -> dict:
+    """The report of one search that ended with one, still in the service (in
+    the table, or in the recent list also after it was collected): its
+    question, state and searcher, the summary and every source and tier the
+    search agent wrote, in full and as text only."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    how, out = _search_ask(["report", req.id], deadline)
+    if how == "refused":
+        raise ValidationError(SEARCH_NOT_IN_SERVICE)
+    v = _search_reply_dict(out)
+    if v.get("id") != req.id:
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    if not _search_reply_bool(v.get("has_report")):
+        raise ValidationError(SEARCH_NO_REPORT)
+    return {"id": req.id,
+            "state": _search_reply_choice(v.get("state"), _SEARCH_STATES),
+            "question": _search_reply_str(v.get("question"), _SEARCH_QUESTION_MAX),
+            "searcher": _search_reply_str(v.get("searcher"), _SEARCH_NAME_MAX),
+            "summary": _search_report_text(v.get("summary")),
+            "sources": _search_report_items(v.get("sources"), _SEARCH_SOURCE_FIELDS),
+            "tiers": _search_report_items(v.get("tiers"), _SEARCH_TIER_FIELDS)}
 
 
 def search_stop(req: SearchIdRequest, deadline: float | None = None) -> dict:

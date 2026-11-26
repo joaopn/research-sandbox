@@ -2621,6 +2621,12 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
     overflow-wrap: anywhere;
 }
 .searchsvc-work-text { margin: 6px 0; color: var(--fg-base); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A search's report box (the work box's card and scrolling body). */
+.searchsvc-work.searchsvc-report { font-size: 13px; }
+.searchsvc-report-h { margin: 10px 0 4px; font-weight: 600; color: var(--fg-base); }
+.searchsvc-report-h:first-child { margin-top: 0; }
+.searchsvc-report-item { margin: 0 0 6px; color: var(--fg-base); white-space: pre-wrap; overflow-wrap: anywhere; }
+.searchsvc-report-item > div + div { color: var(--fg-muted); }
 
 /* Services → MCP (the gateway's server list). Self-scoped classes only. */
 .mcp-server-row { flex-wrap: wrap; }

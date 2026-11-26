@@ -9128,7 +9128,8 @@ function searchEndedAt(ts) {
 // The recent searches table: the searches that ended since the service
 // started, newest first, as the list read gave them (`kept` = how many the
 // service keeps; 0 = the list is off). Plain text only; the reason is the
-// Ended as cell's hover text. A row opens the search's work box as it ended.
+// Ended as cell's hover text. A row opens the search's work box as it ended;
+// a row whose search left a report has a Report button that opens it instead.
 function searchRecentTable(view, list, kept) {
     if (kept === 0) {
         return el("div", { class: "searchsvc-flash" },
@@ -9138,8 +9139,17 @@ function searchRecentTable(view, list, kept) {
         return el("div", { class: "searchsvc-flash" },
                   ["No searches have ended since the service started."]);
     }
-    const head = ["Asked by", "Question", "Searcher", "Ended as", "Ended", "Took", "Tokens"];
+    const head = ["Asked by", "Question", "Searcher", "Ended as", "Ended", "Took", "Tokens", ""];
     const row = (s) => {
+        let report = null;
+        if (s.has_report === true) {
+            report = el("button", { class: "btn-small" }, ["Report"]);
+            report.onclick = (ev) => {
+                // The row's own click opens the work box; Report does not.
+                if (ev) ev.stopPropagation();
+                return searchReportBox(view, s.id);
+            };
+        }
         const q = String(s.question || "");
         const reason = String(s.reason || "");
         const as = reason.includes(SEARCH_STOPPED_MARK) ? "stopped"
@@ -9152,6 +9162,7 @@ function searchRecentTable(view, list, kept) {
             el("td", {}, [searchEndedAt(s.ended_at)]),
             el("td", { class: "searchsvc-num" }, [searchClock(s.ran_s)]),
             el("td", { class: "searchsvc-num" }, [searchTokens(s.tokens)]),
+            el("td", {}, [report]),
         ]);
         tr.onclick = () => searchWorkBox(view, s.id);
         return tr;
@@ -9389,6 +9400,89 @@ function searchWorkBox(view, id) {
         return undefined;
     };
     timer = setInterval(read, SEARCH_LIST_POLL_MS);
+    read();
+    return backdrop;
+}
+
+// One source or tier of a report as plain text lines (the host made every
+// field a string): `first` is the leading line's fields, `second` the next
+// line's; empty fields are left out. An item the agent did not write as an
+// object is its text.
+function searchReportItem(prefix, item, first, second) {
+    const o = item || {};
+    const f = (v) => (v === null || v === undefined ? "" : String(v));
+    if (o.text !== undefined) {
+        return el("div", { class: "searchsvc-report-item" }, [
+            el("div", {}, [prefix + f(o.text)])]);
+    }
+    const line = (parts) => parts.filter((p) => p).join(" · ");
+    const lines = [prefix + line(first(o).map(f)), line(second(o).map(f))];
+    return el("div", { class: "searchsvc-report-item" },
+              lines.filter((l, i) => i === 0 || l).map((l) => el("div", {}, [l])));
+}
+
+// A search's report, read-only, in a box over the page: its question, then
+// the summary, every source (numbered as the agent listed them) and what it
+// tried. Read once (only a search that ended has one). Every value is text the
+// search agent wrote, shown as text; an address is not a link.
+function searchReportBox(view, id) {
+    if (document.querySelector(".modal-backdrop")) return null;
+    const landing = view.__rsRender || renderSearchInto;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const head = el("div", { class: "searchsvc-work-head" }, [
+        el("div", { class: "searchsvc-flash" }, ["Reading the report…"])]);
+    const body = el("div", { class: "searchsvc-work searchsvc-report" }, []);
+    const close = el("button", { class: "btn btn-secondary" }, ["Close"]);
+    close.onclick = () => backdrop.remove();
+    backdrop.appendChild(el("div", { class: "card searchsvc-work-card" }, [
+        el("h2", {}, ["A search’s report"]), head, body,
+        el("div", { class: "btn-row" }, [close]),
+    ]));
+    document.body.appendChild(backdrop);
+    const section = (title, nodes, empty) => [
+        el("div", { class: "searchsvc-report-h" }, [title]),
+        ...(nodes.length ? nodes : [el("div", { class: "searchsvc-flash" }, [empty])])];
+    const paint = (r) => {
+        head.replaceChildren(
+            el("div", { class: "searchsvc-work-q" }, [String(r.question || "")]),
+            el("div", { class: "searchsvc-flash" }, [
+                (SEARCH_RUN_STATE_TEXT[r.state] || String(r.state || ""))
+                + " · searcher " + String(r.searcher || "")]));
+        const sources = (Array.isArray(r.sources) ? r.sources : []).map((s, i) =>
+            searchReportItem(`[${s && s.n ? s.n : i + 1}] `, s,
+                             (o) => [o.title, o.address, o.doi && "DOI " + o.doi,
+                                     o.file && "file " + o.file],
+                             (o) => [o.contributed, o.other]));
+        const tiers = (Array.isArray(r.tiers) ? r.tiers : []).map((t) =>
+            searchReportItem("", t, (o) => [o.tier, o.asked], (o) => [o.result, o.other]));
+        body.replaceChildren(
+            ...section("Summary", r.summary ? [el("div", { class: "searchsvc-work-text" },
+                                                  [String(r.summary)])] : [], "No summary."),
+            ...section("Sources", sources, "No sources."),
+            ...section("What was tried", tiers, "Nothing listed."));
+    };
+    const read = async () => {
+        const { status, body: reply } = await searchGet(
+            "/broker/search/report?id=" + encodeURIComponent(id));
+        if (!backdrop.isConnected) return undefined;
+        if (status === 401) {
+            backdrop.remove();
+            return view.isConnected ? renderMgmtLogin(view, landing) : undefined;
+        }
+        if (status !== 200) {
+            head.replaceChildren(el("div", { class: "searchsvc-flash mcp-test-bad" },
+                                    ["Could not read the report: the host did not answer."]));
+            return undefined;
+        }
+        if (!reply.ok || !reply.result) {
+            head.replaceChildren(
+                el("div", { class: "searchsvc-work-q" }, ["There is no report to show."]),
+                el("div", { class: "searchsvc-flash" }, [mgmtErrText(reply)]));
+            return undefined;
+        }
+        paint(reply.result);
+        return undefined;
+    };
     read();
     return backdrop;
 }

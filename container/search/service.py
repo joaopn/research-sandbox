@@ -580,6 +580,13 @@ class Searches:
         # 42k characters, 168 KB in memory when every one is a 4-byte character.
         # RECENT_MAX of them stay under 17 MB at worst; real questions are a
         # paragraph, so a full list is a few MB at most.
+        # A line whose search ended with a report also keeps that report in
+        # full (its summary, sources and tiers as the agent wrote them, as
+        # compact JSON bytes), opened from the page's Report button; the list
+        # read carries only `has_report`. What it costs: at most about
+        # REPORT_MAX_BYTES per kept search (the report was read with that cap),
+        # so RECENT_MAX x that, about 100 MB, when every search left a report at
+        # the cap; real reports are a few KB, a full list well under a MB.
         self.recent: collections.deque = collections.deque()
 
     # --- the caller's three tools ---
@@ -715,7 +722,8 @@ class Searches:
             recs = sorted((dict(r) for r in self.table.values() if r["state"] not in ENDED),
                           key=lambda r: r["submitted_at"])
             kept = self._trim_recent()
-            recent = [{k: v for k, v in e.items() if k != "view"} for e in self.recent]
+            recent = [{**{k: v for k, v in e.items() if k not in ("view", "report")},
+                       "has_report": e["report"] is not None} for e in self.recent]
         return {"searches": [
             {"id": r["id"], "project": r["project"], "consumer": r["consumer"],
              "question": r["question"][:LIST_QUESTION_MAX_CHARS], "searcher": r["searcher"],
@@ -734,9 +742,13 @@ class Searches:
     def _record_end(self, rec: dict, tools: list[dict]) -> None:
         """Under the lock, once per search, when it ends (any way): its line
         in the recent list, with its work view as it ended (`tools`: its
-        trace's tool calls, read outside the lock before it ended)."""
+        trace's tool calls, read outside the lock before it ended), and its
+        report when it ended with one."""
         self.recent.appendleft({
             "id": rec["id"], "view": self._build_view(rec, tools),
+            "report": (json.dumps({k: rec["outcome"][k] for k in ("summary", "sources", "tiers")},
+                                  ensure_ascii=False, separators=(",", ":")).encode()
+                       if "summary" in rec["outcome"] else None),
             "project": rec["project"], "consumer": rec["consumer"],
             "question": rec["question"][:LIST_QUESTION_MAX_CHARS],
             "searcher": rec["searcher"], "state": rec["state"],
@@ -762,6 +774,36 @@ class Searches:
                 return None
         tools = self._trace_tools(sid) if rec["state"] != "queued" else []
         return self._build_view(rec, tools)
+
+    def report(self, sid: str) -> dict | None:
+        """The operator's read of one search's report, as the agent wrote it:
+        from the table while it is there (ended with a report), else from its
+        recent line. `has_report` is False for a search the service knows that
+        has none (still running, or ended without one). None when it is in
+        neither."""
+        with self.lock:
+            rec = self.table.get(sid)
+            if rec is not None:
+                out = {"id": sid, "state": rec["state"], "question": rec["question"],
+                       "searcher": rec["searcher"]}
+                o = rec.get("outcome") or {}
+                if rec["state"] in ENDED and "summary" in o:
+                    return {**out, "has_report": True,
+                            **{k: o[k] for k in ("summary", "sources", "tiers")}}
+                raw = None
+            else:
+                self._trim_recent()
+                for e in self.recent:
+                    if e["id"] == sid:
+                        out = {"id": sid, "state": e["state"], "question": e["view"]["question"],
+                               "searcher": e["searcher"]}
+                        raw = e["report"]
+                        break
+                else:
+                    return None
+        if raw is None:
+            return {**out, "has_report": False}
+        return {**out, "has_report": True, **json.loads(raw)}
 
     @staticmethod
     def _trace_tools(sid: str) -> list[dict]:
@@ -1452,6 +1494,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/test" and post:
             return self._json(200, sign_in_test())
         for prefix, is_post, act in (("/admin/view/", False, SEARCHES.view),
+                                     ("/admin/report/", False, SEARCHES.report),
                                      ("/admin/stop/", True, SEARCHES.stop)):
             if path.startswith(prefix) and post == is_post:
                 sid = path[len(prefix):]
@@ -1509,10 +1552,10 @@ def drop(name: str) -> int:
 
 
 # The exit code of `admin` when the service answered with a refusal (its JSON
-# error on stdout): no such search for view / stop.
+# error on stdout): no such search for view / report / stop.
 ADMIN_REFUSED_EXIT = 3
-_ADMIN_GET = ("status", "list", "view")
-_ADMIN_WITH_ID = ("view", "stop")
+_ADMIN_GET = ("status", "list", "view", "report")
+_ADMIN_WITH_ID = ("view", "report", "stop")
 
 
 def admin(what: str, sid: str | None = None) -> int:
@@ -1552,7 +1595,7 @@ def main(argv: list) -> int:
     if len(argv) in (2, 3) and argv[0] == "admin":
         return admin(*argv[1:])
     sys.stderr.write("usage: service.py serve | put NAME | drop NAME | admin "
-                     "status|ensure|clear|list|test | admin view|stop ID\n")
+                     "status|ensure|clear|list|test | admin view|report|stop ID\n")
     return 2
 
 
