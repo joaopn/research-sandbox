@@ -1405,18 +1405,24 @@ MCP_SERVER_ADD_WEBUI_FIELDS = frozenset({"name", "url", "description", "headers"
 MCP_SERVER_EDIT_WEBUI_FIELDS = frozenset({"name", "url", "description",
                                           "headers_set", "headers_remove"})
 MCP_SERVER_NAME_WEBUI_FIELDS = frozenset({"name"})
-# A server RS runs (an image). The image reference, its arguments, port, path
-# and data folder are operator-supplied docker inputs, each validated by the
-# request (a reference by docker's grammar, the arguments only ever after the
-# image, the data folder only ever a NAMED volume's target, never a bind
-# source). Setting and header VALUES are secrets: they go only into the 0600
-# settings file and the 0600 list on the host.
+# A server RS runs (an image, or a package). The image reference, its
+# arguments, port, path and data folder are operator-supplied docker inputs,
+# each validated by the request (a reference by docker's grammar, the
+# arguments only ever after the image, the data folder only ever a NAMED
+# volume's target, never a bind source). A package's registry is npm or pypi,
+# its name that registry's own name grammar, its version one exact version
+# and its command a file name: each reaches the install and the run as one
+# argv element, never a shell, never a docker option. Setting and header
+# VALUES are secrets: they go only into the 0600 settings file and the 0600
+# list on the host — never into a package's install.
 MCP_RUN_ADD_WEBUI_FIELDS = frozenset({"name", "image", "args", "port", "path", "data",
                                       "settings", "headers", "destinations",
-                                      "description"})
+                                      "description", "registry", "package",
+                                      "version", "command"})
 MCP_RUN_EDIT_WEBUI_FIELDS = frozenset({"name", "description", "args", "port", "path",
                                        "data", "settings_set", "settings_remove",
-                                       "headers_set", "headers_remove", "destinations"})
+                                       "headers_set", "headers_remove", "destinations",
+                                       "version", "command"})
 # Wiring one consumer (a project's agents, or one of its boxes) to servers.
 MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})

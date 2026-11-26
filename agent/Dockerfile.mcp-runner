@@ -1,0 +1,63 @@
+# rs-mcp-runner — the image an MCP server RS runs from a PACKAGE runs in.
+#
+# The same image serves two one-purpose containers per server (cli/mcp_run.py):
+#   - the INSTALL container (`rs-mcpsrv-<name>_install`), one-shot at Add and
+#     Update: it receives no setting and no secret, mounts the server's fresh
+#     package volume at /rs/pkg and runs install.py, which installs exactly one
+#     package at exactly one version from npm or PyPI;
+#   - the SERVER container (`rs-mcpsrv-<name>`): the package volume read-only
+#     at /rs/pkg, the settings from the host's env file, and serve.py, which
+#     runs the installed command as a stdio MCP server behind the bridge.
+# Nothing is fetched when a container starts: Node, uv and the bridge are baked
+# here, the package is in the volume. Built by `research start` (cached) and by
+# the first package Add or Update when missing; Rebuild all rebuilds it. A
+# server records the content digest of the runner it was installed with (an
+# image Id changes at every rebuild, the content does not): a runner whose
+# content changed is taken up by that server's Update (a re-install), never
+# silently.
+#
+# Pins come from versions.env (passed as build args): NODE_VERSION (the node
+# seed's pin), UV_VERSION, SUPERGATEWAY_VERSION. The base is pinned by tag.
+FROM python:3.12.16-slim-bookworm
+
+ARG NODE_VERSION=24.18.0
+ARG UV_VERSION=0.13.10
+ARG SUPERGATEWAY_VERSION=4.3.0
+
+# Node from the official nodejs.org tarball (self-contained, relocatable),
+# fetched with the base's Python: the slim base has no curl.
+RUN python3 - <<'PYEOF'
+import os, platform, urllib.request
+ver = os.environ["NODE_VERSION"]          # the build arg, in the environment
+arch = {"x86_64": "x64", "aarch64": "arm64"}[platform.machine()]
+url = f"https://nodejs.org/dist/v{ver}/node-v{ver}-linux-{arch}.tar.gz"
+urllib.request.urlretrieve(url, "/tmp/node.tar.gz")
+PYEOF
+RUN mkdir -p /opt/node \
+ && tar -xzf /tmp/node.tar.gz -C /opt/node --strip-components=1 --no-same-owner \
+ && rm /tmp/node.tar.gz
+ENV PATH=/opt/node/bin:$PATH
+
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
+
+# The stdio-to-streamable-HTTP bridge, one server process per MCP session.
+RUN npm install --prefix /opt/rs-mcp/bridge --no-audit --no-fund --no-update-notifier \
+        "supergateway@${SUPERGATEWAY_VERSION}" \
+ && npm cache clean --force
+
+COPY container/mcp-runner/install.py container/mcp-runner/serve.py \
+     container/mcp-runner/launch.py /opt/rs-mcp/
+# The package volume's mount point (a fresh named volume takes its owner).
+RUN mkdir -p /rs/pkg
+
+# Caches live in the container's own /tmp, never in the package volume; uv
+# copies from its cache (another filesystem) and never downloads a Python.
+ENV HOME=/tmp \
+    UV_CACHE_DIR=/tmp/uv-cache \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    npm_config_cache=/tmp/npm-cache \
+    npm_config_update_notifier=false \
+    npm_config_fund=false \
+    npm_config_audit=false \
+    PYTHONUNBUFFERED=1

@@ -193,6 +193,8 @@ def cmd_start(args: argparse.Namespace) -> None:
     # The shared MCP gateway: nothing above or below depends on it, so a
     # failure warns and the start carries on.
     rscore.start_mcp_gateway_with_fleet(rebuild=args.rebuild)
+    # RS's image for MCP servers run from a package (cached; a failure warns).
+    rscore.start_mcp_runner_with_fleet()
     # The MCP servers RS runs (each not stopped by the operator): back up with
     # their route out re-injected and the gateway on their networks. A
     # failure warns and the start carries on. Rebuild all never touches them
@@ -1234,7 +1236,11 @@ def _print_mcp_servers(payload: dict) -> None:
         elif row.get("kind") == "run":
             run_ = row["run"]
             reason = f" ({row['reason']})" if row.get("reason") else ""
-            print(f"      runs {run_['image']} as {run_['digest']}: "
+            what = (f"{run_['registry']} {run_['package']}@{run_['version']} "
+                    f"(command {' '.join([run_['command']] + run_['args'])})"
+                    if run_.get("source") == "package"
+                    else f"{run_['image']} as {run_['digest']}")
+            print(f"      runs {what}: "
                   f"{row.get('state', 'unknown')}{reason}"
                   + ("  [stopped by the operator]" if run_["stopped"] else ""))
             for s in run_["settings"]:
@@ -1255,8 +1261,28 @@ def cmd_mcp_server_list(args: argparse.Namespace) -> None:
 
 
 # The flags only a server RS runs takes (its image, its settings, ...).
-_MCP_RUN_FLAGS = ("image", "arg", "port", "path", "data", "setting", "secret_stdin",
-                  "destination", "no_args", "no_data", "no_destinations", "remove_setting")
+_MCP_RUN_FLAGS = ("image", "package", "command", "arg", "port", "path", "data",
+                  "setting", "secret_stdin", "destination", "no_args", "no_data",
+                  "no_destinations", "remove_setting")
+MCP_PACKAGE_FORM = ("--package takes npm:NAME@VERSION or pypi:NAME==VERSION, with one "
+                    "exact version (as in npm:@scope/server@1.2.3 or "
+                    "pypi:mcp-server-fetch==1.2.3)")
+
+
+def _mcp_cli_package(spec: str) -> tuple[str, str, str]:
+    """(registry, name, version) of --package npm:NAME@VERSION |
+    pypi:NAME==VERSION. Only the shape is read here; the request checks the
+    name and the exact version by each registry's own grammar."""
+    registry, sep, rest = spec.partition(":")
+    if sep and registry == "npm":
+        name, at, version = rest.rpartition("@")      # a scope starts with @ too
+        if at and name:
+            return registry, name, version
+    elif sep and registry == "pypi":
+        name, eq, version = rest.partition("==")
+        if eq:
+            return registry, name, version
+    die(MCP_PACKAGE_FORM)
 
 
 def _mcp_cli_run_flags_given(args: argparse.Namespace) -> list[str]:
@@ -1284,9 +1310,32 @@ def _mcp_cli_settings(args: argparse.Namespace) -> dict:
 
 
 def cmd_mcp_server_add(args: argparse.Namespace) -> None:
+    if args.package is not None:
+        if args.url is not None or args.image is not None:
+            die("--package excludes --url and --image: a server RS runs from a package "
+                "has its address made from its name")
+        if args.port is not None or args.path is not None:
+            die("a server RS runs from a package is served on RS's own port and path; "
+                "--port and --path do not apply")
+        if args.command is None:
+            die("--command is required with --package (the program the package installs)")
+        registry, package, version = _mcp_cli_package(args.package)
+        headers = _mcp_cli_headers(args)
+        settings = _mcp_cli_settings(args)
+        req = _build(rscore.McpRunAddRequest, name=args.name, registry=registry,
+                     package=package, version=version, command=args.command,
+                     args=args.arg or [], data=args.data, settings=settings,
+                     headers=headers, destinations=args.destination or [],
+                     description=args.description)
+        out = rscore.mcp_run_add(req)
+        print(f"added MCP server {req.name!r}, running {out['package']}")
+        return
+    if args.command is not None:
+        die("--command belongs to a server RS runs from a package (--package)")
     if args.image is None:
         if args.url is None:
-            die("give the server's address (--url) or the image RS runs it from (--image)")
+            die("give the server's address (--url), the image RS runs it from (--image) "
+                "or the package (--package)")
         given = _mcp_cli_run_flags_given(args)
         if given:
             die(f"only a server RS runs (--image) takes {', '.join(given)}")
@@ -1332,6 +1381,15 @@ def cmd_mcp_server_edit(args: argparse.Namespace) -> None:
     if args.image is not None:
         die("a server RS runs keeps its image; remove it and add it again to run "
             "another (update re-fetches the same one)")
+    version = None
+    if args.package is not None:
+        registry, package, version = _mcp_cli_package(args.package)
+        _state, data, _why = rscore.mcp_servers.read()
+        run_ = data["servers"][args.name]["run"]
+        if not rscore.mcp_run.is_package(run_) or (registry, package) != (
+                run_["registry"], run_["package"]):
+            die("a server RS runs keeps its package; --package may change only its "
+                "version (remove the server and add it again to run another)")
     if args.arg and args.no_args:
         die("--arg and --no-args exclude each other")
     if args.data is not None and args.no_data:
@@ -1346,7 +1404,8 @@ def cmd_mcp_server_edit(args: argparse.Namespace) -> None:
                  data="" if args.no_data else args.data,
                  settings_set=settings, settings_remove=args.remove_setting or [],
                  headers_set=headers, headers_remove=args.remove_header or [],
-                 destinations=[] if args.no_destinations else (args.destination or None))
+                 destinations=[] if args.no_destinations else (args.destination or None),
+                 version=version, command=args.command)
     out = rscore.mcp_run_edit(req)
     print(f"changed MCP server {req.name!r} ({out['state']})")
 
@@ -1371,6 +1430,11 @@ def cmd_mcp_server_stop(args: argparse.Namespace) -> None:
 def cmd_mcp_server_update(args: argparse.Namespace) -> None:
     req = _build(rscore.McpServerNameRequest, name=args.name)
     out = rscore.mcp_run_update(req)
+    if "package" in out:
+        print(f"MCP server {req.name!r}: {out['package']} installed again"
+              + (f" on a new runner image ({out['old']} -> {out['new']})"
+                 if out["old"] != out["new"] else "") + f" ({out['state']})")
+        return
     print(f"MCP server {req.name!r}: {out['old']} -> {out['new']} ({out['state']})"
           if out["old"] != out["new"] else
           f"MCP server {req.name!r}: image unchanged ({out['state']})")
@@ -3611,12 +3675,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     msa = msv_sub.add_parser("add", help="add a server at an http:// or https:// address "
                                          "(--url), or one RS runs from a container "
-                                         "image (--image)")
+                                         "image (--image) or a package (--package)")
     msa.add_argument("name")
     msa.add_argument("--url", default=None, metavar="URL")
     msa.add_argument("--image", default=None, metavar="REF",
                      help="run the server from this container image (pinned by "
                           "content digest at add)")
+    msa.add_argument("--package", default=None, metavar="npm:NAME@VERSION|pypi:NAME==VERSION",
+                     help="run the server from this npm or PyPI package, at this one "
+                          "exact version (installed once, served on RS's own port)")
+    msa.add_argument("--command", default=None, metavar="CMD",
+                     help="(with --package) the program the package installs; it must "
+                          "speak MCP over stdio")
     msa.add_argument("--description", default=None)
     _mcp_header_flags(msa)
     _mcp_run_flags(msa, add=True)
@@ -3627,6 +3697,11 @@ def build_parser() -> argparse.ArgumentParser:
     mse.add_argument("name")
     mse.add_argument("--url", default=None, metavar="URL")
     mse.add_argument("--image", default=None, help=argparse.SUPPRESS)
+    mse.add_argument("--package", default=None, metavar="npm:NAME@VERSION|pypi:NAME==VERSION",
+                     help="(a server RS runs from a package) the same package at another "
+                          "exact version, installed again before the server moves to it")
+    mse.add_argument("--command", default=None, metavar="CMD",
+                     help="(a server RS runs from a package) the program to run")
     mse.add_argument("--description", default=None)
     _mcp_header_flags(mse)
     mse.add_argument("--remove-header", action="append", metavar="NAME",
@@ -3651,7 +3726,9 @@ def build_parser() -> argparse.ArgumentParser:
             ("restart", cmd_mcp_server_restart, "re-create a server RS runs on its "
                                                 "saved settings"),
             ("update", cmd_mcp_server_update, "fetch a server's image again, pin the "
-                                              "digest it now names and re-create it"),
+                                              "digest it now names and re-create it (a "
+                                              "package server: install its version "
+                                              "again)"),
             ("logs", cmd_mcp_server_logs, f"the last {rscore.MCP_RUN_LOG_LINES} lines "
                                           "of a server RS runs (it may print its own "
                                           "secrets there)")):

@@ -7050,6 +7050,9 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
         "note": "verify bundled VS Code in the release notes before bumping",
     },
     "PLAYWRIGHT_MCP_VERSION": {"kind": "npm", "pkg": "@playwright/mcp"},
+    # RS's image for MCP servers run from a package (rs-mcp-runner).
+    "UV_VERSION": {"kind": "pypi", "pkg": "uv"},
+    "SUPERGATEWAY_VERSION": {"kind": "npm", "pkg": "supergateway"},
     "PYYAML_VERSION": {"kind": "pypi", "pkg": "PyYAML"},
     "AIOHTTP_VERSION": {"kind": "pypi", "pkg": "aiohttp"},
     # Reader dist pins (STAGE_READER) — nbconvert + markdown, dist-pin-only.
@@ -12238,8 +12241,15 @@ def _build_images(force: bool, progress=None) -> None:
 def rebuild(progress=None) -> None:
     """Rebuild the full image fleet (force). Thin public wrapper the broker build
     lane calls; the CLI reaches _build_images directly via `start --rebuild`.
-    The shared MCP gateway's image is rebuilt with it, best-effort."""
+    The shared MCP gateway's image and RS's image for package servers are
+    rebuilt with it, best-effort."""
     _build_images(True, progress=progress)
+    # RS's image for package servers, best-effort too. A server already
+    # installed keeps running the image it was installed with; its Update
+    # installs it again on this one.
+    (progress or _NULL_PROGRESS).step("build", f"building {mcp_run.RUNNER_IMAGE}")
+    if not _mcp_runner_build():
+        print(f"warning: {mcp_run.RUNNER_IMAGE} could not be rebuilt", file=sys.stderr)
     (progress or _NULL_PROGRESS).step("build", f"building {MCP_GATEWAY_IMAGE}")
     if not _mcp_gateway_build():
         print(f"warning: {MCP_GATEWAY_IMAGE} could not be rebuilt", file=sys.stderr)
@@ -20610,13 +20620,19 @@ def _mcp_run_data(value: Any) -> str:
     return value
 
 
+MCP_RUN_PACKAGE_NO_PORT = ("a server RS runs from a package is served on RS's own "
+                           "port and path; it takes no port or path")
+
+
 @dataclass(frozen=True)
 class McpRunAddRequest:
-    """A server RS runs from an image. `settings` and `headers` carry secret
-    values: never repr'd, never logged."""
+    """A server RS runs from an image (`image`, `port`, `path`) or from a
+    package (`registry`, `package`, `version`, `command`; RS serves it on its
+    own port and path). `settings` and `headers` carry secret values: never
+    repr'd, never logged."""
     name: str
-    image: str
-    port: int
+    image: str = ""
+    port: int = 0
     path: str = "/mcp"
     args: list = field(default_factory=list)
     data: str = ""
@@ -20624,20 +20640,45 @@ class McpRunAddRequest:
     headers: dict = field(default_factory=dict, repr=False)
     destinations: list = field(default_factory=list)
     description: str = ""
+    registry: str = ""
+    package: str = ""
+    version: str = ""
+    command: str = ""
+
+    @property
+    def is_package(self) -> bool:
+        return bool(self.registry)
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "McpRunAddRequest":
+        common = dict(name=_mcp_run_name(kw.get("name")),
+                      args=_mcp_run_args(kw.get("args")),
+                      data=_mcp_run_data(kw.get("data")),
+                      settings=_mcp_run_settings(kw.get("settings")),
+                      headers=_mcp_headers(kw.get("headers")),
+                      destinations=_mcp_run_destinations(kw.get("destinations")),
+                      description=_mcp_description(kw.get("description")))
+        if kw.get("registry") is not None or kw.get("package") is not None:
+            if kw.get("image") is not None:
+                raise ValidationError("a server RS runs comes from an image or from "
+                                      "a package, not both")
+            if kw.get("port") is not None or kw.get("path") is not None:
+                raise ValidationError(MCP_RUN_PACKAGE_NO_PORT)
+            registry = kw.get("registry")
+            _mcp_run_check(mcp_run.registry_problem(registry))
+            _mcp_run_check(mcp_run.package_problem(registry, kw.get("package")))
+            _mcp_run_check(mcp_run.version_problem(registry, kw.get("version")))
+            _mcp_run_check(mcp_run.command_problem(kw.get("command")))
+            return cls(registry=registry, package=kw["package"], version=kw["version"],
+                       command=kw["command"], **common)
+        if kw.get("version") is not None or kw.get("command") is not None:
+            raise ValidationError("a version and a command belong to a server RS runs "
+                                  "from a package")
         _mcp_run_check(mcp_run.image_problem(kw.get("image")))
         _mcp_run_check(mcp_run.port_problem(kw.get("port")))
         path = "/mcp" if kw.get("path") is None else kw.get("path")
         _mcp_run_check(mcp_run.path_problem(path))
-        return cls(name=_mcp_run_name(kw.get("name")), image=kw["image"],
-                   port=kw["port"], path=path, args=_mcp_run_args(kw.get("args")),
-                   data=_mcp_run_data(kw.get("data")),
-                   settings=_mcp_run_settings(kw.get("settings")),
-                   headers=_mcp_headers(kw.get("headers")),
-                   destinations=_mcp_run_destinations(kw.get("destinations")),
-                   description=_mcp_description(kw.get("description")))
+        return cls(image=kw["image"], port=kw["port"], path=path, **common)
 
 
 @dataclass(frozen=True)
@@ -20659,9 +20700,23 @@ class McpRunEditRequest:
     headers_set: dict = field(default_factory=dict, repr=False)
     headers_remove: tuple = ()
     destinations: list | None = None
+    # A package server only: a new exact version (installed again into a
+    # fresh package volume) and the command to run. Checked against the
+    # server's registry when it is applied.
+    version: str | None = None
+    command: str | None = None
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "McpRunEditRequest":
+        version = kw.get("version")
+        # The server's own registry's grammar is applied with the change;
+        # here, one exact version of either.
+        if version is not None and all(mcp_run.version_problem(r, version)
+                                       for r in mcp_run.REGISTRIES):
+            raise ValidationError("the version must be one exact version, as in 1.2.3 "
+                                  "(no range, no operator, no tag)")
+        if kw.get("command") is not None:
+            _mcp_run_check(mcp_run.command_problem(kw["command"]))
         if kw.get("port") is not None:
             _mcp_run_check(mcp_run.port_problem(kw["port"]))
         if kw.get("path") is not None:
@@ -20692,7 +20747,8 @@ class McpRunEditRequest:
             settings_set=settings_set, settings_remove=tuple(remove),
             headers_set=headers_set, headers_remove=tuple(hremove),
             destinations=(None if kw.get("destinations") is None
-                          else _mcp_run_destinations(kw["destinations"])))
+                          else _mcp_run_destinations(kw["destinations"])),
+            version=version, command=kw.get("command"))
 
 
 def _mcp_run_entry(data: dict, name: str) -> dict:
@@ -20715,11 +20771,13 @@ def _mcp_run_labels(raw: str) -> dict:
     return labels if isinstance(labels, dict) else {}
 
 
-def _mcp_run_container(name: str, deadline: float | None) -> tuple[str, str | None]:
-    """(docker state | "absent", the server name its label names)."""
+def _mcp_run_container(name: str, deadline: float | None, *,
+                       install: bool = False) -> tuple[str, str | None]:
+    """(docker state | "absent", the server name its label names) of the
+    server's container, or (`install`) of its package's install container."""
+    cname = mcp_run.install_container_name(name) if install else mcp_run.container_name(name)
     r = _mcp_docker(["docker", "container", "inspect", "-f",
-                     "{{.State.Status}}|{{json .Config.Labels}}",
-                     mcp_run.container_name(name)], deadline)
+                     "{{.State.Status}}|{{json .Config.Labels}}", cname], deadline)
     if r.returncode != 0:
         return "absent", None
     status, _, raw = r.stdout.strip().partition("|")
@@ -20764,10 +20822,12 @@ def _mcp_run_check_network(name: str, info: dict) -> None:
             "disconnected on the host before this server can run")
 
 
-def _mcp_run_volume(name: str, deadline: float | None) -> str | None:
-    """The server name the data volume's label names; None = no volume."""
+def _mcp_run_volume(name: str, deadline: float | None,
+                    volume: str | None = None) -> str | None:
+    """The server name the data volume's (or `volume`'s) label names; None =
+    no volume."""
     r = _mcp_docker(["docker", "volume", "inspect", "-f", "{{json .Labels}}",
-                     mcp_run.volume_name(name)], deadline)
+                     volume or mcp_run.volume_name(name)], deadline)
     if r.returncode != 0:
         return None
     return _mcp_run_labels(r.stdout.strip()).get(mcp_run.NAME_LABEL) or ""
@@ -20812,6 +20872,34 @@ def _mcp_run_env_names() -> list[str]:
     return names
 
 
+def _mcp_run_container_kind(obj: str, name: str) -> str | None:
+    """What a container RS labelled for the run server `name` is, by its name."""
+    if obj == mcp_run.container_name(name):
+        return "container"
+    if obj == mcp_run.install_container_name(name):
+        return "install container"
+    return None
+
+
+def _mcp_run_volume_kind(obj: str, name: str) -> str | None:
+    if obj == mcp_run.volume_name(name):
+        return "volume"
+    if mcp_run.is_pkg_volume_of(name, obj):
+        return "package volume"
+    return None
+
+
+def _mcp_run_pkg_volumes(name: str, deadline: float | None) -> list[str]:
+    """The package volumes RS made for the run server `name` (by its name
+    label and the package-volume names), sorted."""
+    r = _mcp_docker(["docker", "volume", "ls", "--filter",
+                     f"label={mcp_run.NAME_LABEL}={name}", "--format", "{{.Name}}"],
+                    deadline)
+    if r.returncode != 0:
+        raise mcp_run.RunError(_MCP_HOST_DOWN)
+    return sorted(v for v in (r.stdout or "").split() if mcp_run.is_pkg_volume_of(name, v))
+
+
 def _mcp_run_found(deadline: float | None) -> tuple[dict, str]:
     """({server name: [kinds found]}, the container listing's output) of
     everything RS made for any run server: one listing by label each for
@@ -20824,22 +20912,22 @@ def _mcp_run_found(deadline: float | None) -> tuple[dict, str]:
             found[name].append(kind)
     label = "{{.Label \"" + mcp_run.NAME_LABEL + "\"}}"
     ps_out = ""
-    for argv, kind, fmt, made in (
-            (["docker", "ps", "-a"], "container",
-             "{{.Names}}\t" + label + "\t{{.State}}\t{{.Status}}", mcp_run.container_name),
-            (["docker", "network", "ls"], "network", "{{.Name}}\t" + label,
-             mcp_run.network_name),
-            (["docker", "volume", "ls"], "volume", "{{.Name}}\t" + label,
-             mcp_run.volume_name)):
+    for argv, fmt, kind_of in (
+            (["docker", "ps", "-a"], "{{.Names}}\t" + label + "\t{{.State}}\t{{.Status}}",
+             _mcp_run_container_kind),
+            (["docker", "network", "ls"], "{{.Name}}\t" + label,
+             lambda obj, n: "network" if obj == mcp_run.network_name(n) else None),
+            (["docker", "volume", "ls"], "{{.Name}}\t" + label, _mcp_run_volume_kind)):
         r = _mcp_docker(argv + ["--filter", f"label={mcp_run.RUN_LABEL}=1",
                                 "--format", fmt], deadline)
         if r.returncode != 0:
             raise ValidationError(_MCP_HOST_DOWN)
-        if kind == "container":
+        if argv[1] == "ps":
             ps_out = r.stdout or ""
         for line in (r.stdout or "").splitlines():
             parts = line.split("\t")
-            if len(parts) >= 2 and parts[0] == made(parts[1]):
+            kind = kind_of(parts[0], parts[1]) if len(parts) >= 2 else None
+            if kind:
                 note(parts[1], kind)
     for name in _mcp_run_env_names():
         note(name, "settings file")
@@ -20854,11 +20942,15 @@ def _mcp_run_leftovers_of(name: str, deadline: float | None) -> list[str]:
     kinds = []
     if _mcp_run_container(name, deadline)[1] == name:
         kinds.append("container")
+    if _mcp_run_container(name, deadline, install=True)[1] == name:
+        kinds.append("install container")
     info = _mcp_run_network(name, deadline)
     if info is not None and info["owner"] == name:
         kinds.append("network")
     if _mcp_run_volume(name, deadline) == name:
         kinds.append("volume")
+    if _mcp_run_pkg_volumes(name, deadline):
+        kinds.append("package volume")
     try:
         os.lstat(mcp_run.env_path(name))
         kinds.append("settings file")
@@ -20878,6 +20970,9 @@ def _mcp_run_names_free(name: str) -> None:
             name=name, what=_mcp_run_kinds_text(left)))
     if _mcp_run_container(name, None)[0] != "absent":
         raise _mcp_run_foreign("container", mcp_run.container_name(name), name, remedy)
+    if _mcp_run_container(name, None, install=True)[0] != "absent":
+        raise _mcp_run_foreign("container", mcp_run.install_container_name(name), name,
+                               remedy)
     if _mcp_run_network(name, None) is not None:
         raise _mcp_run_foreign("network", mcp_run.network_name(name), name, remedy)
     if _mcp_run_volume(name, None) is not None:
@@ -21035,6 +21130,196 @@ def _mcp_run_inject_route(name: str, network: str) -> None:
                                "router could not be set") from None
 
 
+def _mcp_run_net_up(name: str, run_: dict) -> None:
+    """The server's network (made, or checked to be RS's own) and the
+    router's rules for it: what both the server and its package's install
+    run on."""
+    net = mcp_run.network_name(name)
+    info = _mcp_run_network(name, None)
+    if info is None:
+        r = _mcp_docker(mcp_run.network_create_argv(name, network_create_args(net)), None)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the network of the MCP server {name} could not "
+                                  "be created", r)
+    else:
+        _mcp_run_check_network(name, info)
+    _mcp_run_router_rules(name, run_, net)
+
+
+# --- servers RS runs from a package: the runner image and the install -------------
+
+MCP_RUNNER_MISSING = ("RS's image for servers run from a package is not built, so "
+                      "the MCP server {name} was not started; Update on its row "
+                      "builds it and installs the package again")
+MCP_RUNNER_CHANGED = ("the MCP server {name} was installed with an earlier version "
+                      "of RS's image for servers run from a package, so it was not "
+                      "started; Update on its row installs the package again on the "
+                      "current one")
+MCP_RUN_NOT_INSTALLED = ("the installed package of the MCP server {name} is missing, "
+                         "so it was not started; Update on its row installs it again")
+MCP_RUN_INSTALL_FAILED = ("the package {package} {version} could not be installed "
+                          "(the operation's log has the installer's output); nothing "
+                          "of the running server was changed")
+
+
+def _mcp_runner_identity(deadline: float | None) -> tuple[str, str]:
+    """(image Id, content identity) of the runner image; ("", "") when it
+    is not built (mcp_run.runner_identity)."""
+    r = _mcp_docker(["docker", "image", "inspect", "-f", mcp_run.RUNNER_INSPECT_FORMAT,
+                     mcp_run.RUNNER_IMAGE], deadline)
+    return mcp_run.runner_identity(r.stdout or "") if r.returncode == 0 else ("", "")
+
+
+def _mcp_runner_build() -> bool:
+    """Build RS's image for package servers from this tree (cached: seconds;
+    the first build fetches Node, uv and the bridge). Its output goes to the
+    caller's stdout. Like the gateway's it is NOT in _image_build_specs; the
+    pins it declares an ARG for come from the versions files."""
+    dockerfile = SCRIPT_DIR / "agent" / mcp_run.RUNNER_DOCKERFILE
+    try:
+        text = dockerfile.read_text()
+        build_args: list[str] = []
+        for key, value in load_versions().items():
+            if f"ARG {key}=" in text:
+                build_args += ["--build-arg", f"{key}={value}"]
+        r = run(["docker", "build", "-f", str(dockerfile), "-t", mcp_run.RUNNER_IMAGE,
+                 *build_args, str(SCRIPT_DIR)])
+    except OSError:
+        return False
+    return r.returncode == 0
+
+
+def start_mcp_runner_with_fleet() -> None:
+    """`research start`'s step: build RS's image for package servers (cached),
+    or WARN and carry on — the servers already installed keep the image they
+    were installed with; only a new install needs it."""
+    print(f"building {mcp_run.RUNNER_IMAGE}...")
+    if _mcp_runner_build():
+        return
+    if _mcp_runner_identity(None)[0]:
+        print(f"warning: {mcp_run.RUNNER_IMAGE} could not be rebuilt; it keeps its "
+              "previous image", file=sys.stderr)
+    else:
+        print(f"warning: {mcp_run.RUNNER_IMAGE} could not be built; MCP servers "
+              "cannot be added from a package until it is", file=sys.stderr)
+
+
+def _mcp_runner_ensure(progress) -> tuple[str, str]:
+    """(image Id, content identity) of the runner image, built first when it
+    is missing (the build lane)."""
+    image_id, content = _mcp_runner_identity(None)
+    if not image_id:
+        progress.step("build", f"building {mcp_run.RUNNER_IMAGE}")
+        if not _mcp_runner_build():
+            raise mcp_run.RunError("RS's image for servers run from a package could "
+                                   "not be built (the operation's log has the "
+                                   "build's output)")
+        image_id, content = _mcp_runner_identity(None)
+        if not image_id:
+            raise mcp_run.RunError("RS's image for servers run from a package could "
+                                   "not be read after its build")
+    return image_id, content
+
+
+def _mcp_run_check_installed(name: str, run_: dict) -> str:
+    """Before a package server starts: the runner image holds what it was
+    installed with (a start never installs, so another one is refused), and
+    its package volume is RS's. Returns the image Id to run."""
+    image_id, content = _mcp_runner_identity(None)
+    if not image_id:
+        raise mcp_run.RunError(MCP_RUNNER_MISSING.format(name=name))
+    if content != run_["runner_id"]:
+        raise mcp_run.RunError(MCP_RUNNER_CHANGED.format(name=name))
+    volume = mcp_run.pkg_volume_name(name, run_["install"])
+    owner = _mcp_run_volume(name, None, volume)
+    if owner is None:
+        raise mcp_run.RunError(MCP_RUN_NOT_INSTALLED.format(name=name))
+    if owner != name:
+        raise _mcp_run_foreign("volume", volume, name)
+    return image_id
+
+
+def _mcp_run_drop_install(name: str, deadline: float | None) -> None:
+    """Remove the package's install container (one RS made for it), if any."""
+    state, owner = _mcp_run_container(name, deadline, install=True)
+    if state == "absent":
+        return
+    cname = mcp_run.install_container_name(name)
+    if owner != name:
+        raise _mcp_run_foreign("container", cname, name)
+    r = _mcp_docker(["docker", "rm", "-f", cname], deadline)
+    if r.returncode != 0:
+        raise _mcp_run_failed(f"the install container of the MCP server {name} could "
+                              "not be removed", r)
+
+
+def _mcp_run_drop_pkg_volume(name: str, volume: str, deadline: float | None) -> None:
+    """Remove one of the server's package volumes, by its name (absent is no
+    error; one RS did not make for this server refuses)."""
+    owner = _mcp_run_volume(name, deadline, volume)
+    if owner is None:
+        return
+    if owner != name:
+        raise _mcp_run_foreign("volume", volume, name)
+    r = _mcp_docker(["docker", "volume", "rm", volume], deadline)
+    if r.returncode != 0:
+        raise _mcp_run_failed(f"a package volume of the MCP server {name} could not "
+                              "be removed", r)
+
+
+def _mcp_run_install(name: str, run_: dict, install: int, runner_image: str) -> None:
+    """Install the package `run_` names into the FRESH package volume of
+    install number `install`, in a one-shot container of the runner image
+    `runner_image` (its Id) that gets no setting and no secret, on the server's own
+    network and router rules (registries are reached on 443). The install's
+    output streams into the operation's log. On any failure the new volume
+    and the container are removed and RunError is raised; the server's
+    running container and its current volume are never touched."""
+    volume = mcp_run.pkg_volume_name(name, install)
+    _mcp_run_net_up(name, run_)
+    _mcp_run_drop_install(name, None)
+    # A volume of that number left by an install that was cut short.
+    _mcp_run_drop_pkg_volume(name, volume, None)
+    ok = False
+    try:
+        r = _mcp_docker(mcp_run.volume_create_argv(name, volume), None)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the package volume of the MCP server {name} could "
+                                  "not be created", r)
+        r = _mcp_docker(mcp_run.install_run_argv(name, runner_image, install,
+                                                 load_config().sandbox_dns), None)
+        if r.returncode != 0:
+            raise _mcp_run_failed(f"the install of the MCP server {name}'s package "
+                                  "could not be started", r)
+        try:
+            # die()'s line (the docker command) stays out of the log, as for
+            # the server's own route.
+            with contextlib.redirect_stderr(io.StringIO()):
+                inject_route(mcp_run.install_container_name(name),
+                             get_router_ip(mcp_run.network_name(name)))
+        except SystemExit:
+            raise mcp_run.RunError(f"the install of the MCP server {name}'s package "
+                                   "could not be given its route out through RS's "
+                                   "router") from None
+        print(f"installing {run_['registry']} {run_['package']} {run_['version']} ...",
+              flush=True)
+        try:
+            installed = run(mcp_run.install_exec_argv(name, run_)).returncode == 0
+        except OSError:
+            raise mcp_run.RunError(_MCP_HOST_DOWN) from None
+        if not installed:
+            raise mcp_run.RunError(MCP_RUN_INSTALL_FAILED.format(
+                package=run_["package"], version=run_["version"]))
+        ok = True
+    finally:
+        try:
+            _mcp_run_drop_install(name, None)
+            if not ok:
+                _mcp_run_drop_pkg_volume(name, volume, None)
+        except (mcp_run.RunError, ValidationError) as e:
+            print(f"warning: {e}", file=sys.stderr)
+
+
 def _mcp_run_up(name: str, entry: dict, *, recreate: bool) -> None:
     """Make the server run what its entry says: network, router rules, data
     volume, container (re-created when `recreate`, else started as it is),
@@ -21045,18 +21330,11 @@ def _mcp_run_up(name: str, entry: dict, *, recreate: bool) -> None:
     values = mcp_run.read_env(name)
     if values is None or not mcp_run.env_matches(run_, values):
         raise mcp_run.RunError(MCP_RUN_ENV_MISMATCH.format(name=name))
+    runner_image = _mcp_run_check_installed(name, run_) if mcp_run.is_package(run_) else ""
     state, owner = _mcp_run_container(name, None)
     if state != "absent" and owner != name:
         raise _mcp_run_foreign("container", cname, name)
-    info = _mcp_run_network(name, None)
-    if info is None:
-        r = _mcp_docker(mcp_run.network_create_argv(name, network_create_args(net)), None)
-        if r.returncode != 0:
-            raise _mcp_run_failed(f"the network of the MCP server {name} could not "
-                                  "be created", r)
-    else:
-        _mcp_run_check_network(name, info)
-    _mcp_run_router_rules(name, run_, net)
+    _mcp_run_net_up(name, run_)
     if "data" in run_:
         vowner = _mcp_run_volume(name, None)
         if vowner is None:
@@ -21073,7 +21351,8 @@ def _mcp_run_up(name: str, entry: dict, *, recreate: bool) -> None:
                                   "not be removed", r)
         state = "absent"
     if state == "absent":
-        r = _mcp_docker(mcp_run.run_argv(name, run_, load_config().sandbox_dns), None)
+        r = _mcp_docker(mcp_run.run_argv(name, run_, load_config().sandbox_dns,
+                                         runner_image), None)
         if r.returncode != 0:
             raise _mcp_run_failed(f"the MCP server {name} could not be started", r)
     elif state not in ("running", "restarting"):
@@ -21124,8 +21403,9 @@ def _mcp_run_lane(work: Callable[[], dict]) -> dict:
 
 
 def mcp_run_add(req: McpRunAddRequest, progress=None) -> dict:
-    """Add a server RS runs: validate, pull and pin the image, write the
-    settings file and the list entry, bring it up."""
+    """Add a server RS runs: validate, pull and pin the image (or install the
+    package, with no setting given to its install), write the settings file
+    and the list entry, bring it up."""
     progress = progress or _NULL_PROGRESS
 
     def work() -> dict:
@@ -21134,16 +21414,27 @@ def mcp_run_add(req: McpRunAddRequest, progress=None) -> dict:
             raise mcp_servers.ServerListError(
                 f"a server named {req.name} is already on the list")
         _mcp_run_names_free(req.name)
-        progress.step("pull", "fetching the server's image")
-        pinned = _mcp_run_pin(req.image)
-        resolved = _mcp_run_resolve(req.destinations)
-        run_: dict = {"image": req.image, "digest": pinned, "args": list(req.args),
-                      "port": req.port, "path": req.path,
-                      "settings": {sn: ({"secret": True} if spec["secret"]
-                                        else {"secret": False, "value": spec["value"]})
-                                   for sn, spec in req.settings.items()},
-                      "destinations": list(req.destinations), "resolved": resolved,
-                      "stopped": False}
+        settings = {sn: ({"secret": True} if spec["secret"]
+                         else {"secret": False, "value": spec["value"]})
+                    for sn, spec in req.settings.items()}
+        if req.is_package:
+            resolved = _mcp_run_resolve(req.destinations)
+            runner_image, runner_id = _mcp_runner_ensure(progress)
+            run_: dict = {mcp_run.SOURCE_KEY: mcp_run.SOURCE_PACKAGE,
+                          "registry": req.registry, "package": req.package,
+                          "version": req.version, "command": req.command,
+                          "args": list(req.args), "runner_id": runner_id, "install": 1,
+                          "settings": settings, "destinations": list(req.destinations),
+                          "resolved": resolved, "stopped": False}
+            pinned = f"{req.registry} {req.package} {req.version}"
+        else:
+            progress.step("pull", "fetching the server's image")
+            pinned = _mcp_run_pin(req.image)
+            resolved = _mcp_run_resolve(req.destinations)
+            run_ = {"image": req.image, "digest": pinned, "args": list(req.args),
+                    "port": req.port, "path": req.path, "settings": settings,
+                    "destinations": list(req.destinations), "resolved": resolved,
+                    "stopped": False}
         if req.data:
             run_["data"] = req.data
         entry: dict = {"run": run_}
@@ -21152,6 +21443,18 @@ def mcp_run_add(req: McpRunAddRequest, progress=None) -> dict:
         if req.headers:
             entry["headers"] = dict(req.headers)
         _mcp_run_check(mcp_servers.entry_problem(req.name, entry))
+        if req.is_package:
+            progress.step("install", f"installing {pinned}")
+            try:
+                _mcp_run_install(req.name, run_, 1, runner_image)
+            except mcp_run.RunError:
+                # Nothing is on the list yet: what the install made (the
+                # network and its rules) goes again, each by its name.
+                try:
+                    _mcp_run_teardown(req.name, None)
+                except (mcp_run.RunError, ValidationError) as e:
+                    print(f"warning: {e}", file=sys.stderr)
+                raise
 
         def change(data: dict) -> dict:
             if req.name in data["servers"]:
@@ -21163,7 +21466,12 @@ def mcp_run_add(req: McpRunAddRequest, progress=None) -> dict:
         progress.step("start", f"starting the MCP server {req.name}")
         _mcp_run_up(req.name, entry, recreate=False)
         print(f"the MCP server {req.name} runs {pinned}", flush=True)
-        return {"server": req.name, "state": "running", "digest": pinned}
+        out = {"server": req.name, "state": "running"}
+        if req.is_package:
+            out["package"] = pinned
+        else:
+            out["digest"] = pinned
+        return out
     return _mcp_run_lane(work)
 
 
@@ -21174,14 +21482,40 @@ def mcp_run_edit(req: McpRunEditRequest, progress=None) -> dict:
 
     def work() -> dict:
         progress.step("check", f"checking the MCP server {req.name}")
-        _mcp_run_entry(mcp_servers.load(), req.name)
+        current = _mcp_run_entry(mcp_servers.load(), req.name)
+        package = mcp_run.is_package(current["run"])
+        if package and (req.port is not None or req.path is not None):
+            raise mcp_run.RunError(MCP_RUN_PACKAGE_NO_PORT)
+        if not package and (req.version is not None or req.command is not None):
+            raise mcp_run.RunError("a version and a command belong to a server RS runs "
+                                   "from a package")
+        if package and req.version is not None:
+            _mcp_run_check(mcp_run.version_problem(current["run"]["registry"], req.version))
         resolved = (None if req.destinations is None
                     else _mcp_run_resolve(req.destinations))
+        # A new version is installed FIRST, into a fresh package volume; the
+        # server is switched to it only once the install succeeded.
+        reinstall = package and req.version not in (None, current["run"]["version"])
+        old_install = current["run"]["install"] if package else None
+        if reinstall:
+            runner_image, runner_id = _mcp_runner_ensure(progress)
+            target = dict(current["run"], version=req.version)
+            progress.step("install", f"installing {target['package']} {req.version}")
+            _mcp_run_install(req.name, target, old_install + 1, runner_image)
 
         def change(data: dict) -> dict:
             entry = _mcp_run_entry(data, req.name)
             new = json.loads(json.dumps(entry))          # a deep copy
             run_ = new["run"]
+            if package:
+                if not mcp_run.is_package(run_) or run_["install"] != old_install:
+                    raise mcp_servers.ServerListError(
+                        f"the MCP server {req.name} was changed meanwhile; try again")
+                if reinstall:
+                    run_.update(version=req.version, install=old_install + 1,
+                                runner_id=runner_id)
+                if req.command is not None:
+                    run_["command"] = req.command
             if req.description is not None:
                 if req.description:
                     new["description"] = req.description
@@ -21233,12 +21567,31 @@ def mcp_run_edit(req: McpRunEditRequest, progress=None) -> dict:
                 raise mcp_servers.ServerListError(problem)
             data["servers"][req.name] = new
             return values
-        entry = _mcp_run_save(req.name, change)
+        try:
+            entry = _mcp_run_save(req.name, change)
+        except mcp_servers.ServerListError:
+            if reinstall:
+                _mcp_run_forget_volume(req.name, old_install + 1)
+            raise
         progress.step("start", f"applying the change to the MCP server {req.name}")
-        state = _mcp_run_apply(req.name, entry)
+        try:
+            state = _mcp_run_apply(req.name, entry)
+        finally:
+            if reinstall:
+                _mcp_run_forget_volume(req.name, old_install)
         print(f"changed the MCP server {req.name} ({state})", flush=True)
         return {"server": req.name, "state": state}
     return _mcp_run_lane(work)
+
+
+def _mcp_run_forget_volume(name: str, install: int) -> None:
+    """Remove a package volume nothing uses any more (the one a server was
+    switched away from, or a fresh one the list never named). A failure
+    warns: Remove clears every package volume of the server."""
+    try:
+        _mcp_run_drop_pkg_volume(name, mcp_run.pkg_volume_name(name, install), None)
+    except (mcp_run.RunError, ValidationError) as e:
+        print(f"warning: {e}", file=sys.stderr)
 
 
 def _mcp_run_set_stopped(name: str, stopped: bool, *, blocking: bool = True) -> dict:
@@ -21276,11 +21629,14 @@ def mcp_server_restart(req: McpServerNameRequest, progress=None) -> dict:
 
 def mcp_run_update(req: McpServerNameRequest, progress=None) -> dict:
     """Pull the server's image reference again, pin the digest it now names
-    (old and new shown), re-create the server on it."""
+    (old and new shown), re-create the server on it. A package server: its
+    recorded version is installed again (_mcp_run_reinstall)."""
     progress = progress or _NULL_PROGRESS
 
     def work() -> dict:
         entry = _mcp_run_entry(mcp_servers.load(), req.name)
+        if mcp_run.is_package(entry["run"]):
+            return _mcp_run_reinstall(req.name, entry, progress)
         ref, old = entry["run"]["image"], entry["run"]["digest"]
         progress.step("pull", f"fetching {ref} again")
         new = _mcp_run_pin(ref)
@@ -21300,6 +21656,43 @@ def mcp_run_update(req: McpServerNameRequest, progress=None) -> dict:
         state = _mcp_run_apply(req.name, entry)
         return {"server": req.name, "state": state, "old": old, "new": new}
     return _mcp_run_lane(work)
+
+
+def _mcp_run_reinstall(name: str, entry: dict, progress) -> dict:
+    """A package server's Update: install the SAME recorded version again, on
+    the current runner image, into a fresh package volume; switch the server
+    to it only when the install succeeded (so a runner image change or a
+    broken install heals, and a failed one leaves the server as it was), then
+    remove the old volume."""
+    run_ = entry["run"]
+    old_install, old_runner = run_["install"], run_["runner_id"]
+    runner_image, runner_id = _mcp_runner_ensure(progress)
+    progress.step("install", f"installing {run_['package']} {run_['version']} again")
+    _mcp_run_install(name, run_, old_install + 1, runner_image)
+    progress.step("runner", f"was {old_runner}, now {runner_id}" if runner_id != old_runner
+                  else f"unchanged: {runner_id}")
+
+    def change(data: dict) -> None:
+        e = _mcp_run_entry(data, name)
+        if not mcp_run.is_package(e["run"]) or e["run"]["install"] != old_install \
+                or e["run"]["version"] != run_["version"]:
+            raise mcp_servers.ServerListError(
+                f"the MCP server {name} was changed meanwhile; try again")
+        e["run"].update(install=old_install + 1, runner_id=runner_id)
+    try:
+        entry = _mcp_run_save(name, change)
+    except mcp_servers.ServerListError:
+        _mcp_run_forget_volume(name, old_install + 1)
+        raise
+    progress.step("start", f"applying the new install to the MCP server {name}")
+    try:
+        state = _mcp_run_apply(name, entry)
+    finally:
+        _mcp_run_forget_volume(name, old_install)
+    print(f"the MCP server {name} runs {run_['package']} {run_['version']}, "
+          "installed again", flush=True)
+    return {"server": name, "state": state, "old": old_runner, "new": runner_id,
+            "package": f"{run_['registry']} {run_['package']} {run_['version']}"}
 
 
 def mcp_server_stop(req: McpServerNameRequest, *, blocking: bool = True,
@@ -21356,8 +21749,9 @@ def mcp_server_logs(req: McpServerNameRequest, deadline: float | None = None) ->
 
 def _mcp_run_teardown(name: str, deadline: float | None) -> None:
     """Remove everything RS made for a run server, each by its name: the
-    container, the router's rules for its range, the network (after the
-    gateway and the router leave it), the data volume, the settings file.
+    container (and a package's install container), the router's rules for
+    its range, the network (after the gateway and the router leave it), the
+    data volume, every package volume, the settings file.
     Idempotent; a thing of that name RS did not make refuses (RunError)."""
     cname, net = mcp_run.container_name(name), mcp_run.network_name(name)
     state, owner = _mcp_run_container(name, deadline)
@@ -21368,6 +21762,7 @@ def _mcp_run_teardown(name: str, deadline: float | None) -> None:
         if r.returncode != 0:
             raise _mcp_run_failed(f"the container of the MCP server {name} could not "
                                   "be removed", r)
+    _mcp_run_drop_install(name, deadline)
     info = _mcp_run_network(name, deadline)
     if info is not None:
         _mcp_run_check_network(name, info)
@@ -21402,6 +21797,8 @@ def _mcp_run_teardown(name: str, deadline: float | None) -> None:
         if r.returncode != 0:
             raise _mcp_run_failed(f"the data volume of the MCP server {name} could "
                                   "not be removed", r)
+    for volume in _mcp_run_pkg_volumes(name, deadline):
+        _mcp_run_drop_pkg_volume(name, volume, deadline)
     try:
         mcp_run.remove_env(name)
     except OSError as e:

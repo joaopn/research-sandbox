@@ -12,7 +12,7 @@ An MCP server gives an agent extra tools (a reference library, a database, a sea
 A server on this list is one of two kinds, each with optional secret request headers such as an API key:
 
 - **An address** (`http://` or `https://`) of a server that already runs somewhere.
-- **A server RS runs** from a container image: RS starts it in a container of its own on the host, beside the gateway, and gives it its settings. Its address is made from its name, so nothing on the consumer side changes.
+- **A server RS runs** from a container image, or from an npm or PyPI package at an exact version: RS starts it in a container of its own on the host, beside the gateway, and gives it its settings. Its address is made from its name, so nothing on the consumer side changes.
 
 The page adds, edits, tests and removes servers. `research mcp server list | add | edit | remove | test | reset` does the same from the host, and `research mcp server start | stop | restart | logs | update` acts on a server RS runs.
 
@@ -42,6 +42,29 @@ flowchart LR
 - Each row shows running, stopped or failed (with the reason), and Logs shows the server's last lines of output. A server may print its own secrets there; Logs is shown only to the signed-in operator.
 - Remove deletes the container, the router's rules, the network, the data volume and the settings file, each by its name.
 - What RS made for a server whose name is no longer on the list (after a damaged list was replaced, for instance) shows as a leftover row; Remove on that row clears it, and Add of the same name refuses until then.
+
+## Servers RS runs from a package
+
+Instead of an image, the operator can give a package: the registry (npm or PyPI), the package name, one exact version (npm `1.2.3`, PyPI `1.2.3`; never a range, a tag such as `latest` or a wildcard), the command the package installs, and optionally its arguments. Settings, secret headers, destinations and the data folder are as for an image server; there is no port or path, because RS serves the package itself. From the host: `research mcp server add NAME --package npm:NAME@VERSION | pypi:NAME==VERSION --command CMD [--arg A]...`.
+
+```mermaid
+flowchart LR
+    subgraph N["rs-mcpsrv-NAME network (internal)"]
+        I[rs-mcpsrv-NAME_install<br/>one-shot, no settings] -->|installs into| V[(package volume<br/>rs-mcpsrv-NAME-pkg-N)]
+        S[rs-mcpsrv-NAME<br/>bridge + one server process per session]
+        V -.->|read-only| S
+    end
+    I -->|443 via the router| REG[npm or PyPI]
+    G[MCP gateway] -->|streamable HTTP| S
+    F[Settings file on the host, 0600] -.->|docker run --env-file| S
+```
+
+- **The install runs once, in its own container, without the settings.** At Add, at an Edit of the version and at Update, RS starts a one-shot container of its own image `rs-mcp-runner` on the server's network (registries are reached on port 443 through the router), installs that exact version into a fresh package volume of the server's own, and removes the container. That container is given no setting and no secret header: a package's install scripts run there and never see the server's configuration. The install's output is shown in the operation's log.
+- **A start installs and fetches nothing.** The server's container runs the command already in the package volume, mounted read-only, through RS's bridge (`supergateway`, baked into the image at a pinned version). A start after the network is cut still works.
+- **One server process per session.** The bridge serves streamable HTTP on RS's own port and path (`http://rs-mcpsrv-<name>:8000/mcp`). A client's first call starts a server process for its session; the session's later calls go to that process; the client ending the session, ten idle minutes, or the process exiting ends it. Each process gets the container's environment, which holds the server's settings. Claude Code never ends its sessions itself, so the idle limit is what frees them; a call after it simply starts a new session.
+- **Update installs the same version again; Edit of the version installs the new one.** Both install into a fresh volume first and move the server to it only when the install succeeded, then remove the old volume. A failed install (a version that does not exist, a registry that cannot be reached) leaves the server running as it was.
+- **The runner image is recorded.** A package server records what the `rs-mcp-runner` image held when the package was installed (a digest of its layers and configuration; not the image's Id, which Docker renews at every build even when nothing changed). That image is built at `research start` (cached) and by Rebuild all, and by the first package Add when it is missing. When its content has changed, Start and Restart refuse and say that Update installs the package again on the current one.
+- Remove deletes every package volume of the server too, and a package volume left over from an earlier server of that name shows as a leftover row.
 
 Two credentials for the same kind of server (a lab's account and a personal one) are two servers with their own names.
 
@@ -114,9 +137,10 @@ Servers registered with `research mcp add` are granted to a project with `resear
 | `research stop` | Stops the gateway and every server RS runs (they come back at the next start) |
 | Stop on a server's row | Stops it; `research start` leaves it stopped until its Start |
 | Start, Restart on a server's row | Starts it (Restart re-creates it on its saved settings) |
-| Edit, Update on a server's row | Re-creates a running server on the change; a stopped one runs it at its next Start |
+| Edit, Update on a server's row | Re-creates a running server on the change; a stopped one runs it at its next Start (a package server's Update, or an Edit of its version, installs the package into a fresh volume first) |
 | Start on the page | Starts it; builds the image first if missing; attaches it to every project |
-| Software → Rebuild all | Rebuilds the gateway image and moves a running gateway onto it; servers RS runs are not touched (their images are pinned) |
+| `research start` (package servers' image) | Builds `rs-mcp-runner` (cached); a failure warns and does not stop the start |
+| Software → Rebuild all | Rebuilds the gateway image and moves a running gateway onto it, and rebuilds `rs-mcp-runner`; servers RS runs are not touched (their images are pinned; a package server moves to a changed runner at its Update) |
 | A change to the list or the wiring | A running gateway re-reads both; a stopped one stays stopped |
 | A project starts, or a box starts | Its agents get their wired servers again |
 
@@ -142,3 +166,7 @@ Servers registered with `research mcp add` are granted to a project with `resear
 - **One credential per server.** Everyone wired to a server acts with its one credential.
 - **Anything of a server's name that RS did not make is an error.** RS never adopts, renames or deletes it.
 - **Removal is by name.** RS deletes what it made for that server, one named thing at a time.
+- **A package is pinned to one exact version.** A range or a tag is refused, not resolved: what Add installed is what every Update installs again.
+- **A package's install never sees a secret.** It runs in its own container with no settings; only the server's container gets them.
+- **Nothing is fetched when a server starts.** The package is installed once into a volume; a start runs what is there.
+- **The bridge is a pinned upstream one.** It gives each session its own server process and ends it with the session; RS owns only the small launcher in front of it.

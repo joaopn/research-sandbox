@@ -3,8 +3,8 @@
 Stdlib only. The list is the set of MCP servers the shared gateway container
 (`rs-mcpgw`) knows, each with optional secret request headers. A server is
 either an ADDRESS the operator typed (`url`) or a server RS RUNS from a
-container image (`run`, cli/mcp_run.py), whose address is derived from its
-name. The list lives in ~/.research-sandbox/mcp-servers.json (0600); what the
+container image or an npm or PyPI package (`run`, cli/mcp_run.py), whose
+address is derived from its name. The list lives in ~/.research-sandbox/mcp-servers.json (0600); what the
 gateway needs of it (name, address, headers) is rendered into the one folder
 the gateway container mounts read-only. A run server's setting values are in
 neither file: they live in its own settings file (mcp_run.env_path).
@@ -42,12 +42,15 @@ LOCK_PATH = STATE_DIR / "mcp-servers.lock"
 GATEWAY_DIR = STATE_DIR / "mcp-gateway"
 RENDERED_NAME = "servers.json"
 
-# The version the writer writes. 2 added servers RS runs (`run` entries); an
-# address entry is unchanged, so a version-1 file is read as it is and written
-# as 2 at its next change. An RS that knows only 1 reads a 2 as "written by a
-# newer version" (nothing changed), never as damaged.
-VERSION = 2
-READABLE_VERSIONS = (1, 2)
+# The version the writer writes. 2 added servers RS runs from an image (`run`
+# entries); 3 added servers RS runs from a package (`run` entries with
+# `source: package`). Older entries are unchanged, so a version-1 or -2 file
+# is read as it is and written as 3 at its next change. An RS that knows only
+# 2 would judge a package entry not valid and the WHOLE list damaged — whose
+# only remedy discards every server — so it must read a 3 as "written by a
+# newer version" (nothing changed) instead, as one that knows only 1 reads a 2.
+VERSION = 3
+READABLE_VERSIONS = (1, 2, 3)
 # What the gateway mounts keeps its own version: its format (name → url,
 # headers, description) did not change, and the gateway program is not
 # rebuilt for it.
@@ -208,7 +211,8 @@ def judge(raw: bytes) -> tuple[str, dict[str, Any], str | None]:
     for name, entry in data["servers"].items():
         if entry_problem(name, entry):
             return DAMAGED, empty(), "it holds a server that is not valid"
-        if version == 1 and is_run(entry):
+        if (version == 1 and is_run(entry)) or (
+                version == 2 and is_run(entry) and mcp_run.is_package(entry["run"])):
             return DAMAGED, empty(), "it holds a server that is not valid"
     return OK, data, None
 
@@ -316,7 +320,9 @@ def lock(blocking: bool = True) -> Iterator[None]:
 
 def public_view(data: dict[str, Any]) -> list[dict[str, Any]]:
     """The rows a page or a listing may show: header NAMES only; for a server
-    RS runs, its image, arguments, port, path, data folder, destinations and
+    RS runs, where it comes from (`source`: its image, digest, port and path,
+    or its registry, package, exact version, command and the runner image it
+    was installed with), its arguments, data folder, destinations and
     settings — each setting's name and secret flag, and the value only of one
     that is not secret (a secret value is not on the list at all)."""
     rows = []
@@ -328,15 +334,22 @@ def public_view(data: dict[str, Any]) -> list[dict[str, Any]]:
                                "headers": sorted(e.get("headers", {}))}
         if is_run(e):
             run = e["run"]
-            row["run"] = {
-                "image": run["image"], "digest": run["digest"],
-                "args": list(run["args"]), "port": run["port"], "path": run["path"],
-                "data": run.get("data"),
+            common = {
+                "args": list(run["args"]), "data": run.get("data"),
                 "settings": [dict({"name": sn, "secret": spec["secret"]},
                                   **({} if spec["secret"] else {"value": spec["value"]}))
                              for sn, spec in sorted(run["settings"].items())],
                 "destinations": list(run["destinations"]),
                 "stopped": run["stopped"]}
+            if mcp_run.is_package(run):
+                row["run"] = dict(common, source=mcp_run.SOURCE_PACKAGE,
+                                  registry=run["registry"], package=run["package"],
+                                  version=run["version"], command=run["command"],
+                                  runner_id=run["runner_id"])
+            else:
+                row["run"] = dict(common, source="image", image=run["image"],
+                                  digest=run["digest"], port=run["port"],
+                                  path=run["path"])
         rows.append(row)
     return rows
 

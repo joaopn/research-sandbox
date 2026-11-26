@@ -23,6 +23,27 @@ printf '%s\n' "$API_KEY" | python research.py mcp server add myserver --image gh
     --destination db.lab.example:5432
 ```
 
+## A package RS runs (Services → MCP)
+
+A server RS runs from an npm or PyPI package is installed once at one exact version and run by RS behind its own bridge. The package's contract:
+
+1. **Install a command that speaks MCP over stdio.** RS runs the command you name (with your arguments) and talks JSON-RPC to it on its standard input and output; anything the server prints for people goes to its standard error, which is what Logs shows.
+2. **Read its settings from the environment.** Each setting is an environment value, read literally. A secret that only works on the command line or from a file is not supported.
+3. **Need nothing at install time but the package itself.** The install gets no setting and no secret; a package whose install needs a key cannot be run.
+4. **Fetch nothing when it starts.** Everything it needs must be installed with the package: a start runs offline as far as the package is concerned (its own calls to its service go out on ports 80 and 443, or to a destination you name).
+5. **Expect a process per session.** Each MCP session gets its own process, started on its first call and ended with the session or after ten idle minutes; keep state that must outlive a session in the data folder.
+
+From the host:
+
+```bash
+printf '%s\n' "$ZOTERO_API_KEY" | python research.py mcp server add zotero \
+    --package pypi:zotero-mcp-server==0.9.0 --command zotero-mcp --arg serve \
+    --setting ZOTERO_LIBRARY_ID=123 --setting ZOTERO_LIBRARY_TYPE=user \
+    --setting ZOTERO_LOCAL=false --secret-stdin ZOTERO_API_KEY
+```
+
+An argument that starts with `-` is written `--arg=--flag`.
+
 ## A server for the per-project registry (host commands)
 
 Three constraints define the contract between the research-sandbox and an MCP server:

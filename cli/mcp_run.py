@@ -1,5 +1,6 @@
-"""mcp_run — MCP servers RS runs itself from a container image: names, shapes,
-the settings file and the docker argv (pure helpers).
+"""mcp_run — MCP servers RS runs itself, from a container image or from an npm
+or PyPI package: names, shapes, the settings file and the docker argv (pure
+helpers).
 
 Stdlib only, and it imports nothing from RS (mcp_servers and rscore import
 it). A server RS runs is an entry of the gateway's server list
@@ -19,6 +20,15 @@ it). A server RS runs is an entry of the gateway's server list
   - its gateway address is derived, never typed:
     ``http://rs-mcpsrv-<name>:<port><path>``.
 
+A server RS runs from a PACKAGE (``run.source == "package"``) is the same
+container, network, settings file and hardening, with RS's own image
+``rs-mcp-runner`` in place of the operator's: the package is installed ONCE
+(at Add, Edit of its version and Update) by a one-shot install container that
+receives no setting and no secret, into a package volume of its own
+(``rs-mcpsrv-<name>-pkg-<n>``, a fresh one per install), and the server
+container runs the installed command from that volume (mounted read-only)
+behind RS's bridge on RS's own port and path. Nothing is fetched at start.
+
 The lifecycle (bring up, stop, remove, the start/stop hooks) lives in rscore;
 this module decides names, shapes, the file and the argv.
 
@@ -28,6 +38,7 @@ never a value, a host path or a command.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 import posixpath
@@ -72,8 +83,182 @@ def volume_name(name: str) -> str:
 
 def url_for(name: str, run: dict[str, Any]) -> str:
     """The address the gateway forwards to: the container by name on the
-    server's own network."""
+    server's own network (a package server: the bridge's own port and path)."""
+    if is_package(run):
+        return f"http://{container_name(name)}:{BRIDGE_PORT}{BRIDGE_PATH}"
     return f"http://{container_name(name)}:{run['port']}{run['path']}"
+
+
+# --- a server RS runs from a package --------------------------------------------
+
+SOURCE_KEY = "source"
+# An image entry carries no `source` (its shape is PR 1's, unchanged); a
+# package entry carries this value.
+SOURCE_PACKAGE = "package"
+REGISTRIES = ("npm", "pypi")
+# RS's image for package servers (agent/Dockerfile.mcp-runner). Not in the
+# fleet's build specs: built where it is used, like the gateway's.
+RUNNER_IMAGE = "rs-mcp-runner:latest"
+RUNNER_DOCKERFILE = "Dockerfile.mcp-runner"
+# Inside the runner (LOCKSTEP with container/mcp-runner/*.py): where the
+# package volume is mounted, where each registry's install puts its commands,
+# and the two programs.
+PKG_MOUNT = "/rs/pkg"
+_COMMAND_DIRS = {"npm": PKG_MOUNT + "/node_modules/.bin", "pypi": PKG_MOUNT + "/venv/bin"}
+INSTALL_PROGRAM = "/opt/rs-mcp/install.py"
+SERVE_PROGRAM = "/opt/rs-mcp/serve.py"
+# The install container idles while RS gives it its route out, then the
+# install runs in it by `docker exec` (its output streams into the log).
+INSTALL_IDLE = ["sleep", "infinity"]
+# `_` cannot be in a server name, so no server's container is ever named so.
+INSTALL_SUFFIX = "_install"
+PKG_VOLUME_INFIX = "-pkg-"
+# The bridge's port and path: RS's own, the same for every package server
+# (each is alone in its container), so they are not on the list.
+BRIDGE_PORT = 8000
+BRIDGE_PATH = "/mcp"
+# How long the bridge keeps a session (and its server process) that nobody
+# uses. Claude Code never ends its sessions (measured: no DELETE at the end
+# of a session), so every agent session leaves one process — tens of MB for
+# a Python server — until this runs out; an expired session costs the next
+# call one re-initialize, which Claude Code does by itself (measured: a 404
+# for its session makes it initialize again and retry). At half, an operator
+# pausing for five minutes pays one process start (seconds) more often; at ten
+# times, a busy project's short agent sessions keep ten times as many idle
+# processes (and their memory) for over an hour and a half.
+BRIDGE_SESSION_IDLE_S = 600
+
+# npm's package-name rules (validate-npm-package-name): optional @scope/,
+# lowercase, URL-safe characters, at most 214 characters. The first character
+# of the scope and of the name is a letter or digit here (npm also allows `-`,
+# `~`, which could read as an option or a path).
+NPM_NAME_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*$", re.ASCII)
+NPM_NAME_MAX = 214
+# semver 2.0.0's own grammar (semver.org): MAJOR.MINOR.PATCH, an optional
+# pre-release and build — nothing else (no range, no tag, no x, no v).
+_SEMVER_ID = r"(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)"
+NPM_VERSION_RE = re.compile(
+    r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    rf"(?:-{_SEMVER_ID}(?:\.{_SEMVER_ID})*)?"
+    r"(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$", re.ASCII)
+# PEP 508's distribution name (case-insensitive): letters and digits, with
+# . _ - only inside.
+PYPI_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$", re.ASCII)
+# PEP 440's version grammar (the packaging library's VERSION_PATTERN), as one
+# exact version: no operator, no wildcard, no spaces.
+PYPI_VERSION_RE = re.compile(r"""^
+    v?
+    (?:[0-9]+!)?                                   # epoch
+    [0-9]+(?:\.[0-9]+)*                            # release
+    (?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?   # pre
+    (?:-[0-9]+|[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?   # post
+    (?:[-_.]?dev[-_.]?[0-9]*)?                      # dev
+    (?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?            # local
+$""", re.ASCII | re.IGNORECASE | re.VERBOSE)
+# The program a package installs: a file name (it is looked up only in the
+# package's own command folder), never a path or an option.
+COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$", re.ASCII)
+_RUNNER_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
+PACKAGE_KEYS = frozenset({SOURCE_KEY, "registry", "package", "version", "command",
+                          "args", "data", "runner_id", "install", "settings",
+                          "destinations", "resolved", "stopped"})
+PACKAGE_REQUIRED = PACKAGE_KEYS - {"data"}
+
+
+def is_package(run: dict[str, Any]) -> bool:
+    return run.get(SOURCE_KEY) == SOURCE_PACKAGE
+
+
+def install_container_name(name: str) -> str:
+    return PREFIX + name + INSTALL_SUFFIX
+
+
+def pkg_volume_name(name: str, install: int) -> str:
+    return f"{PREFIX}{name}{PKG_VOLUME_INFIX}{install}"
+
+
+def is_pkg_volume_of(name: str, volume: str) -> bool:
+    """Whether `volume` is one of the package volumes RS names for `name`."""
+    head = PREFIX + name + PKG_VOLUME_INFIX
+    n = volume[len(head):]
+    return volume.startswith(head) and n.isascii() and n.isdigit() \
+        and not n.startswith("0")
+
+
+def command_path(run: dict[str, Any]) -> str:
+    """Where the package's command is inside the runner."""
+    return f"{_COMMAND_DIRS[run['registry']]}/{run['command']}"
+
+
+def registry_problem(registry: Any) -> str | None:
+    if registry not in REGISTRIES:
+        return "the registry must be npm or pypi"
+    return None
+
+
+def package_problem(registry: str, package: Any) -> str | None:
+    """A registry's own package-name grammar: no flag, URL, path or VCS spec
+    can be one."""
+    if registry == "npm":
+        if not isinstance(package, str) or not NPM_NAME_RE.fullmatch(package) \
+                or len(package) > NPM_NAME_MAX:
+            return ("the package must be an npm package name, as in "
+                    "@scope/server or server (lowercase, no spaces, no path or address)")
+    elif not isinstance(package, str) or not PYPI_NAME_RE.fullmatch(package):
+        return ("the package must be a PyPI project name, as in mcp-server-fetch "
+                "(letters, digits, . _ -, no path or address)")
+    return None
+
+
+def version_problem(registry: str, version: Any) -> str | None:
+    """Exactly one version: never a range, a tag or a wildcard (the no-drift
+    rule: what Add installs is what every Update installs again)."""
+    if registry == "npm":
+        if not isinstance(version, str) or not NPM_VERSION_RE.fullmatch(version):
+            return ("the version must be one exact npm version, as in 1.2.3 "
+                    "(no range such as ^1.2 or ~1.2, no tag such as latest)")
+    elif not isinstance(version, str) or not PYPI_VERSION_RE.fullmatch(version):
+        return ("the version must be one exact PyPI version, as in 1.2.3 "
+                "(no operator such as >= or ~=, no wildcard)")
+    return None
+
+
+def command_problem(command: Any) -> str | None:
+    if not isinstance(command, str) or not COMMAND_RE.fullmatch(command):
+        return ("the command must be the name of the program the package "
+                "installs, as in mcp-server-fetch (no path, no spaces)")
+    return None
+
+
+# What identifies the runner image a package was installed with: a digest of
+# its layers and its configuration, computed by RS from `docker image
+# inspect`. Not the image Id: on Docker's containerd image store (the default
+# since Engine 29) every build mints a new Id even when nothing changed, and
+# the old one is deleted once the tag moves (both measured) — `research
+# start` rebuilds the runner (cached) every time, so an Id would refuse every
+# package server after every start.
+RUNNER_INSPECT_FORMAT = "{{.Id}}|{{json .RootFS.Layers}}|{{json .Config}}"
+
+
+def runner_identity(inspect_out: str) -> tuple[str, str]:
+    """(the image Id to run, the content identity to record and compare) from
+    `docker image inspect -f RUNNER_INSPECT_FORMAT`; ("", "") when unusable."""
+    image_id, sep, content = inspect_out.strip().partition("|")
+    if not sep or not _RUNNER_ID_RE.fullmatch(image_id) or not content:
+        return "", ""
+    return image_id, "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+
+
+def runner_id_problem(runner_id: Any) -> str | None:
+    if not isinstance(runner_id, str) or not _RUNNER_ID_RE.fullmatch(runner_id):
+        return "the recorded image of RS's package runner is not one RS wrote"
+    return None
+
+
+def install_problem(install: Any) -> str | None:
+    if isinstance(install, bool) or not isinstance(install, int) or install < 1:
+        return "the recorded install of the package is not one RS wrote"
+    return None
 
 
 # --- host state ------------------------------------------------------------------
@@ -255,12 +440,41 @@ def run_problem(run: Any) -> str | None:
     """Why `run` is not a valid run object, or None (input and file alike)."""
     if not isinstance(run, dict):
         return "a server RS runs must be described by an object"
+    if SOURCE_KEY in run:
+        return package_run_problem(run)
     if set(run) - RUN_KEYS or RUN_REQUIRED - set(run):
         return "a server RS runs holds an unknown or a missing field"
     for problem in (image_problem(run["image"]), pinned_problem(run["digest"]),
                     args_problem(run["args"]), port_problem(run["port"]),
                     path_problem(run["path"]),
                     data_problem(run["data"]) if "data" in run else None,
+                    settings_problem(run["settings"]),
+                    destinations_problem(run["destinations"])):
+        if problem:
+            return problem
+    problem = resolved_problem(run["destinations"], run["resolved"])
+    if problem:
+        return problem
+    if not isinstance(run["stopped"], bool):
+        return "a server RS runs must say whether it was stopped"
+    return None
+
+
+def package_run_problem(run: dict) -> str | None:
+    """Why a package server's run object is not valid, or None."""
+    if run.get(SOURCE_KEY) != SOURCE_PACKAGE:
+        return "a server RS runs comes from an image or a package"
+    if set(run) - PACKAGE_KEYS or PACKAGE_REQUIRED - set(run):
+        return "a server RS runs holds an unknown or a missing field"
+    problem = registry_problem(run["registry"])
+    if problem:
+        return problem
+    for problem in (package_problem(run["registry"], run["package"]),
+                    version_problem(run["registry"], run["version"]),
+                    command_problem(run["command"]), args_problem(run["args"]),
+                    data_problem(run["data"]) if "data" in run else None,
+                    runner_id_problem(run["runner_id"]),
+                    install_problem(run["install"]),
                     settings_problem(run["settings"]),
                     destinations_problem(run["destinations"])):
         if problem:
@@ -392,27 +606,63 @@ def network_create_argv(name: str, base: list[str]) -> list[str]:
     return base[:3] + ["--internal"] + labels(name) + base[3:]
 
 
-def volume_create_argv(name: str) -> list[str]:
-    return ["docker", "volume", "create"] + labels(name) + [volume_name(name)]
+def volume_create_argv(name: str, volume: str | None = None) -> list[str]:
+    """The data volume, or (`volume`) one of the server's package volumes."""
+    return ["docker", "volume", "create"] + labels(name) + [volume or volume_name(name)]
 
 
-def run_argv(name: str, run: dict[str, Any], dns: list[str]) -> list[str]:
+def _hardening(dns: list[str]) -> list[str]:
+    argv = ["--restart", RESTART_POLICY,
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges"]
+    for server in dns:
+        argv += ["--dns", server]
+    return argv
+
+
+def install_run_argv(name: str, runner_image: str, install: int, dns: list[str]) -> list[str]:
+    """The one-shot install container: the runner image (by Id), the server's network
+    (its route out is injected before the install runs), the FRESH package
+    volume — and no settings file, no environment value, no secret: what a
+    package's install scripts run beside is RS's image and nothing of the
+    server's configuration. It idles until the install is run in it."""
+    return (["docker", "run", "-d", "--name", install_container_name(name),
+             "--network", network_name(name)] + _hardening(dns) + labels(name)
+            + ["-v", f"{pkg_volume_name(name, install)}:{PKG_MOUNT}",
+               runner_image] + INSTALL_IDLE)
+
+
+def install_exec_argv(name: str, run: dict[str, Any]) -> list[str]:
+    """The install, inside the install container: each value one argv
+    element, validated before it gets here, never read by a shell."""
+    return ["docker", "exec", install_container_name(name), "python3", INSTALL_PROGRAM,
+            run["registry"], run["package"], run["version"], run["command"]]
+
+
+def run_argv(name: str, run: dict[str, Any], dns: list[str],
+             runner_image: str = "") -> list[str]:
     """The server's container. Values arrive only through the env file (never
     this command line); the image is the PINNED digest, never the operator's
     tag; the operator's arguments come after it, where docker hands them to
     the server as its own command and never reads them as options."""
     argv = ["docker", "run", "-d",
             "--name", container_name(name),
-            "--network", network_name(name),
-            "--restart", RESTART_POLICY,
-            "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges"]
-    for server in dns:
-        argv += ["--dns", server]
+            "--network", network_name(name)] + _hardening(dns)
     argv += labels(name)
     argv += ["--env-file", str(env_path(name))]
     if "data" in run:
         argv += ["-v", f"{volume_name(name)}:{run['data']}"]
+    if is_package(run):
+        # RS's runner by the image Id checked to hold the content the
+        # package was installed with (`runner_image`), the installed package
+        # read-only (a start installs and fetches nothing), and the bridge in
+        # front of the package's command.
+        assert _RUNNER_ID_RE.fullmatch(runner_image)
+        argv += ["-v", f"{pkg_volume_name(name, run['install'])}:{PKG_MOUNT}:ro",
+                 runner_image, "python3", SERVE_PROGRAM,
+                 "--port", str(BRIDGE_PORT), "--path", BRIDGE_PATH,
+                 "--idle-s", str(BRIDGE_SESSION_IDLE_S), "--", command_path(run)]
+        return argv + list(run["args"])
     argv.append(run["digest"])
     argv += list(run["args"])
     return argv
