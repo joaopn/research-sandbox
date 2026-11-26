@@ -2682,10 +2682,10 @@ function renderSettingsInto(view) {
 }
 
 // Services → MCP: the shared MCP gateway and its server list. A server is an
-// address plus optional secret request headers; the page shows a secret's
-// NAME only and never receives its value back. Wiring a server to a project
-// or a box is not on this page yet. Every read is this page's own render or
-// one of its buttons — nothing here runs on a timer.
+// address, or a container image RS runs, plus optional secret request headers
+// (and, for one RS runs, settings, some secret); the page shows a secret's
+// NAME only and never receives its value back. Every read is this page's own
+// render or one of its buttons — nothing here runs on a timer.
 const MCP_GATEWAY_START_TITLE = "Starting the MCP gateway";
 const MCP_GATEWAY_TEXT = {
     running: "running",
@@ -2833,6 +2833,17 @@ function mcpServerDialog(view, existing) {
     }
     const headerRows = [];            // new or replaced secrets: {nameI, valueI}
     const removeBoxes = [];           // saved secrets: {name, cb}
+    // Add only: which kind of server. "A server RS runs" swaps in its own form.
+    let kindField = null;
+    if (!existing) {
+        const kindI = mcpKindSelect("address");
+        kindI.onchange = () => {
+            if (kindI.value !== "run") return;
+            backdrop.remove();
+            mcpRunDialog(view, null);
+        };
+        kindField = el("div", { class: "field" }, [el("label", {}, ["Kind"]), kindI]);
+    }
     const headersWrap = el("div", { class: "mcp-headers" });
     const addHeaderRow = (fixedName) => {
         const hn = el("input", { type: "text", autocomplete: "off",
@@ -2880,6 +2891,7 @@ function mcpServerDialog(view, existing) {
     };
     const card = el("div", { class: "card mcp-server-card" }, [
         el("h2", {}, [existing ? "Edit MCP server" : "Add an MCP server"]),
+        kindField,
         el("div", { class: "field" }, [el("label", {}, ["Name"]), nameI]),
         el("div", { class: "field" }, [el("label", {}, ["Address"]), urlI]),
         el("div", { class: "hint" }, [
@@ -2899,6 +2911,474 @@ function mcpServerDialog(view, existing) {
     backdrop.appendChild(card);
     document.body.appendChild(backdrop);
     return backdrop;
+}
+
+// ---- servers RS runs (a container image RS starts beside the gateway) ------
+// Add, Edit, Start, Restart and Update run in the background on the host and
+// show their log in the same box as the gateway's Start; Stop, Logs and Remove
+// answer at once. A secret setting's value, like a secret header's, is never
+// sent back to the page: its field starts empty and empty means "unchanged".
+const MCP_RUN_STATE_TEXT = {
+    running: "running",
+    stopped: "stopped",
+    failed: "failed",
+    absent: "not started",
+    unknown: "unknown",
+    leftover: "leftover",
+};
+const MCP_RUN_OP_TITLE = {
+    add: "Adding the MCP server ",
+    edit: "Saving the MCP server ",
+    start: "Starting the MCP server ",
+    restart: "Restarting the MCP server ",
+    update: "Updating the MCP server ",
+};
+const MCP_RUN_DEST_HINT = "One host:port per line, on your network or this machine, "
+    + "for example db.lab.example:5432. Without any, the server reaches only the "
+    + "internet, on the web ports (80 and 443).";
+
+// The Add dialog's kind switch (both forms carry one).
+function mcpKindSelect(value) {
+    const sel = el("select", { class: "mcp-kind" }, [
+        el("option", { value: "address" }, ["An address"]),
+        el("option", { value: "run" }, ["A server RS runs"]),
+    ]);
+    sel.value = value;
+    return sel;
+}
+
+// Non-empty lines of a textarea; `keep` leaves each line as typed (arguments
+// may carry spaces of their own), otherwise each is trimmed.
+function mcpLines(text, keep) {
+    return String(text || "").split("\n").map((l) => l.replace(/\r$/, ""))
+        .filter((l) => l.trim() !== "").map((l) => (keep ? l : l.trim()));
+}
+
+// A port as typed: a whole number is sent as a number; anything else is sent
+// as typed, so the broker's own refusal names what is wrong.
+function mcpPortValue(text) {
+    const s = String(text || "").trim();
+    return /^[0-9]+$/.test(s) ? parseInt(s, 10) : s;
+}
+
+// "sha256:<first 12 hex>" of a pinned digest (`repo@sha256:…` or `sha256:…`).
+function mcpShortDigest(digest) {
+    const m = /sha256:([0-9a-f]{12})/.exec(String(digest || ""));
+    return m ? "sha256:" + m[1] : "";
+}
+
+// The Add payload of a server RS runs, in the broker's field shapes.
+function mcpRunAddPayload(f) {
+    const payload = { name: f.name.trim(), image: f.image.trim(),
+                      port: mcpPortValue(f.port), path: f.path.trim() || "/mcp" };
+    if (f.description.trim()) payload.description = f.description.trim();
+    const args = mcpLines(f.args, true);
+    if (args.length) payload.args = args;
+    if (f.data.trim()) payload.data = f.data.trim();
+    const settings = {};
+    for (const s of f.settings) {
+        if (s.name.trim()) settings[s.name.trim()] = { secret: !!s.secret, value: s.value };
+    }
+    if (Object.keys(settings).length) payload.settings = settings;
+    const headers = {};
+    for (const h of f.headers) {
+        if (h.name.trim()) headers[h.name.trim()] = h.value;
+    }
+    if (Object.keys(headers).length) payload.headers = headers;
+    const dests = mcpLines(f.destinations, false);
+    if (dests.length) payload.destinations = dests;
+    return payload;
+}
+
+// The Edit payload: only what changed. A saved setting is sent when its value
+// was typed (a secret) or changed (a plain one), or its secret tick changed;
+// named for removal only when its remove box is ticked. Headers as for an
+// address server.
+// The name of a saved SECRET setting whose secret tick was taken off while its
+// value field was left empty (a secret is never refilled, so an empty field
+// would silently replace the value with ""), or null. Edit refuses in place.
+function mcpRunUnsecretEmpty(existing, f) {
+    const saved = {};
+    for (const s of ((existing.run || {}).settings || [])) saved[s.name] = s;
+    for (const s of f.settings) {
+        const name = s.name.trim();
+        const old = s.saved ? saved[name] : null;
+        if (old && old.secret && !s.remove && !s.secret && s.value === "") return name;
+    }
+    return null;
+}
+
+function mcpRunEditPayload(existing, f) {
+    const run = existing.run || {};
+    const payload = { name: existing.name };
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    if (f.description.trim() !== (existing.description || "")) {
+        payload.description = f.description.trim();
+    }
+    const args = mcpLines(f.args, true);
+    if (!same(args, run.args || [])) payload.args = args;
+    const port = mcpPortValue(f.port);
+    if (port !== run.port) payload.port = port;
+    const path = f.path.trim() || "/mcp";
+    if (path !== run.path) payload.path = path;
+    const data = f.data.trim();
+    if (data !== (run.data || "")) payload.data = data;
+    const dests = mcpLines(f.destinations, false);
+    if (!same(dests, run.destinations || [])) payload.destinations = dests;
+    const saved = {};
+    for (const s of (run.settings || [])) saved[s.name] = s;
+    const set = {};
+    const remove = [];
+    for (const s of f.settings) {
+        const name = s.name.trim();
+        if (!name) continue;
+        const old = s.saved ? saved[name] : null;
+        if (old && s.remove) { remove.push(name); continue; }
+        if (old) {
+            const flagChanged = !!s.secret !== !!old.secret;
+            const valueChanged = old.secret ? s.value !== "" : s.value !== (old.value || "");
+            if (!flagChanged && !valueChanged) continue;
+        }
+        set[name] = { secret: !!s.secret, value: s.value };
+    }
+    if (Object.keys(set).length) payload.settings_set = set;
+    if (remove.length) payload.settings_remove = remove;
+    const hset = {};
+    for (const h of f.headers) {
+        if (h.name.trim() && h.value) hset[h.name.trim()] = h.value;
+    }
+    if (Object.keys(hset).length) payload.headers_set = hset;
+    if (f.headersRemove.length) payload.headers_remove = f.headersRemove.slice();
+    return payload;
+}
+
+// Tail one of a run server's background actions in the gateway Start's box;
+// its Done re-renders the page. `backdrop`/`card`: a dialog to reuse, or null.
+async function mcpRunTail(view, opId, title, backdrop, card) {
+    if (!backdrop) {
+        backdrop = el("div", { class: "modal-backdrop" });
+        card = el("div", { class: "card sw-build-card" }, [el("h2", {}, [title])]);
+        backdrop.appendChild(card);
+        document.body.appendChild(backdrop);
+    } else {
+        card.className = "card sw-build-card";
+    }
+    await mgmtTailBuildLog(view, backdrop, card, opId, title,
+                           () => rerenderView(view), view.__rsRender || renderMcpInto);
+}
+
+// The Add / Edit dialog of a server RS runs. `existing` is its list row, or null.
+function mcpRunDialog(view, existing) {
+    if (document.querySelector(".modal-backdrop")) return null;
+    const run = (existing && existing.run) || {};
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const errEl = el("div", { class: "error" });
+    const text = (cls, placeholder) => el("input", { type: "text", autocomplete: "off",
+                                                      class: cls, placeholder });
+    const nameI = text("mcp-run-name", "zotero");
+    const descI = text("mcp-run-desc", "what this server is for");
+    const imageI = text("mcp-run-image", "ghcr.io/owner/server:1.2");
+    const argsI = el("textarea", { class: "mcp-run-args", rows: "3",
+                                   placeholder: "one argument per line (optional)" });
+    const portI = text("mcp-run-port", "8000");
+    const pathI = text("mcp-run-path", "/mcp");
+    const dataI = text("mcp-run-data", "/data (optional)");
+    const destI = el("textarea", { class: "mcp-run-dests", rows: "2",
+                                   placeholder: "host:port (optional)" });
+    pathI.value = "/mcp";
+    if (existing) {
+        nameI.value = existing.name; nameI.disabled = true;
+        imageI.value = run.image || ""; imageI.disabled = true;
+        descI.value = existing.description || "";
+        argsI.value = (run.args || []).join("\n");
+        portI.value = run.port === undefined ? "" : String(run.port);
+        pathI.value = run.path || "/mcp";
+        dataI.value = run.data || "";
+        destI.value = (run.destinations || []).join("\n");
+    }
+    // Settings: NAME, value, a secret tick (a secret value is a password
+    // field), and on a saved one a remove box.
+    const settingRows = [];
+    const settingsWrap = el("div", { class: "mcp-settings" });
+    const addSettingRow = (saved) => {
+        const sn = el("input", { type: "text", autocomplete: "off",
+                                 class: "mcp-header-name mcp-setting-name", placeholder: "API_KEY" });
+        const sv = el("input", { type: "text", autocomplete: "off",
+                                 class: "mcp-header-value mcp-setting-value", placeholder: "value" });
+        const secretCb = el("input", { type: "checkbox", class: "mcp-setting-secret" });
+        const setSecret = (on) => {
+            sv.type = on ? "password" : "text";
+            sv.setAttribute("autocomplete", on ? "new-password" : "off");
+        };
+        secretCb.onchange = () => setSecret(secretCb.checked);
+        const line = el("div", { class: "mcp-header-row mcp-setting-row" }, [
+            sn, sv, el("span", { class: "mcp-header-remove" }, [secretCb, " secret"])]);
+        const row = { saved: !!saved, nameI: sn, valueI: sv, secretCb, removeCb: null };
+        if (saved) {
+            sn.value = saved.name; sn.disabled = true;
+            secretCb.checked = !!saved.secret;
+            if (saved.secret) sv.placeholder = "new value (empty keeps it)";
+            else sv.value = saved.value || "";
+            row.removeCb = el("input", { type: "checkbox", class: "mcp-setting-remove" });
+            line.appendChild(el("span", { class: "mcp-header-remove" }, [row.removeCb, " remove"]));
+        }
+        setSecret(secretCb.checked);
+        settingRows.push(row);
+        settingsWrap.appendChild(line);
+    };
+    for (const s of (run.settings || [])) addSettingRow(s);
+    const moreSetting = el("button", { type: "button", class: "btn-small" }, ["Add a setting"]);
+    moreSetting.onclick = () => addSettingRow(null);
+    // Secret headers: the address form's control.
+    const headerRows = [];
+    const headerRemoves = [];
+    const headersWrap = el("div", { class: "mcp-headers" });
+    const addHeaderRow = (fixedName) => {
+        const hn = el("input", { type: "text", autocomplete: "off",
+                                 class: "mcp-header-name", placeholder: "Authorization" });
+        const hv = el("input", { type: "password", autocomplete: "new-password",
+                                 class: "mcp-header-value",
+                                 placeholder: fixedName ? "new value (empty keeps it)" : "value" });
+        if (fixedName) { hn.value = fixedName; hn.disabled = true; }
+        const line = el("div", { class: "mcp-header-row" }, [hn, hv]);
+        if (fixedName) {
+            const cb = el("input", { type: "checkbox", class: "mcp-header-remove-cb" });
+            headerRemoves.push({ name: fixedName, cb });
+            line.appendChild(el("span", { class: "mcp-header-remove" }, [cb, " remove"]));
+        }
+        headerRows.push({ nameI: hn, valueI: hv });
+        headersWrap.appendChild(line);
+    };
+    for (const hname of (existing ? existing.headers || [] : [])) addHeaderRow(hname);
+    const moreHeader = el("button", { type: "button", class: "btn-small" }, ["Add a secret header"]);
+    moreHeader.onclick = () => addHeaderRow(null);
+
+    let kindField = null;
+    if (!existing) {
+        const kindI = mcpKindSelect("run");
+        kindI.onchange = () => {
+            if (kindI.value !== "address") return;
+            backdrop.remove();
+            mcpServerDialog(view, null);
+        };
+        kindField = el("div", { class: "field" }, [el("label", {}, ["Kind"]), kindI]);
+    }
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: "btn" }, [existing ? "Save" : "Add server"]);
+    const read = () => ({
+        name: nameI.value, description: descI.value, image: imageI.value,
+        args: argsI.value, port: portI.value, path: pathI.value, data: dataI.value,
+        destinations: destI.value,
+        settings: settingRows.map((r) => ({
+            saved: r.saved, name: r.nameI.value, value: r.valueI.value,
+            secret: r.secretCb.checked, remove: !!(r.removeCb && r.removeCb.checked) })),
+        headers: headerRows.map((h) => ({ name: h.nameI.value, value: h.valueI.value })),
+        headersRemove: headerRemoves.filter((b) => b.cb.checked).map((b) => b.name),
+    });
+    const card = el("div", { class: "card mcp-server-card" });
+    go.onclick = async () => {
+        errEl.textContent = "";
+        const f = read();
+        const unsecret = existing ? mcpRunUnsecretEmpty(existing, f) : null;
+        if (unsecret) {
+            errEl.textContent = "To make " + unsecret + " a plain setting, type its value: "
+                + "a secret's value is never shown again.";
+            return;
+        }
+        const payload = existing ? mcpRunEditPayload(existing, f) : mcpRunAddPayload(f);
+        go.disabled = true; cancel.disabled = true;
+        const action = existing ? "edit" : "add";
+        const { status, body } = await mcpPost("/broker/mcp/run/" + action, payload);
+        const redirect = mgmtStatusRedirect(view, status, view.__rsRender || renderMcpInto);
+        if (redirect) { backdrop.remove(); return redirect(); }
+        if (status !== 200 || !body.ok || !body.op_id) {
+            go.disabled = false; cancel.disabled = false;
+            errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+            return;
+        }
+        await mcpRunTail(view, body.op_id, MCP_RUN_OP_TITLE[action] + payload.name,
+                         backdrop, card);
+    };
+    const field = (label, input) => el("div", { class: "field" }, [el("label", {}, [label]), input]);
+    for (const c of [
+        el("h2", {}, [existing ? "Edit MCP server" : "Add an MCP server"]),
+        kindField,
+        field("Name", nameI),
+        field("Description", descI),
+        field("Image", imageI),
+        el("div", { class: "hint" }, [
+            "A container image reference. RS fetches it once and keeps running that "
+            + "exact image until you use Update."]),
+        field("Arguments", argsI),
+        field("Port", portI),
+        field("Path", pathI),
+        el("div", { class: "hint" }, [
+            "The port and path the server answers MCP on inside its container."]),
+        field("Data folder", dataI),
+        el("div", { class: "hint" }, [
+            "A folder inside the server kept across restarts and updates (optional)."]),
+        el("div", { class: "mcp-headers-title" }, ["Settings"]),
+        el("div", { class: "hint" }, [
+            "Values the server reads from its environment. Only its own container "
+            + "receives them. A secret value is never shown again; it can be "
+            + "replaced or removed."]),
+        settingsWrap,
+        el("div", { class: "mcp-headers-more" }, [moreSetting]),
+        el("div", { class: "mcp-headers-title" }, ["Secret headers"]),
+        el("div", { class: "hint" }, [
+            "Sent to the server with every request, for example Authorization. "
+            + "A saved value is never shown again; it can be replaced or removed."]),
+        headersWrap,
+        el("div", { class: "mcp-headers-more" }, [moreHeader]),
+        field("Destinations", destI),
+        el("div", { class: "hint" }, [MCP_RUN_DEST_HINT]),
+        el("div", { class: "btn-row" }, [cancel, go]),
+        errEl,
+    ]) {
+        if (c) card.appendChild(c);
+    }
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    return backdrop;
+}
+
+// Start / Restart / Update of a run server's row: a background action tailed
+// in the box. A session that ended lands on the sign-in; every other failure
+// is a line on this row, never the page-wide outage card.
+async function mcpRunRowOp(view, name, action, btn, cell) {
+    if (document.querySelector(".modal-backdrop")) return;
+    btn.disabled = true;
+    cell.className = "mcp-test";
+    cell.textContent = "";
+    const { status, body } = await mcpPost("/broker/mcp/run/" + action, { name });
+    if (status === 401) return renderMgmtLogin(view, view.__rsRender || renderMcpInto);
+    if (status !== 200 || !body.ok || !body.op_id) {
+        btn.disabled = false;
+        cell.className = "mcp-test mcp-test-bad";
+        cell.textContent = status === 200 && body.error ? mgmtErrText(body) : MCP_TEST_RETRY_TEXT;
+        return;
+    }
+    await mcpRunTail(view, body.op_id, MCP_RUN_OP_TITLE[action] + name, null, null);
+}
+
+// Stop: answers at once; the page re-reads itself on success.
+async function mcpRunStop(view, name, btn, cell) {
+    btn.disabled = true;
+    cell.className = "mcp-test";
+    cell.textContent = "Stopping…";
+    const { status, body } = await mcpPost("/broker/mcp/servers/stop", { name });
+    if (status === 401) return renderMgmtLogin(view, view.__rsRender || renderMcpInto);
+    if (status !== 200 || !body.ok) {
+        btn.disabled = false;
+        cell.className = "mcp-test mcp-test-bad";
+        cell.textContent = status === 200 && body.error ? mgmtErrText(body) : MCP_TEST_RETRY_TEXT;
+        return;
+    }
+    rerenderView(view);
+}
+
+// Logs: one read per click, shown in the row's panel; nothing refreshes it.
+async function mcpRunLogs(view, name, panel, cell) {
+    cell.className = "mcp-test";
+    cell.textContent = "Asking…";
+    const { status, body } = await mcpPost("/broker/mcp/servers/logs", { name });
+    if (status === 401) return renderMgmtLogin(view, view.__rsRender || renderMcpInto);
+    if (status !== 200 || !body.ok || !body.result) {
+        cell.className = "mcp-test mcp-test-bad";
+        cell.textContent = status === 200 && body.error ? mgmtErrText(body) : MCP_TEST_RETRY_TEXT;
+        return;
+    }
+    cell.textContent = "";
+    const r = body.result;
+    const hide = el("button", { class: "btn-small" }, ["Hide"]);
+    hide.onclick = () => { panel.innerHTML = ""; };
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "mcp-run-log-head" }, [
+        "Last lines of " + name + "'s output", hide]));
+    panel.appendChild(el("pre", { class: "mcp-run-log" }, [
+        r.state === "absent" ? "It has no container yet."
+            : (r.log || "It has printed nothing yet.")]));
+}
+
+// One row of a server RS runs (a leftover one included: run null).
+function mcpRunRow(view, srv, wiredNames, cell) {
+    const run = srv.run;
+    const state = srv.state || "unknown";
+    const stateText = (MCP_RUN_STATE_TEXT[state] || state)
+        + (srv.reason ? ": " + srv.reason : "");
+    const badge = el("span", { class: "type-badge mcp-run-state" }, [stateText]);
+    const remove = el("button", { class: "btn-small" }, ["Remove"]);
+    const logPanel = el("div", { class: "mcp-run-logs" });
+    const actions = [];
+    if (!run) {
+        remove.onclick = () => mcpConfirmDialog(view, {
+            title: "Remove " + srv.name,
+            text: "What RS made for a server " + srv.name + " that is no longer on "
+                + "the list (its container, network, data and settings) is removed.",
+            confirmLabel: "Remove",
+            path: "/broker/mcp/servers/remove",
+            payload: { name: srv.name },
+        });
+        actions.push(remove);
+    } else {
+        const test = el("button", { class: "btn-small" }, ["Test"]);
+        test.onclick = () => mcpTestRow(view, srv.name, cell);
+        actions.push(test);
+        if (state === "running") {
+            const stop = el("button", { class: "btn-small" }, ["Stop"]);
+            stop.onclick = () => mcpRunStop(view, srv.name, stop, cell);
+            actions.push(stop);
+        } else {
+            const start = el("button", { class: "btn-small" }, ["Start"]);
+            start.onclick = () => mcpRunRowOp(view, srv.name, "start", start, cell);
+            actions.push(start);
+        }
+        for (const [action, label] of [["restart", "Restart"], ["update", "Update"]]) {
+            const b = el("button", { class: "btn-small" }, [label]);
+            b.onclick = () => mcpRunRowOp(view, srv.name, action, b, cell);
+            actions.push(b);
+        }
+        const logs = el("button", { class: "btn-small" }, ["Logs"]);
+        logs.onclick = () => mcpRunLogs(view, srv.name, logPanel, cell);
+        const edit = el("button", { class: "btn-small" }, ["Edit"]);
+        edit.onclick = () => mcpRunDialog(view, srv);
+        remove.onclick = () => mcpConfirmDialog(view, {
+            title: "Remove " + srv.name,
+            text: "The server is stopped and taken off the list with its settings, "
+                + "secret headers and data."
+                + (wiredNames.length
+                    ? " It is wired to " + wiredNames.join(", ") + ": the gateway "
+                      + "refuses it for them at once, and each agent’s entry for it "
+                      + "goes the next time that project or box starts or is re-wired."
+                    : ""),
+            confirmLabel: "Remove",
+            path: "/broker/mcp/servers/remove",
+            payload: { name: srv.name },
+        });
+        actions.push(logs, edit, remove);
+    }
+    const meta = [];
+    if (run) {
+        const digest = mcpShortDigest(run.digest);
+        meta.push("Image: " + run.image + (digest ? " (" + digest + ")" : ""));
+        if (srv.description) meta.unshift(srv.description);
+        const settings = (run.settings || []).map((s) => (s.secret
+            ? s.name + " (secret)" : s.name + "=" + (s.value || "")));
+        if (settings.length) meta.push("Settings: " + settings.join(", "));
+        if ((srv.headers || []).length) meta.push("Secret headers: " + srv.headers.join(", "));
+        if ((run.destinations || []).length) meta.push("Destinations: " + run.destinations.join(", "));
+        if (wiredNames.length) meta.push("Wired to: " + wiredNames.join(", "));
+    }
+    return el("div", { class: "mgmt-row mgmt-infra-row mcp-server-row",
+                       "data-mcp-server": srv.name }, [
+        el("span", { class: "mcp-server-name" }, [srv.name]),
+        badge,
+        el("span", { class: "mcp-server-actions" }, actions),
+        el("div", { class: "mcp-server-meta" }, [meta.join(" · ")]),
+        cell,
+        logPanel,
+    ]);
 }
 
 // A plain confirm for an action that answers at once (Remove, Start an empty
@@ -3218,6 +3698,13 @@ function renderMcpScreen(view, result, wiring) {
     }
     for (const srv of servers) {
         const cell = el("span", { class: "mcp-test" });
+        if (srv.kind === "run") {
+            const runWired = Array.isArray(srv.wired) ? srv.wired : [];
+            list.appendChild(mcpRunRow(view, srv, runWired.map((w) => w[0] + (w[1] === "agent" ? ""
+                : w[1] === "workers" ? " / analysis workers" : " / " + w[1].slice(4))), cell));
+            if (srv.run) rows.push({ name: srv.name, cell });
+            continue;
+        }
         const test = el("button", { class: "btn-small" }, ["Test"]);
         test.onclick = () => mcpTestRow(view, srv.name, cell);
         const edit = el("button", { class: "btn-small" }, ["Edit"]);

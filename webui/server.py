@@ -878,9 +878,13 @@ async def broker_software_handler(request: web.Request) -> web.Response:
 BROKER_MAX_REQUEST_BYTES = 64 * 1024
 
 
-def _broker_frame_len(verb: str, args: dict, token: str) -> int:
+def _broker_frame_len(verb: str, args: dict, token: str,
+                      op_id: str | None = None) -> int:
     """The length of the frame broker_call would send (same encoding)."""
-    return len(json.dumps({"verb": verb, "args": args, "token": token}).encode())
+    payload = {"verb": verb, "args": args, "token": token}
+    if op_id is not None:
+        payload["op_id"] = op_id
+    return len(json.dumps(payload).encode())
 
 
 async def broker_mcp_servers_handler(request: web.Request) -> web.Response:
@@ -899,6 +903,23 @@ _MCP_SERVER_ACTIONS = {
     "remove": ("mcp_server_remove", ("name",)),
     "test": ("mcp_server_test", ("name",)),
     "reset": ("mcp_server_list_reset", ()),
+    # A server RS runs: Stop and Logs answer at once (inline broker verbs).
+    "stop": ("mcp_server_stop", ("name",)),
+    "logs": ("mcp_server_logs", ("name",)),
+}
+# A server RS runs: the changes that pull an image or (re)create its container
+# are build-lane verbs (POST /broker/mcp/run/<action>, answered with an op_id
+# at once). The hand-picked leg of the request-field ↔ MCP_RUN_*_WEBUI_FIELDS ↔
+# app.js payload lockstep; setting and header VALUES only pass through.
+_MCP_RUN_ACTIONS = {
+    "add": ("mcp_run_add", ("name", "image", "args", "port", "path", "data",
+                            "settings", "headers", "destinations", "description")),
+    "edit": ("mcp_run_edit", ("name", "description", "args", "port", "path", "data",
+                              "settings_set", "settings_remove", "headers_set",
+                              "headers_remove", "destinations")),
+    "start": ("mcp_server_start", ("name",)),
+    "restart": ("mcp_server_restart", ("name",)),
+    "update": ("mcp_run_update", ("name",)),
 }
 # The wiring actions (POST /broker/mcp/<action>): same handler factory.
 _MCP_WIRING_ACTIONS = {
@@ -1027,6 +1048,54 @@ def _mcp_server_action_handler(action: str, table: dict | None = None):
                  "secret headers"}}, status=200)
         status, reply = await _relay(request, verb, args)
         return web.json_response(reply, status=status)
+    return handler
+
+
+def _mcp_run_action_handler(action: str):
+    verb, fields = _MCP_RUN_ACTIONS[action]
+
+    async def handler(request: web.Request) -> web.Response:
+        """POST /broker/mcp/run/<action> — a build-lane change of a server RS
+        runs: origin-checked, session-gated, only the verb's own fields cross,
+        an over-size frame is refused here before the relay. Relayed
+        synchronously (the broker spawns and answers at once) and answered
+        with {op_id} for the log tail, as broker_build_handler does."""
+        if not origin_ok(request):
+            return web.Response(status=403, text="origin rejected")
+        s = _broker_session(request)
+        if s is None:
+            return web.json_response(
+                {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        args = {k: body[k] for k in fields if k in body}
+        op_id = _mint_op_id("mcp", action)
+        if _broker_frame_len(verb, args, s["broker_token"], op_id) > BROKER_MAX_REQUEST_BYTES:
+            return web.json_response(
+                {"ok": False, "error": {"kind": "validation", "message":
+                 "the entry is too large; shorten the description, the "
+                 "settings or the secret headers"}}, status=200)
+        try:
+            reply = await broker_call(verb, args, token=s["broker_token"],
+                                      op_id=op_id, timeout=BROKER_CALL_TIMEOUT_S)
+        except BrokerUnavailable:
+            return web.json_response(
+                {"ok": False, "error": {"kind": "broker_unavailable"}}, status=503)
+        except BrokerForbidden:
+            return web.json_response(
+                {"ok": False, "error": {"kind": "forbidden"}}, status=403)
+        if (not reply.get("ok")
+                and reply.get("error", {}).get("kind") == "unauthorized"):
+            BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+            return web.json_response(
+                {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+        if not reply.get("ok"):
+            return web.json_response(reply, status=200)   # busy / validation → app error
+        return web.json_response({"ok": True, "op_id": op_id})
     return handler
 
 
@@ -4674,6 +4743,9 @@ def main() -> None:
     for _action in _MCP_SERVER_ACTIONS:
         app.router.add_post(f"/broker/mcp/servers/{_action}",
                             _mcp_server_action_handler(_action))
+    for _action in _MCP_RUN_ACTIONS:
+        app.router.add_post(f"/broker/mcp/run/{_action}",
+                            _mcp_run_action_handler(_action))
     app.router.add_get("/broker/mcp/wiring", broker_mcp_wiring_handler)
     for _action in _MCP_WIRING_ACTIONS:
         app.router.add_post(f"/broker/mcp/{_action}",
