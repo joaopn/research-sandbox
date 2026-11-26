@@ -85,6 +85,7 @@ import image_registry  # noqa: E402  (the image shelf's registry client; stdlib 
 import mcp_registry  # noqa: E402
 import mcp_servers  # noqa: E402  (the MCP gateway's server list; stdlib only)
 import mcp_run  # noqa: E402  (MCP servers RS runs from an image: names, file, argv)
+import mcp_paste  # noqa: E402  (a pasted MCP configuration → drafts of the Add form)
 import model_catalog  # noqa: E402  (agent model/effort catalog + per-type defaults; HOST-side only — never staged/baked into a container, see _read_models)
 import role_mcp  # noqa: E402
 import extension  # noqa: E402
@@ -11245,34 +11246,51 @@ def pin_reset(req: PinResetRequest) -> dict:
 _NPM_LATEST_MAX_BYTES = 256 * 1024
 
 
-def _npm_latest_bounded(pkg: str) -> str:
-    """npm's `latest` version of `pkg`, or an exception (TimeoutError past the
-    deadline; anything the read raised). The caller maps every failure to its
-    own pathless text."""
-    url = ("https://registry.npmjs.org/" + pkg.replace("/", "%2F") + "/latest")
+def _json_get_bounded(url: str, max_bytes: int, timeout: float, agent: str) -> Any:
+    """One GET of a JSON document under ONE total deadline (`timeout` seconds,
+    name resolution included) and a byte cap; an exception otherwise
+    (TimeoutError past the deadline; anything the read raised)."""
     out: dict = {}
 
     def read() -> None:
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "research-sandbox/app-refresh"})
-            with urllib.request.urlopen(req, timeout=_UPSTREAM_RESOLVE_MAX_TIME_S) as resp:
-                raw = resp.read(_NPM_LATEST_MAX_BYTES + 1)
-            if len(raw) > _NPM_LATEST_MAX_BYTES:
-                raise ValueError("answer too large for a manifest")
-            out["version"] = json.loads(raw.decode("utf-8"))["version"]
+            req = urllib.request.Request(url, headers={"User-Agent": agent})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ValueError("answer too large")
+            out["doc"] = json.loads(raw.decode("utf-8"))
         except BaseException as e:  # handed to the caller's thread
             out["error"] = e
     worker = threading.Thread(target=read, daemon=True)
     worker.start()
-    worker.join(_UPSTREAM_RESOLVE_MAX_TIME_S)
+    worker.join(timeout)
     if worker.is_alive():
-        raise TimeoutError("npm did not answer in time")
+        raise TimeoutError("the registry did not answer in time")
     if "error" in out:
         raise out["error"]
-    if not isinstance(out.get("version"), str):
+    return out["doc"]
+
+
+def _npm_manifest_bounded(pkg: str, ref: str, timeout: float = _UPSTREAM_RESOLVE_MAX_TIME_S,
+                          agent: str = "research-sandbox/app-refresh") -> dict:
+    """npm's per-package manifest of `ref` (`latest`, a tag or an exact
+    version) — the small document, never the package document."""
+    url = ("https://registry.npmjs.org/" + pkg.replace("/", "%2F") + "/" + ref)
+    doc = _json_get_bounded(url, _NPM_LATEST_MAX_BYTES, timeout, agent)
+    if not isinstance(doc, dict):
+        raise ValueError("npm's answer is not a manifest")
+    return doc
+
+
+def _npm_latest_bounded(pkg: str) -> str:
+    """npm's `latest` version of `pkg`, or an exception (TimeoutError past the
+    deadline; anything the read raised). The caller maps every failure to its
+    own pathless text."""
+    version = _npm_manifest_bounded(pkg, "latest").get("version")
+    if not isinstance(version, str):
         raise ValueError("no version in npm's answer")
-    return out["version"]
+    return version
 
 
 def app_refresh_check(key: str) -> tuple[str, str]:
@@ -20350,6 +20368,82 @@ def mcp_server_add(req: McpServerAddRequest, *, blocking: bool = True,
         data["servers"][req.name] = entry
     _mcp_change(change, blocking=blocking, deadline=deadline)
     return mcp_server_list(deadline)
+
+
+# --- a pasted configuration → drafts of the Add form (cli/mcp_paste.py) --------
+# The pasted text, as the broker frame carries it, is capped well inside the
+# frame (MAX_REQUEST_BYTES, 64 KiB): half of it leaves room for the frame's own
+# fields whatever the text's characters cost once encoded (a line break is two
+# bytes there, a non-ASCII character up to twelve). The largest configuration
+# block measured in real READMEs is 1.5 KB and a whole mcp.json with a dozen
+# servers a few KB, so this is about twenty times what a paste needs.
+MCP_DRAFT_TEXT_MAX_BYTES = 32 * 1024
+# PyPI's project document (the only one that names the current version) holds
+# every release's files, so it grows with each release: 47 KB to 0.3 MB measured
+# for MCP servers (mcp-grafana the largest), 3-4 MB for numpy-sized projects,
+# which are not MCP servers. Seven times the largest MCP server measured; a
+# larger one leaves the version empty with a note.
+_PYPI_DOC_MAX_BYTES = 2 * 1024 * 1024
+_MCP_DRAFT_AGENT = "research-sandbox/mcp-draft"
+
+
+@dataclass(frozen=True)
+class McpServerDraftRequest:
+    """The pasted text: never repr'd, never logged (it may hold a key)."""
+    text: str = field(repr=False)
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "McpServerDraftRequest":
+        text = kw.get("text")
+        if not isinstance(text, str):
+            raise ValidationError("paste a server's configuration as text")
+        if len(json.dumps(text).encode()) > MCP_DRAFT_TEXT_MAX_BYTES:
+            raise ValidationError("the pasted text is too long; paste only the "
+                                  "configuration of the servers to add")
+        return cls(text=text)
+
+
+def _mcp_draft_left(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("no time left")
+    return left
+
+
+def _mcp_draft_npm(pkg: str, ref: str, deadline: float) -> dict:
+    if mcp_run.package_problem("npm", pkg) or (
+            ref != "latest" and mcp_run.version_problem("npm", ref)):
+        raise ValueError("not a package and version to ask npm for")
+    return _npm_manifest_bounded(pkg, ref, _mcp_draft_left(deadline), _MCP_DRAFT_AGENT)
+
+
+def _mcp_draft_pypi(pkg: str, deadline: float) -> str:
+    if mcp_run.package_problem("pypi", pkg):
+        raise ValueError("not a package to ask PyPI for")
+    doc = _json_get_bounded(f"https://pypi.org/pypi/{pkg}/json", _PYPI_DOC_MAX_BYTES,
+                            _mcp_draft_left(deadline), _MCP_DRAFT_AGENT)
+    version = doc.get("info", {}).get("version") if isinstance(doc, dict) else None
+    if not isinstance(version, str):
+        raise ValueError("no version in PyPI's answer")
+    return version
+
+
+def mcp_server_draft(req: McpServerDraftRequest, deadline: float | None = None) -> dict:
+    """Drafts of the Add form for every server in a pasted configuration
+    (mcp_paste.read): {"drafts": [...], "notes": [...]}. Changes NOTHING — no
+    list, no lock, no docker; nothing pasted is run and no address from it is
+    fetched. Its only outside calls are registry lookups by validated package
+    name, all under ONE deadline, each given the time left; a lookup that
+    cannot finish leaves its field empty with a note."""
+    if deadline is None:
+        deadline = _mcp_deadline()
+    try:
+        return mcp_paste.read(
+            req.text,
+            npm_manifest=lambda pkg, ref: _mcp_draft_npm(pkg, ref, deadline),
+            pypi_version=lambda pkg: _mcp_draft_pypi(pkg, deadline))
+    except RecursionError:
+        raise ValidationError("the pasted text is nested too deeply to read") from None
 
 
 def mcp_server_edit(req: McpServerEditRequest, *, blocking: bool = True,

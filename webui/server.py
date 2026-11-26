@@ -898,6 +898,8 @@ async def broker_mcp_servers_handler(request: web.Request) -> web.Response:
 # the request-field ↔ MCP_SERVER_*_WEBUI_FIELDS ↔ app.js payload lockstep.
 _MCP_SERVER_ACTIONS = {
     "add": ("mcp_server_add", ("name", "url", "description", "headers")),
+    # A pasted configuration → drafts of the Add form; saves nothing.
+    "draft": ("mcp_server_draft", ("text",)),
     "edit": ("mcp_server_edit", ("name", "url", "description",
                                  "headers_set", "headers_remove")),
     "remove": ("mcp_server_remove", ("name",)),

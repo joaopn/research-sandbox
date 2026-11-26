@@ -66,6 +66,17 @@ flowchart LR
 - **The runner image is recorded.** A package server records what the `rs-mcp-runner` image held when the package was installed (a digest of its layers and configuration; not the image's Id, which Docker renews at every build even when nothing changed). That image is built at `research start` (cached) and by Rebuild all, and by the first package Add when it is missing. When its content has changed, Start and Restart refuse and say that Update installs the package again on the current one.
 - Remove deletes every package volume of the server too, and a package volume left over from an earlier server of that name shows as a leftover row.
 
+## Pasting a server's configuration
+
+A server's README usually says how to configure it in one of a few shapes: a one-liner (`npx -y <package>`, `uvx <package>`, `docker run … <image>`, `claude mcp add …`, `pip install <package>`), or an mcp.json block (`mcpServers` for Claude Desktop and Claude Code, `servers` for VS Code, `context_servers` for Zed, `mcp` for opencode, or one bare entry). The operator can paste that text, and RS returns a filled-in draft of the Add form for each server in it, to review and save as usual.
+
+- **What is read.** The text is read as JSON (comments and trailing commas allowed, as VS Code writes them) or as command lines. An npm or PyPI runner becomes a package server, a `docker run` line an image server, an address an address server; a block with several servers gives one draft each, named after its key.
+- **Nothing is run and nothing is saved.** The text is only parsed: no command in it is run and no address in it is fetched. A draft is saved only when the operator saves it through Add, which checks it like any other.
+- **Versions are looked up and pinned.** When the paste names no version (or `latest`), RS asks the registry for the current one and fills it in, with the npm command from that version's own record (the program named like the package, or its only one). A version the paste gives is kept as written; Add refuses it unless it is one exact version. A lookup that fails or runs out of time leaves the field empty with a note.
+- **Settings are secret by default.** Every setting the paste names starts as secret; a value that is a placeholder (`${input:…}`, `<your-token>`, `YOUR_API_KEY`, `$VAR`, …) is left empty to fill in.
+- **A docker line needs an HTTP image.** RS runs an image only when it serves MCP over HTTP; one that speaks only stdio does not run that way. Its port and path are left to fill in, and a host folder it mounts is left out.
+- **What could not be mapped is a note** on the draft: an unknown option, a path on the operator's machine (a server RS runs sees only its own data folder), a program installed on the operator's machine, a failed lookup.
+
 Two credentials for the same kind of server (a lab's account and a personal one) are two servers with their own names.
 
 When the shared [Aldine](Aldine.md) LaTeX editor is turned on, RS keeps a server named `aldine` on this list; it is wired like any other server, and Turn off removes it again.
@@ -170,3 +181,4 @@ Servers registered with `research mcp add` are granted to a project with `resear
 - **A package's install never sees a secret.** It runs in its own container with no settings; only the server's container gets them.
 - **Nothing is fetched when a server starts.** The package is installed once into a volume; a start runs what is there.
 - **The bridge is a pinned upstream one.** It gives each session its own server process and ends it with the session; RS owns only the small launcher in front of it.
+- **A pasted configuration is read, never run.** It only fills the Add form; the one outside call is the registry lookup of a version, by package name.

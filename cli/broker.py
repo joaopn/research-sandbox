@@ -407,6 +407,17 @@ def _verb_mcp_server_add(args: dict, _progress=None) -> dict:
     return rscore.mcp_server_add(req, blocking=False, deadline=rscore._mcp_deadline())
 
 
+def _verb_mcp_server_draft(args: dict, _progress=None) -> dict:
+    """Drafts of the Add form from a pasted configuration. Changes nothing
+    (no list, no lock, no docker); its registry lookups share ONE deadline,
+    taken FIRST. The text and the drafts may hold keys: the audit line
+    carries no args, and nothing here logs either."""
+    deadline = rscore._mcp_deadline()
+    safe = {k: v for k, v in args.items() if k in MCP_SERVER_DRAFT_WEBUI_FIELDS}
+    req = rscore.McpServerDraftRequest.from_kwargs(**safe)
+    return rscore.mcp_server_draft(req, deadline)
+
+
 def _verb_mcp_server_edit(args: dict, _progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in MCP_SERVER_EDIT_WEBUI_FIELDS}
     req = rscore.McpServerEditRequest.from_kwargs(**safe)
@@ -1405,6 +1416,9 @@ MCP_SERVER_ADD_WEBUI_FIELDS = frozenset({"name", "url", "description", "headers"
 MCP_SERVER_EDIT_WEBUI_FIELDS = frozenset({"name", "url", "description",
                                           "headers_set", "headers_remove"})
 MCP_SERVER_NAME_WEBUI_FIELDS = frozenset({"name"})
+# A pasted configuration to read into drafts of the Add form: one text,
+# parsed only (json, shlex), never run; nothing pasted reaches docker.
+MCP_SERVER_DRAFT_WEBUI_FIELDS = frozenset({"text"})
 # A server RS runs (an image, or a package). The image reference, its
 # arguments, port, path and data folder are operator-supplied docker inputs,
 # each validated by the request (a reference by docker's grammar, the
@@ -1692,6 +1706,7 @@ VERBS = {
     "aldine_off": _verb_aldine_off,
     "aldine_status": _verb_aldine_status,
     "mcp_server_add": _verb_mcp_server_add,
+    "mcp_server_draft": _verb_mcp_server_draft,
     "mcp_server_edit": _verb_mcp_server_edit,
     "mcp_server_remove": _verb_mcp_server_remove,
     "mcp_server_stop": _verb_mcp_server_stop,
