@@ -25,12 +25,23 @@
 #       and checks instead of its working mode)
 #     ~/.claude/skills/rs-test/{SKILL.md,policies/<policy>.md for every staged
 #       test policy} — the test-policy switch
+#     ~/.claude/skills/rs-plan/SKILL.md, ~/.claude/skills/rs-work/SKILL.md —
+#       the session roles of a researcher-subagents project (the planning
+#       session, a work session on one package), with the role's model and
+#       effort in their frontmatter, and ~/.local/bin/claude-plan,
+#       ~/.local/bin/claude-work — the shortcuts that start Claude Code on
+#       the role's model with the role's skill as the first prompt; all four
+#       only when RS_HARNESS_SUBAGENTS is 1, whatever the project's planner
+#       (the skills say so and stop when it is off)
 #   pi (pi in RS_HARNESS_AGENTS), under pi's agent dir:
 #     agents/doer.md, agents/checker.md, skills/harness/{…same…},
 #     skills/rs-test/{…same…}; agents/analyst.md only when RS_HARNESS_SUBAGENTS
 #     is 1 (pi has no surveyor yet: it has no web search of its own);
 #     agents/source-checker.md and skills/paper-check/{SKILL.md,bibpass.py}
-#     only when RS_HARNESS_PAPER_CHECK is 1
+#     only when RS_HARNESS_PAPER_CHECK is 1;
+#     skills/rs-plan/SKILL.md, skills/rs-work/SKILL.md (pi's skills take no
+#     model) and ~/.local/bin/pi-plan, ~/.local/bin/pi-work (they carry pi's
+#     model and thinking level of the role) only when RS_HARNESS_SUBAGENTS is 1
 #     and beside RS's rules extension, ~/.local/share/pi-agent/rs/roles/<role>.md
 #       — a link to the role's part, which the extension reads for that child
 #   either (any agent): ~/.claude/rules/rs-harness.md — the standing mode, and
@@ -77,6 +88,18 @@
 #   RS_HARNESS_PI_ANALYST_THINKING    pi thinking level for pi's analyst
 #                                     (these six: the project's record, read
 #                                     with RS_HARNESS_SUBAGENTS only)
+#   RS_HARNESS_PLANNER_MODEL          Claude tier for the planning session
+#                                     (empty: none named, the session's own)
+#   RS_HARNESS_PLANNER_EFFORT         Claude effort level for it (empty: none)
+#   RS_HARNESS_WORK_MODEL             Claude tier for a work session
+#   RS_HARNESS_WORK_EFFORT            Claude effort level for it
+#   RS_HARNESS_PI_PLANNER_MODEL       pi provider/model for the planning
+#                                     session (empty: pi's Agent model)
+#   RS_HARNESS_PI_PLANNER_THINKING    pi thinking level for it
+#   RS_HARNESS_PI_WORK_MODEL          pi provider/model for a work session
+#   RS_HARNESS_PI_WORK_THINKING       pi thinking level for it
+#                                     (these eight: the project's record, read
+#                                     with RS_HARNESS_SUBAGENTS only)
 #   RS_HARNESS_ANALYST_MCP            the MCP servers the project's own agents
 #                                     are wired to (space separated), which pi's
 #                                     analyst names (pi gives a child no MCP
@@ -97,7 +120,8 @@ FAILED=0
 
 warn() { echo "rs-harness: $*" >&2; }
 
-# put DEST — write stdin to DEST through a temp file beside it. Returns
+# put DEST [MODE] — write stdin to DEST through a temp file beside it, with
+# MODE (chmod's) set on the temp file before the rename when given. Returns
 # non-zero on failure and never sets state itself: it often runs at the end of
 # a pipeline, i.e. in a subshell, so every caller writes `put … || FAILED=1`.
 put() {
@@ -106,7 +130,8 @@ put() {
     # The temp name carries this run's pid: a box can run two installers at
     # once (its boot waiter and an Update's refresh), and a shared name would
     # let one truncate the file the other is renaming into place.
-    if [ ! -d "$1" ] && mkdir -p "$(dirname "$1")" && cat > "$1.rs-tmp.$$" && mv -f "$1.rs-tmp.$$" "$1"; then
+    if [ ! -d "$1" ] && mkdir -p "$(dirname "$1")" && cat > "$1.rs-tmp.$$" \
+            && { [ -z "${2:-}" ] || chmod "$2" "$1.rs-tmp.$$"; } && mv -f "$1.rs-tmp.$$" "$1"; then
         return 0
     fi
     rm -f "$1.rs-tmp.$$"
@@ -201,7 +226,8 @@ checked() {
 # otherwise leave a frontmatter-only agent file that reads as a success. A
 # mode's own rule body, and a test policy's, is checked when it is chosen, below.
 for f in agents/doer.md agents/checker.md agents/analyst.md agents/surveyor.md skill/SKILL.md modes/LIST skill-test/SKILL.md policies/LIST \
-        skill-research/SKILL.md agents/source-checker.md skill-paper-check/SKILL.md skill-paper-check/bibpass.py; do
+        skill-research/SKILL.md agents/source-checker.md skill-paper-check/SKILL.md skill-paper-check/bibpass.py \
+        skill-roles/rs-plan.md skill-roles/rs-work.md skill-roles/shortcut.sh; do
     if [ ! -r "$SRC/$f" ]; then
         warn "the shipped file $f is missing; nothing installed"
         echo RS_HARNESS_INSTALL_FAILED
@@ -246,6 +272,16 @@ SURVEYOR_MODEL=$(checked RS_HARNESS_SURVEYOR_MODEL "${RS_HARNESS_SURVEYOR_MODEL:
 SURVEYOR_EFFORT=$(checked RS_HARNESS_SURVEYOR_EFFORT "${RS_HARNESS_SURVEYOR_EFFORT:-}" claude_effort_ok)
 PI_ANALYST_MODEL=$(checked RS_HARNESS_PI_ANALYST_MODEL "${RS_HARNESS_PI_ANALYST_MODEL:-}" pi_model_ok)
 PI_ANALYST_THINKING=$(checked RS_HARNESS_PI_ANALYST_THINKING "${RS_HARNESS_PI_ANALYST_THINKING:-}" pi_thinking_ok)
+# The session roles' models (the project's record; unset: the role's skill
+# and shortcut name no model, so the agent starts on its own).
+PLANNER_MODEL=$(checked RS_HARNESS_PLANNER_MODEL "${RS_HARNESS_PLANNER_MODEL:-}" claude_tier_ok)
+PLANNER_EFFORT=$(checked RS_HARNESS_PLANNER_EFFORT "${RS_HARNESS_PLANNER_EFFORT:-}" claude_effort_ok)
+WORK_MODEL=$(checked RS_HARNESS_WORK_MODEL "${RS_HARNESS_WORK_MODEL:-}" claude_tier_ok)
+WORK_EFFORT=$(checked RS_HARNESS_WORK_EFFORT "${RS_HARNESS_WORK_EFFORT:-}" claude_effort_ok)
+PI_PLANNER_MODEL=$(checked RS_HARNESS_PI_PLANNER_MODEL "${RS_HARNESS_PI_PLANNER_MODEL:-}" pi_model_ok)
+PI_PLANNER_THINKING=$(checked RS_HARNESS_PI_PLANNER_THINKING "${RS_HARNESS_PI_PLANNER_THINKING:-}" pi_thinking_ok)
+PI_WORK_MODEL=$(checked RS_HARNESS_PI_WORK_MODEL "${RS_HARNESS_PI_WORK_MODEL:-}" pi_model_ok)
+PI_WORK_THINKING=$(checked RS_HARNESS_PI_WORK_THINKING "${RS_HARNESS_PI_WORK_THINKING:-}" pi_thinking_ok)
 # The paper check (its skill and the source-checker role): only when the host
 # says this agent gets it.
 PAPER_CHECK=0
@@ -316,6 +352,46 @@ skill_test() {
 skill_paper_check() {
     put "$1/SKILL.md" < "$SRC/skill-paper-check/SKILL.md" || FAILED=1
     put "$1/bibpass.py" < "$SRC/skill-paper-check/bibpass.py" || FAILED=1
+}
+
+PLAN_DESC="Make this session the project's planning session - define the task with the user and split it into work packages with charters. Use when the user asks for the planning role, or after a compaction to reload this session's planning role."
+WORK_DESC="Make this session a work session on one work package - take the package and work only inside its charter. Use when the user asks to work in a package, or after a compaction to reload this session's work role."
+
+# role_skill AGENT DIR ROLE MODEL SECOND — a session role's skill (ROLE plan
+# or work, named rs-ROLE) into DIR/SKILL.md: its frontmatter, then its text.
+# Claude's carries the role's model and effort (SECOND), and is invoked by the
+# model too (no disable-model-invocation: a session loads its role again
+# after a compaction); pi's skills take no model, so pi's carries neither.
+role_skill() {
+    if [ "$3" = plan ]; then DESC=$PLAN_DESC; else DESC=$WORK_DESC; fi
+    {
+        printf '%s\n' '---' "name: rs-$3" "description: $DESC"
+        if [ "$1" = claude ]; then
+            [ "$3" != work ] || printf '%s\n' 'argument-hint: "<package>"'
+            [ -z "$4" ] || printf '%s\n' "model: \"$4\""
+            [ -z "$5" ] || printf '%s\n' "effort: \"$5\""
+        fi
+        printf '%s\n' '---' ''
+        cat "$SRC/skill-roles/rs-$3.md"
+    } | put "$2/SKILL.md" || FAILED=1
+}
+
+# role_shortcut AGENT ROLE MODEL SECOND — the shortcut AGENT-ROLE into
+# ~/.local/bin (beside the agents' launchers, on the terminal's PATH): the
+# role's settings as shell assignments (every value passed one of the
+# charsets above, none of which admits a quote, a `$` or a backslash), then
+# the shared body. SECOND is Claude's effort or pi's thinking level.
+role_shortcut() {
+    {
+        printf '%s\n' '#!/bin/sh' "# $1-$2 — written by RS (its harness installer); rewritten at every RS start and settings change." \
+            "RS_ROLE_AGENT=$1" "RS_ROLE=$2" "RS_ROLE_MODEL=\"$3\""
+        if [ "$1" = claude ]; then
+            printf '%s\n' "RS_ROLE_EFFORT=\"$4\"" 'RS_ROLE_THINKING='
+        else
+            printf '%s\n' 'RS_ROLE_EFFORT=' "RS_ROLE_THINKING=\"$4\""
+        fi
+        cat "$SRC/skill-roles/shortcut.sh"
+    } | put "$HOME/.local/bin/$1-$2" 755 || FAILED=1
 }
 
 # has_part ROLE — RS's instruction writer laid ROLE's part here: a regular,
@@ -424,6 +500,12 @@ if [ "$HAS_CLAUDE" = 1 ]; then
         } | put "$HOME/.claude/agents/source-checker.md" || FAILED=1
         skill_paper_check "$HOME/.claude/skills/paper-check"
     fi
+    if [ "$SUBAGENTS" = 1 ]; then
+        role_skill claude "$HOME/.claude/skills/rs-plan" plan "$PLANNER_MODEL" "$PLANNER_EFFORT"
+        role_skill claude "$HOME/.claude/skills/rs-work" work "$WORK_MODEL" "$WORK_EFFORT"
+        role_shortcut claude plan "$PLANNER_MODEL" "$PLANNER_EFFORT"
+        role_shortcut claude work "$WORK_MODEL" "$WORK_EFFORT"
+    fi
     skill "$HOME/.claude/skills/harness"
     skill_test "$HOME/.claude/skills/rs-test"
 fi
@@ -475,6 +557,12 @@ if [ "$HAS_PI" = 1 ]; then
             cat "$SRC/agents/source-checker.md"
         } | put "$PI_DIR/agents/source-checker.md" || FAILED=1
         skill_paper_check "$PI_DIR/skills/paper-check"
+    fi
+    if [ "$SUBAGENTS" = 1 ]; then
+        role_skill pi "$PI_DIR/skills/rs-plan" plan
+        role_skill pi "$PI_DIR/skills/rs-work" work
+        role_shortcut pi plan "$PI_PLANNER_MODEL" "$PI_PLANNER_THINKING"
+        role_shortcut pi work "$PI_WORK_MODEL" "$PI_WORK_THINKING"
     fi
     skill "$PI_DIR/skills/harness"
     skill_test "$PI_DIR/skills/rs-test"

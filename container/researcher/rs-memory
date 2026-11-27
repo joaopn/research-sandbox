@@ -158,8 +158,11 @@ the referee's model and a re-run's folder are the workspace's in a package
 too. RS_MEMORY_DIR naming a package's memory is refused: a package's memory
 is reached by taking the package. Taking a memory first consolidates its
 last session when that one ended without `close` (as `open` does without
-the planner); `open` of a session that holds nothing lists the packages and
-consolidates nothing; `close` and `close --hook` act on the memory the
+the planner); `open` of a session that holds nothing lists the packages,
+names the role skills (/rs-plan, /rs-work) and their shortcuts, and
+consolidates nothing; `open` of a session that holds something names its
+role and the skill to invoke again when that skill's text is not in
+context (after a compaction); `close` and `close --hook` act on the memory the
 session holds, then give it back. Only the planning session adds a package,
 changes a charter (journalled in the package as an entry naming the
 sections that changed, so its session sees it at its next `open`) or
@@ -2032,12 +2035,16 @@ def open_listing_text() -> str:
     parts = ["# rs-memory: work packages\n"
              "This project works in work packages (its planner is on), and this session holds "
              "none yet: its memory is not chosen, so nothing was read or consolidated. Open by "
-             "asking the user which package to take, or whether this session plans. Then:\n"
+             "asking the user which package to take, or whether this session plans. Then invoke "
+             "the role's skill, which takes it and says how the role works:\n"
              "- to plan (define the task with the user, add packages and their charters): "
-             "rs-memory plan\n"
-             "- to work in one package, and only in it: rs-memory take <package>\n"
+             "/rs-plan (pi: /skill:rs-plan), which runs rs-memory plan\n"
+             "- to work in one package, and only in it: /rs-work <package> (pi: /skill:rs-work "
+             "<package>), which runs rs-memory take <package>\n"
              "Under Claude Code give either call a Bash timeout of 600000 ms: it first "
-             "consolidates that memory's last session when the session ended without closing."]
+             "consolidates that memory's last session when the session ended without closing. "
+             "In the project's terminal, claude-plan and claude-work <package> (pi: pi-plan and "
+             "pi-work <package>) start a new session in either role, on the role's model."]
     if SESSION["lost"]:
         parts.append(SESSION["lost"][0].upper() + SESSION["lost"][1:] + ".")
     parts.append(packages_text(SESSION["sid"]))
@@ -2047,18 +2054,30 @@ def open_listing_text() -> str:
     return "\n\n".join(parts) + "\n"
 
 
+# What open says to a session that holds something about its role's skill:
+# the skill's text is the role, and a compaction drops it (open runs again
+# after every compaction, under both agents).
+ROLE_RELOAD = ("Its role is the {skill} skill's text: when that text is not in your context "
+               "(after a compaction, for one), invoke the skill again, /{cmd} (pi: "
+               "/skill:{cmd}), and go on in the role.")
+
+
 def open_head() -> "str | None":
     """open's first lines, with the planner on, for a session that holds
     something: what it holds."""
     if not SESSION["planner"] or SESSION["binding"] is None:
         return None
     if SESSION["binding"][0] == "top":
-        return ("## This session plans\nIt holds the project's top: define the task with the "
+        return ("## This session plans\nThis session is the planning session. " + ROLE_RELOAD.format(
+                    skill="rs-plan", cmd="rs-plan")
+                + " It holds the project's top: define the task with the "
                 "user and write the packages and their charters with rs-memory package add, "
                 "package charter, package done and package close.\n\n"
                 + packages_text(SESSION["sid"]))
     name = SESSION["binding"][1]
-    return (f"## This session's work package: {name}\nIts folder is {package_dir(name)}, its "
+    return (f"## This session's work package: {name}\nThis session works in package {name}. "
+            + ROLE_RELOAD.format(skill="rs-work", cmd=f"rs-work {name}") +
+            f" Its folder is {package_dir(name)}, its "
             f"charter {package_dir(name) / CHARTER_FILE}: work only inside the charter, and bring "
             "an idea outside it to the user as a suggestion. Its analyses go under "
             f"{package_dir(name) / TASKS_DIR}/.")
