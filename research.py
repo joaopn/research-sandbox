@@ -523,6 +523,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         referee_model=args.referee_model, referee_effort=args.referee_effort,
         analyst_model=args.analyst_model, analyst_effort=args.analyst_effort,
         surveyor_model=args.surveyor_model, surveyor_effort=args.surveyor_effort,
+        pi_referee_model=args.pi_referee_model, pi_referee_thinking=args.pi_referee_thinking,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
         status_bar=args.status_bar,
         block_account_links=args.block_account_links,
@@ -986,6 +987,7 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         referee_model=args.referee_model, referee_effort=args.referee_effort,
         analyst_model=args.analyst_model, analyst_effort=args.analyst_effort,
         surveyor_model=args.surveyor_model, surveyor_effort=args.surveyor_effort,
+        pi_referee_model=args.pi_referee_model, pi_referee_thinking=args.pi_referee_thinking,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
         agents=agents,
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
@@ -3321,6 +3323,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "project (unset = the installation default)")
     c.add_argument("--surveyor-effort", default="", metavar="LEVEL",
                    help="effort level of Claude's surveyor helper (unset = the installation default)")
+    c.add_argument("--pi-referee-model", dest="pi_referee_model", default="",
+                   metavar="PROVIDER/MODEL",
+                   help="model of the finding referee under pi, in a researcher-subagents "
+                        "project (unset = the Agent model). Needs pi among the agents.")
+    c.add_argument("--pi-referee-thinking", dest="pi_referee_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="thinking level of the finding referee under pi, with its own "
+                        "model (unset = pi's default)")
     c.add_argument("--pi-analyst-model", dest="pi_analyst_model", default="",
                    metavar="PROVIDER/MODEL",
                    help="model of pi's analyst helper, in a researcher-subagents project "
@@ -3442,6 +3452,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "project (unset = leave unchanged)")
     u.add_argument("--surveyor-effort", default="", metavar="LEVEL",
                    help="effort level of Claude's surveyor helper (unset = leave unchanged)")
+    u.add_argument("--pi-referee-model", dest="pi_referee_model", default="",
+                   metavar="PROVIDER/MODEL",
+                   help="model of the finding referee under pi, in a researcher-subagents "
+                        "project (unset = leave unchanged; --reset pi_referee_model = "
+                        "the Agent model)")
+    u.add_argument("--pi-referee-thinking", dest="pi_referee_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="thinking level of the finding referee under pi "
+                        "(unset = leave unchanged)")
     u.add_argument("--pi-analyst-model", dest="pi_analyst_model", default="",
                    metavar="PROVIDER/MODEL",
                    help="model of pi's analyst helper, in a researcher-subagents project "

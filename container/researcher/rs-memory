@@ -1580,7 +1580,9 @@ def run_rerun(ident: str, n: int) -> int:
 
 def referee_model(agent: str) -> "list[str]":
     """The model flags for the referee, from the project's record; no model
-    recorded is an error, never a fallback to the agent's default."""
+    recorded is an error, never a fallback to the agent's default. Under pi
+    the referee's own pair (pi_models.referee) comes first when it names a
+    model, then pi's Agent model (pi_models.agent)."""
     data = project_record()
     if agent == "claude":
         models = data.get("models") if isinstance(data.get("models"), dict) else {}
@@ -1595,12 +1597,17 @@ def referee_model(agent: str) -> "list[str]":
             raise Refused(f"the referee's effort in {record_path()} is not text: {e!r}")
         return ["--model", m.strip()] + (["--effort", e.strip()] if e.strip() else [])
     blk = data.get("pi_models") if isinstance(data.get("pi_models"), dict) else {}
-    pair = blk.get("agent")
+    pair = blk.get("referee")
     m = pair.get("model") if isinstance(pair, dict) else None
     if not isinstance(m, str) or not m.strip():
+        pair = blk.get("agent")
+        m = pair.get("model") if isinstance(pair, dict) else None
+    if not isinstance(m, str) or not m.strip():
         raise Refused("no referee model is set for this project: its record "
-                      f"({record_path()}) has no pi model (pi_models.agent.model); the PI "
-                      "sets pi's model in the project's settings")
+                      f"({record_path()}) has neither a pi referee model "
+                      "(pi_models.referee.model) nor a pi model (pi_models.agent.model); "
+                      "the PI sets one on pi's tab in the project's ⚙ Agents box "
+                      "(the Referee row)")
     t = pair.get("thinking") or ""
     if not isinstance(t, str):
         raise Refused(f"pi's thinking level in {record_path()} is not text: {t!r}")

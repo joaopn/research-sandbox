@@ -1034,9 +1034,10 @@ CREATE_WEBUI_FIELDS = frozenset({
     # record, which rs-memory and the kit's installer read inside the
     # container; no path, host port or mount. from_kwargs refuses them on any
     # other workflow, resolves Claude's against the catalog and holds pi's to
-    # the strict charset.
+    # the strict charset (pi's referee: rs-memory reads it at each run).
     "referee_model", "referee_effort", "analyst_model", "analyst_effort",
-    "surveyor_model", "surveyor_effort", "pi_analyst_model", "pi_analyst_thinking",
+    "surveyor_model", "surveyor_effort", "pi_referee_model", "pi_referee_thinking",
+    "pi_analyst_model", "pi_analyst_thinking",
     # The working mode and the doer/checker models (dev workflows only, refused
     # elsewhere in from_kwargs): IN-BOX — they land in the agent's own config
     # files inside the container; tiers, pi ids and levels are shape-checked.
@@ -1075,11 +1076,12 @@ UPDATE_WEBUI_FIELDS = frozenset({
     "supervisor_model", "supervisor_effort",
     "worker_model", "worker_effort",
     "role_model", "role_effort",
-    # The finding referee's pair (the ⚙ Agents box of a researcher-subagents
-    # project): IN-BOX like the worker pair — catalog tokens written into the
-    # project's record, which rs-memory reads inside the container; refused in
-    # update() on any other project. No container is touched.
-    "referee_model", "referee_effort",
+    # The finding referee's pairs (the ⚙ Agents box of a researcher-subagents
+    # project): IN-BOX like the worker pair — catalog tokens (Claude's) and a
+    # pi provider/model id (pi's) written into the project's record, which
+    # rs-memory reads inside the container; refused in update() on any other
+    # project. No container is touched.
+    "referee_model", "referee_effort", "pi_referee_model", "pi_referee_thinking",
     # The helper roles' pairs (the same box, the same project type): catalog
     # tokens and a pi provider/model id written into the project's record,
     # which the kit's installer reads inside the container; refused in

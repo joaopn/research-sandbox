@@ -1467,8 +1467,10 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
                       "supervisor_model", "supervisor_effort",
                       "worker_model", "worker_effort",
                       "role_model", "role_effort",
-                      # the ⚙ Agents box's Referee row (researcher-subagents)
+                      # the ⚙ Agents box's Referee rows (researcher-subagents),
+                      # Claude's and pi's
                       "referee_model", "referee_effort",
+                      "pi_referee_model", "pi_referee_thinking",
                       # its Analyst and Surveyor rows, and pi's Analyst row
                       "analyst_model", "analyst_effort",
                       "surveyor_model", "surveyor_effort",
