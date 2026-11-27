@@ -1490,6 +1490,10 @@ class CreateRequest:
     # RESEARCH_SWITCHES_KEY object when either is given.
     subagents_switch: str = ""
     checks_switch: str = ""
+    # Its planner (RESEARCH_SWITCHES["planner"]), a project setting only: on =
+    # the work is split into work packages. "" = off; written into the same
+    # object only when given.
+    planner_switch: str = ""
     # The working mode and the doer/checker models (I33; HARNESS_FIELDS, "" =
     # unset). Dev workflows only; validated in _validated_harness.
     harness_mode: str = ""
@@ -1856,7 +1860,7 @@ class CreateRequest:
                                      agents=agents)
         switches = _research_switch_args(kw)
         if any(switches.values()) and not research_subagents:
-            raise ValidationError("the subagents and checks settings apply only to a "
+            raise ValidationError("the subagents, checks and planner settings apply only to a "
                                   "researcher-subagents project")
         return cls(
             name=_require_name(kw.get("name")),
@@ -2437,6 +2441,9 @@ class UpdateRequest:
     # new sessions start with, never a running session's.
     subagents_switch: str = ""
     checks_switch: str = ""
+    # Its planner: "" = unchanged. Changed with the two above or on its own;
+    # turning it off is refused while a work package is open.
+    planner_switch: str = ""
 
     def model_changes(self) -> dict[str, dict[str, str]]:
         """The per-type model/effort fields the caller actually SET, as
@@ -5317,10 +5324,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # Its two switches, only when the create chose one (from_kwargs
         # refused them elsewhere): every switch named, the unchosen one at its
         # default. A record without them reads as the defaults.
+        # The planner is written only when chosen, so a record made without
+        # it is exactly as before the planner existed.
         chosen = {k: getattr(req, f) for k, f in RESEARCH_SWITCH_FIELDS.items()
                   if getattr(req, f)}
         if chosen:
-            marker[RESEARCH_SWITCHES_KEY] = {**RESEARCH_SWITCH_DEFAULTS, **chosen}
+            marker[RESEARCH_SWITCHES_KEY] = {
+                **{k: RESEARCH_SWITCH_DEFAULTS[k] for k in RESEARCH_SESSION_SWITCHES}, **chosen}
     if req.research_companion:
         # The companion type: rs-memory's companion mode keys on it. Only
         # written when set, so a researcher project's record is exactly as
@@ -6426,7 +6436,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         return _update_account_links(req, cfg, project, container, progress)
     # A researcher-subagents project's switches: their own change, the record
     # and then (running) the agent's instructions, nothing restarted.
-    if req.subagents_switch or req.checks_switch:
+    if req.subagents_switch or req.checks_switch or req.planner_switch:
         return _update_research_switches(req, cfg, project, container, progress)
     # The docker substrate has no in-container editable surface (no templates, no
     # worker/extension cone) and no sysbox store to re-stage. The ONE meaningful
@@ -10462,11 +10472,19 @@ SUBAGENTS_RECORD_KEY = "subagents"
 # SUBAGENTS_RECORD_KEY keeps meaning "a researcher-subagents project".
 # MIRROR of rs-memory's SWITCHES_KEY / SWITCHES / SWITCH_DEFAULTS (the
 # command reads what the host writes).
+# The third, `planner` (off = one session at the project's top, on = the work
+# split into work packages under <workspace>/packages/, each worked on in a
+# session of its own), is a project setting only: no session switches it, so
+# the rs-mode skill neither carries nor names it (RESEARCH_SESSION_SWITCHES),
+# and the record holds it only once it was chosen.
 RESEARCH_SWITCHES_KEY = "research_switches"
-RESEARCH_SWITCHES = {"subagents": ("on", "off"), "checks": ("off", "staged", "all")}
-RESEARCH_SWITCH_DEFAULTS = {"subagents": "on", "checks": "staged"}
+RESEARCH_SWITCHES = {"subagents": ("on", "off"), "checks": ("off", "staged", "all"),
+                     "planner": ("off", "on")}
+RESEARCH_SWITCH_DEFAULTS = {"subagents": "on", "checks": "staged", "planner": "off"}
+RESEARCH_SESSION_SWITCHES = ("subagents", "checks")
 # The request fields that set them (CreateRequest, UpdateRequest), by switch.
-RESEARCH_SWITCH_FIELDS = {"subagents": "subagents_switch", "checks": "checks_switch"}
+RESEARCH_SWITCH_FIELDS = {"subagents": "subagents_switch", "checks": "checks_switch",
+                          "planner": "planner_switch"}
 # The instruction text of a researcher-subagents project marks each passage
 # that depends on a switch with a whole line `<!-- rs-switch: NAME VALUE... -->`
 # before it and `<!-- rs-switch: end -->` after it: the passage is kept when
@@ -10522,11 +10540,13 @@ def _compose_research_text(text: str, switches: "dict[str, str]") -> str:
 
 def research_switch_pieces(text: str) -> "dict[tuple[str, str], str]":
     """{(switch, value): its passages}, each passage stripped and joined by a
-    blank line, for every switch value (a value no passage names maps to "")."""
+    blank line, for every value of the switches a session switches
+    (RESEARCH_SESSION_SWITCHES; a value no passage names maps to ""). The
+    planner's passages are no session's to switch, and are left out."""
     pieces: "dict[tuple[str, str], list[str]]" = {
-        (k, v): [] for k, vals in RESEARCH_SWITCHES.items() for v in vals}
+        (k, v): [] for k in RESEARCH_SESSION_SWITCHES for v in RESEARCH_SWITCHES[k]}
     for key, t in _research_switch_blocks(text):
-        if key is not None and t.strip():
+        if key is not None and key[0] in RESEARCH_SESSION_SWITCHES and t.strip():
             for v in key[1]:
                 pieces[(key[0], v)].append(t.strip())
     return {k: "\n\n".join(v) for k, v in pieces.items()}
@@ -18601,7 +18621,10 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # `rs-memory switch` (a session's own subagents and checks switches) and
 # `rs-memory check` (both checks of several findings at once), and rely on
 # accept honouring the checks switch (the record's research_switches).
-MEMORY_KIT_VERSION = "10"
+# Version 11: the researcher-subagents instructions name the planner's verbs
+# (`rs-memory plan`, `take`, `release`, `package …`: work packages, with the
+# record's research_switches planner on).
+MEMORY_KIT_VERSION = "11"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")
@@ -19170,16 +19193,19 @@ def _update_account_links(req: "UpdateRequest", cfg: "Config", project: str,  # 
 
 def _update_research_switches(req: "UpdateRequest", cfg: "Config", project: str,  # type: ignore[name-defined]
                               container: str, progress) -> "UpdateResult":
-    """A researcher-subagents project's two switches, alone in their request:
-    merged into the record's RESEARCH_SWITCHES_KEY object, then, on a running
-    project, RS's instructions written again from it (what the agent's next
-    session reads; no container is restarted, a running session keeps its
-    switches). A stopped project gets them at its next start, which writes the
-    instructions anyway. Refused before any write on another project type, on
-    an unreadable record and on a switches object RS did not write."""
-    if _dc_replace(req, subagents_switch="", checks_switch="") != UpdateRequest(name=req.name):
-        raise ValidationError("change the subagents and checks settings on their own, not "
-                              "together with other settings")
+    """A researcher-subagents project's switches (subagents, checks, planner),
+    alone in their request: merged into the record's RESEARCH_SWITCHES_KEY
+    object, then, on a running project, RS's instructions written again from
+    it (what the agent's next session reads; no container is restarted, a
+    running session keeps its switches). A stopped project gets them at its
+    next start, which writes the instructions anyway. Refused before any
+    write on another project type, on an unreadable record, on a switches
+    object RS did not write, and, for the planner turned off, while a work
+    package is open (read from the project's folder, running or stopped)."""
+    if (_dc_replace(req, subagents_switch="", checks_switch="", planner_switch="")
+            != UpdateRequest(name=req.name)):
+        raise ValidationError("change the subagents, checks and planner settings on their own, "
+                              "not together with other settings")
     workspace_path = workspace_path_for(project, cfg)
     state, data = _read_marker_three_way(workspace_path)
     if state != "ok":
@@ -19200,7 +19226,15 @@ def _update_research_switches(req: "UpdateRequest", cfg: "Config", project: str,
             now_set = read_research_switches(d)
         except ValueError as e:      # changed since the check above
             raise ValidationError(_research_switches_unreadable(str(e)))
-        d[RESEARCH_SWITCHES_KEY] = {**now_set, **chosen}
+        # Checked here, just before the write, so a package added or taken
+        # since the panel opened still refuses.
+        if chosen.get("planner") == "off" and now_set["planner"] == "on":
+            _refuse_open_work_packages(workspace_path)
+        new = {**now_set, **chosen}
+        # A record that never held the planner keeps its shape.
+        if "planner" not in chosen and "planner" not in d.get(RESEARCH_SWITCHES_KEY, {}):
+            new.pop("planner")
+        d[RESEARCH_SWITCHES_KEY] = new
     progress.step("switches", "saving the subagents and checks settings")
     _marker_rmw(workspace_path, mutate, "change the subagents and checks settings")
     words = ", ".join(f"{k} {v}" for k, v in
@@ -19213,9 +19247,119 @@ def _update_research_switches(req: "UpdateRequest", cfg: "Config", project: str,
     progress.step("instructions", "writing the agent's instructions")
     found = _write_project_instructions(project, container, workspace_path, progress=progress)
     print(f"{project!r} now starts new sessions with {words}; a running session keeps its "
-          "own until it is switched with /rs-mode.")
+          "own subagents and checks until it is switched with /rs-mode.")
     _raise_old_instructions(found)
     return UpdateResult(project=project, rebuilt=False)
+
+
+# A work package's status file, <workspace>/packages/<name>/package.json, as
+# the host reads it to refuse turning the planner off while one is open. The
+# project writes the tree, so it is walked by descriptor (_open_work_packages).
+# rs-memory writes a few hundred bytes; the cap is its own STATUS_MAX_BYTES (a
+# thousand times that), so anything rs-memory writes is read. MIRROR of
+# rs-memory's PACKAGES_DIR, PACKAGE_STATUS, PACKAGE_STATES, STATUS_MAX_BYTES.
+WORK_PACKAGES_DIR = "packages"
+WORK_PACKAGE_STATUS = "package.json"
+WORK_PACKAGE_STATES = ("open", "done", "closed")
+WORK_PACKAGE_STATUS_MAX_BYTES = 256 * 1024
+# What the project sees as its packages folder, for refusal text (never the
+# host path).
+WORK_PACKAGES_SHOWN = "/workspace/packages"
+
+
+def _open_work_packages(workspace_path: "Path") -> "tuple[list[str], list[str]]":
+    """Read-only, host-side: the names of the work packages whose status says
+    `open`, and what RS could not read there (each a sentence in project
+    terms). The tree is project-writable, so it is read through descriptors,
+    each level relative to its parent and never following a link; a status
+    file is opened without blocking and read only when it is a plain,
+    singly-linked file within WORK_PACKAGE_STATUS_MAX_BYTES (enforced again
+    by a cap+1 read). No packages folder: none open."""
+    path_flags = _role_job_path_flags()
+    cap = WORK_PACKAGE_STATUS_MAX_BYTES
+    open_names: "list[str]" = []
+    problems: "list[str]" = []
+    fds: "list[int]" = []
+    try:
+        try:
+            fds.append(os.open(workspace_path, path_flags))
+        except OSError as e:
+            return [], [f"the project's folder cannot be read ({e.strerror or e})"]
+        try:
+            fds.append(os.open(WORK_PACKAGES_DIR, _ROLE_JOB_DIR_FLAGS, dir_fd=fds[0]))
+        except FileNotFoundError:
+            return [], []
+        except OSError as e:
+            return [], [f"{WORK_PACKAGES_SHOWN} is not a folder RS can read "
+                        f"({e.strerror or e})"]
+        try:
+            names = sorted(os.listdir(fds[1]))
+        except OSError as e:
+            return [], [f"{WORK_PACKAGES_SHOWN} cannot be listed ({e.strerror or e})"]
+        for name in names:
+            if not _PROJECT_NAME_RE.match(name):
+                problems.append(f"{WORK_PACKAGES_SHOWN} holds an entry that is no package name")
+                continue
+            where = f"{WORK_PACKAGES_SHOWN}/{name}"
+            try:
+                dfd = os.open(name, path_flags, dir_fd=fds[1])
+            except OSError:
+                problems.append(f"{where} is not a folder (a link or a file)")
+                continue
+            try:
+                try:
+                    fd = os.open(WORK_PACKAGE_STATUS, _ROLE_JOB_READ_FLAGS, dir_fd=dfd)
+                except FileNotFoundError:
+                    problems.append(f"{where} has no {WORK_PACKAGE_STATUS}")
+                    continue
+                except OSError as e:
+                    problems.append(f"{where}/{WORK_PACKAGE_STATUS} cannot be opened as a "
+                                    f"plain file ({e.strerror or e})")
+                    continue
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1 or st.st_size > cap:
+                        raise ValueError("it is not a plain file rs-memory wrote")
+                    with open(fd, "rb", closefd=False) as fh:
+                        raw = fh.read(cap + 1)
+                    if len(raw) > cap:
+                        raise ValueError("it is larger than a status file")
+                    status = json.loads(raw.decode("utf-8"))
+                    state = status.get("state") if isinstance(status, dict) else None
+                    if state not in WORK_PACKAGE_STATES:
+                        raise ValueError("it names no state rs-memory writes")
+                except (OSError, ValueError, RecursionError) as e:
+                    problems.append(f"{where}/{WORK_PACKAGE_STATUS} cannot be read ({e})")
+                    continue
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(dfd)
+            if state == "open":
+                open_names.append(name)
+        return open_names, problems
+    finally:
+        for d in reversed(fds):
+            os.close(d)
+
+
+def _refuse_open_work_packages(workspace_path: "Path") -> None:
+    """The planner turned off: refused while a work package is open, naming
+    each, or while RS cannot tell (browser-safe: the remedies are typed in
+    the project's own terminal)."""
+    open_names, problems = _open_work_packages(workspace_path)
+    if open_names:
+        raise ValidationError(
+            f"the planner cannot be turned off while work packages are open: "
+            + ", ".join(f"{WORK_PACKAGES_SHOWN}/{n}" for n in open_names)
+            + ". Finish each (rs-memory package done <name>, in its session or the planning "
+            "session) or close it (rs-memory package close <name>, in the planning session), "
+            "then turn the planner off; done and closed packages stay as history")
+    if problems:
+        raise ValidationError("the planner cannot be turned off: RS cannot tell whether every "
+                              "work package is done or closed, because "
+                              + "; ".join(problems)
+                              + ". Tell the project's agent, or fix it in the project's terminal")
 
 
 def _research_switches_unreadable(why: str) -> str:

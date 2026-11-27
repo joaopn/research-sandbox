@@ -526,6 +526,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         pi_referee_model=args.pi_referee_model, pi_referee_thinking=args.pi_referee_thinking,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
         subagents_switch=args.subagents_switch, checks_switch=args.checks_switch,
+        planner_switch=args.planner_switch,
         status_bar=args.status_bar,
         block_account_links=args.block_account_links,
         **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
@@ -991,6 +992,7 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         pi_referee_model=args.pi_referee_model, pi_referee_thinking=args.pi_referee_thinking,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
         subagents_switch=args.subagents_switch, checks_switch=args.checks_switch,
+        planner_switch=args.planner_switch,
         agents=agents,
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
         reset=args.reset or [],
@@ -3350,6 +3352,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "independent referee): needed for the findings the agent stages "
                         "(staged), staged and run on every result (all), or not needed (off) "
                         "(unset = staged)")
+    c.add_argument("--planner", dest="planner_switch", default="",
+                   choices=("",) + rscore.RESEARCH_SWITCHES["planner"], metavar="on|off",
+                   help="a researcher-subagents project's work split into work packages, each "
+                        "worked on in a session of its own, with a planning session over them "
+                        "(on), or one session at the project's top (off) (unset = off)")
     c.add_argument("--status-bar", dest="status_bar", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="RS's status bar under the prompt of the project container's "
@@ -3490,6 +3497,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="what a researcher-subagents project's new sessions start with: "
                         "finding checks off, staged or all (unset = leave unchanged; on its "
                         "own, with --subagents; running sessions keep theirs)")
+    u.add_argument("--planner", dest="planner_switch", default="",
+                   choices=("",) + rscore.RESEARCH_SWITCHES["planner"], metavar="on|off",
+                   help="a researcher-subagents project's work packages: on, or off (refused "
+                        "while a package is open) (unset = leave unchanged; on its own, with "
+                        "--subagents and --checks)")
     u.add_argument("--pi-model", dest="pi_model", default="", metavar="PROVIDER/MODEL",
                    help="pi's starting model (written into pi's settings)")
     u.add_argument("--pi-thinking", dest="pi_thinking", default="",
