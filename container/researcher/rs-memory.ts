@@ -19,6 +19,12 @@
 //   PI_SESSION_ID in this extension's process, so rs-memory cannot tell the
 //   agent itself): when the last session ended without its consolidation,
 //   open runs it first, as pi, and waits for it.
+// - Every call is given the session's id as PI_SESSION_ID, read from the
+//   handler's context (ctx.sessionManager.getSessionId(), the value pi's bash
+//   tool puts in PI_SESSION_ID for the session's own commands), so `open`
+//   names the switches this session works under (a researcher-subagents
+//   session switched with /skill:rs-mode keeps them after a compaction) and
+//   the end entry names the session. No id: the variable is left out.
 // - At the end of a session it journals the end (`rs-memory close --hook`),
 //   which starts nothing: the next session start, or an explicit
 //   `rs-memory close`, consolidates. The call is made synchronously and
@@ -47,6 +53,26 @@ export function openArgs(): string[] {
 	return ["open", "--hook", "--agent", "pi"];
 }
 
+// The session's id from a handler's context; "" when pi gives none.
+export function sessionIdOf(ctx: any): string {
+	try {
+		const id = ctx?.sessionManager?.getSessionId?.();
+		return typeof id === "string" ? id : "";
+	} catch {
+		return "";
+	}
+}
+
+// The tool's environment: this process's, with PI_SESSION_ID set to the
+// session's id (an inherited one, which would name another session, is
+// dropped), or left out when there is none.
+export function toolEnv(env: Record<string, string | undefined>, sessionId: string): Record<string, string | undefined> {
+	const out: Record<string, string | undefined> = { ...env };
+	delete out.PI_SESSION_ID;
+	if (sessionId) out.PI_SESSION_ID = sessionId;
+	return out;
+}
+
 // The message a run starts with, or undefined when the tool had nothing to say.
 export function frontMessage(output: string): { customType: string; content: string; display: boolean } | undefined {
 	const text = output.trim();
@@ -54,15 +80,16 @@ export function frontMessage(output: string): { customType: string; content: str
 	return { customType: MESSAGE_TYPE, content: text, display: false };
 }
 
-function closeNow(): void {
+function closeNow(sessionId: string): void {
 	try {
-		spawnSync("setsid", closeArgs(), { stdio: "ignore" });
+		spawnSync("setsid", closeArgs(), { stdio: "ignore", env: toolEnv(process.env, sessionId) });
 	} catch { /* never into pi */ }
 }
 
-function openNow(): string {
+function openNow(sessionId: string): string {
 	try {
-		const r = spawnSync(TOOL, openArgs(), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+		const r = spawnSync(TOOL, openArgs(), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+			env: toolEnv(process.env, sessionId) });
 		return r.status === 0 && typeof r.stdout === "string" ? r.stdout : "";
 	} catch {
 		return "";
@@ -73,26 +100,35 @@ export default function (pi: any) {
 	if (inactive(process.env)) return;
 	let pending = false;
 	let inRun = false;
+	// The session's id as last seen, for a handler whose context gives none.
+	let lastId = "";
+	const idOf = (ctx: any): string => {
+		const id = sessionIdOf(ctx);
+		if (id) lastId = id;
+		return id || lastId;
+	};
 	pi.on("agent_start", () => { inRun = true; });
 	pi.on("agent_end", () => { inRun = false; });
-	pi.on("session_start", () => { pending = true; });
-	pi.on("session_compact", (e: any) => {
+	pi.on("session_start", (_e: any, ctx: any) => { idOf(ctx); pending = true; });
+	pi.on("session_compact", (e: any, ctx: any) => {
+		const id = idOf(ctx);
 		if (!inRun && e?.willRetry !== true) { pending = true; return; }
 		pending = false;
 		try {
-			const message = frontMessage(openNow());
+			const message = frontMessage(openNow(id));
 			if (message) pi.sendMessage(message, { deliverAs: "steer" });
 		} catch { /* never into pi */ }
 	});
-	pi.on("before_agent_start", () => {
+	pi.on("before_agent_start", (_e: any, ctx: any) => {
+		const id = idOf(ctx);
 		if (!pending) return undefined;
 		pending = false;
 		try {
-			const message = frontMessage(openNow());
+			const message = frontMessage(openNow(id));
 			return message ? { message } : undefined;
 		} catch {
 			return undefined;
 		}
 	});
-	pi.on("session_shutdown", () => closeNow());
+	pi.on("session_shutdown", (_e: any, ctx: any) => closeNow(idOf(ctx)));
 }

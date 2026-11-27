@@ -24,6 +24,8 @@ Everything lives under /workspace/memory/ (RS_MEMORY_DIR overrides it):
                                 project only: a re-run (rerun/, rerun.md) or a
                                 referee run (snapshot/, verdict.md); never
                                 deleted, the audit trail
+  sessions/<id>.json            a session's own switches (`switch`), in a
+                                researcher-subagents project
   jobs/job-<n>.md               a long run the agent left going (its pid, its
                                 command line, its log); marked done, never
                                 deleted
@@ -65,6 +67,10 @@ Verbs:
                                 correct a staged claim in place
   rerun-command ID (--rerun CMD | --no-rerun REASON)
   rerun ID  /  referee ID [--agent claude|pi]
+  check ID... [--agent claude|pi]  both checks of several findings, in parallel
+  switch [--subagents on|off] [--checks off|staged|all]
+                                this session's switches: shown, or switched for
+                                this session only
   accept ID... [--over-objection]  /  strike ID... --reason R
   view [ID | --topic T]         the state of knowledge, computed at every call
   recall WORD... [--body]       the journal, the claims and the logbook
@@ -84,8 +90,9 @@ rewritten; its agent is stopped after CONSOLIDATION_LIMIT_S seconds.
 `close --hook` (the session's end hook) only journals the end, fast; the
 next `open` then consolidates first, when the journal has a session's end
 after the last consolidation, and its text says how that went. `rerun` and
-`referee` wait for their check and print its result. Each run stays in its
-caller's process group and the kernel stops it when its caller ends; a
+`referee` wait for their check and print its result; `check` starts the
+checks of several findings side by side and waits for them all. Each run
+stays in its caller's process group and the kernel stops it when its caller ends; a
 caller stopped with SIGTERM, SIGINT or SIGHUP stops its run first. What a
 run starts (the re-run's command, an agent) runs under a keeper that leads
 a process group of its own and takes that whole group down when its run
@@ -97,6 +104,19 @@ The checks (--rerun, rerun-command, rerun, referee, --over-objection and
 accept's conditions on a finding) exist only in a project whose record,
 /workspace/.orchestrator/project.json, says "subagents": true; anywhere else
 every verb behaves as it always has.
+
+Such a project has two switches, what a new session starts with: the
+record's "research_switches" object, {"subagents": "on"|"off", "checks":
+"off"|"staged"|"all"} (a record without it, or without a key, reads as
+subagents on, checks staged). `switch` records a running session's own
+switches, keyed by its id (CLAUDE_CODE_SESSION_ID, PI_SESSION_ID); they win
+over the record in that session only. The checks switch decides accept: with
+"staged" or "all" a finding needs both checks, as always; with "off" it can
+be accepted without them (a finding needs no --rerun either), and its record
+entry names what it lacked (`unchecked`), its pages say "not checked", as do
+the pages of a finding staged with the checks off (`checks: off`) until a
+check runs on it. The checks' verbs work whatever the switch. "all" differs
+from "staged" only in the instructions. `open` says which switches hold.
 
 A project whose record says "companion": true keeps a companion's memory:
 front.md's parts are "Standing preferences" (P-<n>, kept by the consolidation
@@ -173,6 +193,25 @@ CHECKS_KEY = "subagents"
 # and beliefs, and claims only when the PI asks for one. Never set together
 # with CHECKS_KEY.
 COMPANION_KEY = "companion"
+# A researcher-subagents project's two switches, what a NEW session starts
+# with: one object in the record, {"subagents": "on"|"off", "checks":
+# "off"|"staged"|"all"}. A record without it (every project made before the
+# switches) reads as SWITCH_DEFAULTS, today's behaviour; a key missing from it
+# reads as its default too. MIRROR of rscore.RESEARCH_SWITCHES_KEY,
+# RESEARCH_SWITCHES and RESEARCH_SWITCH_DEFAULTS (the host writes what this
+# command reads). Inside rs-memory "staged" and "all" behave alike (a finding
+# needs both checks before it is accepted); "all" differs only in the
+# instructions (every result is staged and checked).
+SWITCHES_KEY = "research_switches"
+SWITCHES = {"subagents": ("on", "off"), "checks": ("off", "staged", "all")}
+SWITCH_DEFAULTS = {"subagents": "on", "checks": "staged"}
+# A running session's own switches (`switch`, which /rs-mode runs): one file
+# per session under the memory folder, sessions/<id>.json, named by the
+# session's id. The id is Claude Code's CLAUDE_CODE_SESSION_ID or pi's
+# PI_SESSION_ID, which each sets in every command its session runs; it becomes
+# a file name only once its characters are checked.
+SESSIONS_DIR = "sessions"
+SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 # What a fresh process drops from the session's environment, as the
 # consolidation run does: the child is no part of the agent's session.
 SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "PI_SESSION_ID", "PI_SESSION_FILE")
@@ -364,9 +403,125 @@ def refuse_both_kinds() -> None:
     companion_on()
 
 
-def checks_on() -> bool:
+def checks_kit() -> bool:
+    """Whether this project has the finding checks at all (a researcher-
+    subagents project): their verbs and options work there whatever the
+    session's checks switch, so a check the PI asks for can always run."""
     companion_on()                      # refuses a record that sets both
     return project_record().get(CHECKS_KEY) is True
+
+
+def checks_on() -> bool:
+    """Whether a finding needs both its checks before the PI can accept it in
+    THIS session: a researcher-subagents project whose session's checks switch
+    is not off (the session's own, else the record's, else the default)."""
+    return checks_kit() and session_switches()["checks"][0] != "off"
+
+
+def checked_switches(raw: object, where: str) -> "dict[str, str]":
+    """A switches object as written in the record or a session's file: an
+    object whose keys are switches and whose values are among each switch's
+    values. Anything else is refused, never read as a default."""
+    if not isinstance(raw, dict):
+        raise Refused(f"{where} holds the subagents and checks switches as something other "
+                      "than an object, so rs-memory cannot tell how this session works; "
+                      "tell the PI")
+    for k, v in raw.items():
+        if k not in SWITCHES:
+            raise Refused(f"{where} holds a switch rs-memory does not know ({single_line(k)!r}; "
+                          f"it knows {', '.join(SWITCHES)}); tell the PI")
+        if v not in SWITCHES[k]:
+            raise Refused(f"{where} sets the {k} switch to {v!r}, which is not one of "
+                          f"{', '.join(SWITCHES[k])}; tell the PI")
+    return dict(raw)
+
+
+def record_switches() -> "dict[str, str]":
+    """The switches the project's record sets ({} when it sets none)."""
+    rec = project_record()
+    if SWITCHES_KEY not in rec:
+        return {}
+    return checked_switches(rec[SWITCHES_KEY], f"the project's record {record_path()}")
+
+
+def session_id() -> "str | None":
+    """The session this command runs in: Claude Code's CLAUDE_CODE_SESSION_ID
+    or pi's PI_SESSION_ID; None outside a session (a terminal, a start hook
+    that is not given the id). Both set: the agent detect_agent names."""
+    claude = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    pi = os.environ.get("PI_SESSION_ID") or ""
+    sid = claude or pi
+    if claude and pi:
+        agent = detect_agent(quiet=True)
+        if agent is None:
+            raise Refused("both a Claude session (CLAUDE_CODE_SESSION_ID) and a pi session "
+                          "(PI_SESSION_ID) are in this shell's environment, so rs-memory "
+                          "cannot tell which session's switches apply")
+        sid = claude if agent == "claude" else pi
+    if not sid:
+        return None
+    if not SESSION_ID_RE.match(sid):
+        raise Refused("this session's id holds characters rs-memory does not use in a file "
+                      "name (only letters, digits, '.', '_' and '-'), so it cannot tell this "
+                      "session's switches; tell the PI")
+    return sid
+
+
+def session_file(sid: str) -> Path:
+    return mem_dir() / SESSIONS_DIR / f"{sid}.json"
+
+
+def session_record(sid: str) -> "dict[str, str]":
+    """The switches a session recorded for itself ({} when it recorded none)."""
+    p = session_file(sid)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise Refused(f"this session's switches {p} cannot be read ({e}); tell the PI")
+    try:
+        raw = json.loads(text)
+    except (ValueError, RecursionError):
+        raise Refused(f"this session's switches {p} are not JSON; tell the PI")
+    return checked_switches(raw, f"this session's switches {p}")
+
+
+def session_switches() -> "dict[str, tuple[str, str]]":
+    """Each switch as this session works under it, and where that comes from:
+    "session" (switched for this session), "project" (the project's record)
+    or "default" (a record that does not set it: today's behaviour)."""
+    rec = record_switches()
+    sid = session_id()
+    mine = session_record(sid) if sid else {}
+    out = {}
+    for k in SWITCHES:
+        if k in mine:
+            out[k] = (mine[k], "session")
+        elif k in rec:
+            out[k] = (rec[k], "project")
+        else:
+            out[k] = (SWITCH_DEFAULTS[k], "default")
+    return out
+
+
+def switches_held(sw: "dict[str, tuple[str, str]]") -> str:
+    """" For a switch switched for this session, …" (with a leading space)
+    when any switch comes from the session, "" otherwise: where the text the
+    session now works under is (open and switch print it)."""
+    if all(src != "session" for _v, src in sw.values()):
+        return ""
+    return (" For a switch switched for this session, the rs-mode skill's text for its value "
+            "holds over your instructions' text for it (its SKILL.md, in ~/.claude/skills/"
+            "harness/ under Claude Code and in skills/harness/ of pi's agent folder).")
+
+
+def switch_words(sw: "dict[str, tuple[str, str]]") -> str:
+    """The switches in plain words: "subagents on (the project's setting),
+    checks off (switched for this session)"."""
+    return ", ".join(f"{k} {v} ("
+                     + ("switched for this session" if src == "session" else "the project's setting")
+                     + ")" for k, (v, src) in sw.items())
 
 
 def front_parts() -> tuple:
@@ -390,7 +545,7 @@ def item_line_re(parts: tuple) -> "re.Pattern":
 
 
 def require_checks(what: str) -> None:
-    if not checks_on():
+    if not checks_kit():
         raise Refused(f"{what} is for researcher-subagents projects only: this project's "
                       f"record ({record_path()}) does not say \"{CHECKS_KEY}\": true")
 
@@ -580,18 +735,28 @@ def stop_group(child: subprocess.Popen) -> None:
 def wait_tethered(child: subprocess.Popen) -> int:
     """Wait for a run start_tethered started. A caller told to stop (SIGTERM,
     SIGINT, SIGHUP) stops the run, waits for it to go, and exits non-zero."""
+    return wait_all_tethered([child])[0]
+
+
+def wait_all_tethered(children: "list[subprocess.Popen]") -> "list[int]":
+    """Wait for every run start_tethered started (they run side by side), and
+    return their exit codes. A caller told to stop (SIGTERM, SIGINT, SIGHUP)
+    stops every run, waits for them all to go, and exits non-zero."""
     sigs = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
     def stop(signum, _frame):
         raise _Stopped(signum)
     old = {s: signal.signal(s, stop) for s in sigs}
     try:
-        return child.wait()
+        return [child.wait() for child in children]
     except _Stopped as e:
         for s in sigs:
             signal.signal(s, signal.SIG_IGN)
-        child.terminate()
-        child.wait()
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+        for child in children:
+            child.wait()
         sys.exit(128 + e.args[0])
     finally:
         for s, h in old.items():
@@ -966,7 +1131,10 @@ def check_title(title: "str | None") -> str:
 
 def write_claim(prefix: str, title: str, statement: str, scope: str, hedge: str,
                 evidence: "list[tuple[str, str]]", relations: "dict[str, list[str]]",
-                topics: "list[str]", rerun: "tuple[str, str] | None" = None) -> str:
+                topics: "list[str]", rerun: "tuple[str, str] | None" = None,
+                unchecked: bool = False) -> str:
+    """`unchecked`: a finding staged in a session whose checks are off, which
+    its pages then say until a check is run on it."""
     ident = next_claim_id(prefix)
     fields = [("kind", CLAIM_KINDS[prefix]), ("title", title),
               ("scope", scope), ("hedge", hedge or "(none stated)"),
@@ -975,6 +1143,8 @@ def write_claim(prefix: str, title: str, statement: str, scope: str, hedge: str,
         fields.append(("evidence", f"{path} sha256={digest}"))
     if rerun:
         fields.append(rerun)
+    if unchecked:
+        fields.append(("checks", "off"))
     for rel in RELATIONS:
         for i in relations.get(rel, []):
             fields.append((rel, i))
@@ -1023,16 +1193,22 @@ def cmd_claim(a) -> None:
         raise Refused("a finding here needs --rerun CMD, the command that reproduces it "
                       "(it writes its outputs into the folder $RS_RERUN_OUT), or "
                       "--no-rerun REASON, why it cannot be re-run")
+    # A finding staged with this session's checks off: its pages say it was
+    # not checked (until a check runs on it).
+    unchecked = prefix == "F" and checks_kit() and not checks_on()
     with Lock():
         known = set(claim_files())
         ev = validate_claim(a.statement, a.scope or "", a.evidence or [], rels, prefix, known)
         ident = write_claim(prefix, title, a.statement, a.scope or "", a.hedge or "", ev,
                             rels, [single_line(t) for t in (a.topic or []) if t.strip()],
-                            rerun)
+                            rerun, unchecked)
         refresh_pages()
     print(f"{ident} staged. It enters the record when the PI accepts it "
           f"(they say \"accept {ident}\", you run rs-memory accept {ident}).")
-    if rerun:
+    if unchecked:
+        print(f"The checks are off in this session, so the PI can accept it without them; "
+              f"rs-memory check {ident} runs them when the PI asks for them.")
+    elif rerun:
         print(f"Before the PI can accept it, it needs its checks: "
               + (f"rs-memory rerun {ident} (the re-run) and " if rerun[0] == "rerun" else "")
               + f"rs-memory referee {ident} (the referee's verdict).")
@@ -1040,7 +1216,7 @@ def cmd_claim(a) -> None:
 
 # The fields a staged claim carries, in the order write_claim writes them.
 CLAIM_FIELDS = ("kind", "title", "scope", "hedge", "staged", "session", "amended", "evidence",
-                "rerun", "no-rerun") + RELATIONS + ("topic",)
+                "rerun", "no-rerun", "checks") + RELATIONS + ("topic",)
 
 
 def cmd_amend(a) -> None:
@@ -1100,7 +1276,8 @@ def cmd_amend(a) -> None:
         new = {"kind": meta.get("kind", []), "title": title, "scope": [scope],
                "hedge": [hedge if single_line(hedge) else "(none stated)"],
                "staged": meta.get("staged", []), "session": meta.get("session", []),
-               "amended": [stamp], "evidence": ev_lines, "topic": topics, **rels}
+               "amended": [stamp], "evidence": ev_lines, "topic": topics,
+               "checks": meta.get("checks", []), **rels}
         if rerun:
             new["rerun" if rerun[0] == "rerun" else "no-rerun"] = [rerun[1]]
         else:
@@ -1147,8 +1324,11 @@ def _evidence_changed(meta: dict) -> "str | None":
 def cmd_accept(a) -> None:
     refuse_under_guard("accept claims (only the PI does)")
     a.ids = list(dict.fromkeys(a.ids))
+    # The checks' conditions apply in a project that has them (`kit`); this
+    # session's checks switch decides whether both must be there (`checks`).
+    kit = checks_kit()
     checks = checks_on()
-    if a.over_objection and not checks:
+    if a.over_objection and not kit:
         require_checks("--over-objection")
     with Lock():
         files = claim_files()
@@ -1165,9 +1345,10 @@ def cmd_accept(a) -> None:
                               "check the finding still holds and correct it with "
                               f"rs-memory amend {ident} --evidence <file> …, which hashes "
                               "the evidence again")
-            # A finding's two checks, in a project that has them.
-            extra = accept_checks(ident, meta, a.over_objection) \
-                if checks and ident.startswith("F-") else None
+            # A finding's two checks, in a project that has them: required
+            # unless this session's checks are off.
+            extra = accept_checks(ident, meta, a.over_objection, required=checks) \
+                if kit and ident.startswith("F-") else None
             metas.append((ident, path, extra))
         # The front page's facts section follows the record: when this accept
         # changes it (a fact accepted, withdrawn or superseded), the page is
@@ -1182,7 +1363,7 @@ def cmd_accept(a) -> None:
         # accept before anything moves.
         freeze_all_evidence([(ident, parse_entry(path)) for ident, path, _e in metas])
         stamp = now()
-        objected = []
+        objected, unchecked = [], []
         for ident, path, extra in metas:
             dest = mem_dir() / "record" / f"{ident}.md"
             os.replace(path, dest)                      # a move: the staged file IS the record
@@ -1199,16 +1380,24 @@ def cmd_accept(a) -> None:
             write_text(dest, head + "\n" + (f"\n{body}\n" if body else ""), mode=0o444)
             if objection.strip():
                 objected.append(ident)
+            if any(k == "unchecked" for k, _v in fields):
+                unchecked.append(ident)
         if front is not None:
             # The same page number: only the computed section moved, and a
             # consolidation built from this page still applies.
             write_text(mem_dir() / "front.md", render_front(front))
+        body = [("over the referee's objection: " + " ".join(objected)) if objected else "",
+                ("without all its checks (the checks were off): " + " ".join(unchecked))
+                if unchecked else ""]
         j = add_journal("accepted " + " ".join(i for i, _p, _e in metas), "accept",
-                        ("over the referee's objection: " + " ".join(objected)) if objected else "")
+                        "\n".join(b for b in body if b))
         refresh_pages()
     print(f"Accepted into the record: {' '.join(i for i, _p, _e in metas)} ({j}).")
     if objected:
         print(f"Accepted over the referee's objection, which stays on the entry: {' '.join(objected)}.")
+    if unchecked:
+        print(f"Accepted without all its checks, since the checks are off in this session; its "
+              f"record entry and its pages say it was not checked: {' '.join(unchecked)}.")
 
 
 def cmd_strike(a) -> None:
@@ -1226,6 +1415,40 @@ def cmd_strike(a) -> None:
         j = add_journal("struck " + " ".join(a.ids), "strike", a.reason)
         refresh_pages()
     print(f"Struck: {' '.join(a.ids)} ({j}).")
+
+
+def cmd_switch(a) -> None:
+    """This session's switches: shown (no option), or recorded for this
+    session only (the options named), under the lock. New sessions start with
+    the project's record, which only RS writes."""
+    require_checks("switch")
+    if a.subagents is None and a.checks is None:
+        sw = session_switches()
+        note = ("" if session_id() else " This shell runs in no agent session (neither "
+                "CLAUDE_CODE_SESSION_ID nor PI_SESSION_ID is set), so these are the "
+                "project's settings.")
+        print(f"This session works with {switch_words(sw)}.{note}{switches_held(sw)}")
+        return
+    refuse_under_guard("switch a session's subagents or checks")
+    sid = session_id()
+    if sid is None:
+        raise Refused("rs-memory cannot tell which session to switch: neither "
+                      "CLAUDE_CODE_SESSION_ID (Claude Code) nor PI_SESSION_ID (pi) is set in "
+                      "this shell. Run it from the agent's session, as /rs-mode does")
+    record_switches()                   # a record it cannot read refuses before any write
+    with Lock():
+        mine = session_record(sid)
+        for k in SWITCHES:
+            v = getattr(a, k)
+            if v is not None:
+                mine[k] = v
+        try:
+            write_text(session_file(sid), json.dumps(mine, sort_keys=True) + "\n")
+        except OSError as e:
+            raise Refused(f"this session's switches could not be written to "
+                          f"{session_file(sid)} ({e.strerror or e}); tell the PI")
+    print(f"This session now works with {switch_words(session_switches())}. The switch "
+          "lasts for this session only; new sessions start with the project's settings.")
 
 
 # -------------------------------------------------------------------- checks
@@ -1470,9 +1693,13 @@ def check_lines(ident: str, meta: dict, indent: str) -> "list[str]":
     return out
 
 
-def accept_checks(ident: str, meta: dict, over: bool) -> "tuple[list, str]":
-    """Refuse a finding whose checks are missing or object (without the PI's
-    --over-objection); else the fields and body its record entry gets."""
+def accept_checks(ident: str, meta: dict, over: bool,
+                  required: bool = True) -> "tuple[list, str]":
+    """Refuse a finding whose checks are missing (when they are `required`:
+    the session's checks are not off) or object (without the PI's
+    --over-objection); else the fields and body its record entry gets. A
+    finding accepted without a check it lacks records which ones, in its
+    `unchecked` field."""
     fc = finding_checks(ident, meta)
     missing = []
     if not fc["cur_verdicts"]:
@@ -1483,7 +1710,7 @@ def accept_checks(ident: str, meta: dict, over: bool) -> "tuple[list, str]":
                        + (f"(run rs-memory rerun {ident})" if fc["command"] else
                           f"(give one with rs-memory rerun-command {ident} --rerun CMD "
                           "or --no-rerun REASON)"))
-    if missing:
+    if missing and required:
         raise Refused(f"{ident} cannot be accepted yet: " + "; ".join(missing))
     objections = [c for c in fc["cur_verdicts"] if one(c["rec"], "verdict") in OBJECTIONS]
     if objections and not over:
@@ -1496,6 +1723,10 @@ def accept_checks(ident: str, meta: dict, over: bool) -> "tuple[list, str]":
     if fc["cur_rerun"]:
         c = fc["cur_rerun"][-1]
         fields.append(("rerun-check", rerun_summary(c) + f" [{c['dir'] / 'rerun.md'}]"))
+    halves = ([UNCHECKED_RERUN] if not fc["cur_rerun"] and not fc["reason"] else []) \
+        + ([UNCHECKED_REFEREE] if not fc["cur_verdicts"] else [])
+    if halves and not required:
+        fields.append(("unchecked", " and ".join(halves) + " (accepted with the checks off)"))
     body = []
     for c in objections:
         fields.append(("objection", f"check {c['n']}: {one(c['rec'], 'verdict')}"))
@@ -1504,6 +1735,11 @@ def accept_checks(ident: str, meta: dict, over: bool) -> "tuple[list, str]":
         body.append(c["rec"]["body"].strip())       # the narrower claim and the findings
         body.append("")
     return fields, "\n".join(body)
+
+
+# The halves an accepted finding's `unchecked` field names.
+UNCHECKED_RERUN = "the re-run"
+UNCHECKED_REFEREE = "the referee"
 
 
 # ------------------------------------------------------------ checks: verbs
@@ -1533,18 +1769,29 @@ def cmd_rerun(a) -> None:
     with Lock():
         _path, meta = staged_finding(a.id)
         refuse_changed(a.id, meta)
-        cmd = one(meta, "rerun")
-        if not cmd:
-            raise Refused(f"{a.id} has no re-run command; give one with "
-                          f"rs-memory rerun-command {a.id} --rerun CMD")
-        n, d = new_check(a.id, "rerun", [("command", cmd)] + binding_fields(meta))
-        (d / "rerun").mkdir()
+        n, d = new_rerun(a.id, meta)
         log, child = start_check(a.id, n, d, "rerun", "rerun.log")
         refresh_pages()
-    print(f"Re-run of {a.id} started (check {n}), writing into {d / 'rerun'}; "
-          f"its log is {log}. Waiting for it to end.", flush=True)
+    print(rerun_started(a.id, n, d, log), flush=True)
     wait_tethered(child)
     print(f"Re-run of {a.id}: {check_result(a.id, n)}")
+
+
+def new_rerun(ident: str, meta: dict) -> "tuple[int, Path]":
+    """A re-run's check folder, ready to start; the caller holds the lock and
+    has refused changed evidence."""
+    cmd = one(meta, "rerun")
+    if not cmd:
+        raise Refused(f"{ident} has no re-run command; give one with "
+                      f"rs-memory rerun-command {ident} --rerun CMD")
+    n, d = new_check(ident, "rerun", [("command", cmd)] + binding_fields(meta))
+    (d / "rerun").mkdir()
+    return n, d
+
+
+def rerun_started(ident: str, n: int, d: Path, log: Path) -> str:
+    return (f"Re-run of {ident} started (check {n}), writing into {d / 'rerun'}; "
+            f"its log is {log}. Waiting for it to end.")
 
 
 def run_rerun(ident: str, n: int) -> int:
@@ -1665,56 +1912,119 @@ def claim_text(ident: str, meta: dict, names: "list[str]") -> str:
     return "\n".join(out) + "\n"
 
 
+def referee_instruction() -> str:
+    try:
+        return REFEREE_FILE.read_text(encoding="utf-8")
+    except OSError as e:
+        raise Refused(f"the referee's instruction {REFEREE_FILE} cannot be read ({e.strerror}); "
+                      "this project's image predates the referee: tell the PI")
+
+
 def cmd_referee(a) -> None:
     refuse_under_guard("start a referee run")
     require_checks("referee")
     agent = a.agent or detect_agent()
     model_flags = referee_model(agent)
-    try:
-        instruction = REFEREE_FILE.read_text(encoding="utf-8")
-    except OSError as e:
-        raise Refused(f"the referee's instruction {REFEREE_FILE} cannot be read ({e.strerror}); "
-                      "this project's image predates the referee: tell the PI")
+    instruction = referee_instruction()
     with Lock():
         _path, meta = staged_finding(a.id)
         refuse_changed(a.id, meta)
-        fc = finding_checks(a.id, meta)
-        rerun = fc["reruns"][-1] if fc["reruns"] and fc["reruns"][-1]["state"] == "done" else None
-        accepted = accepted_record_text()
-        n, d = new_check(a.id, "referee", [("agent", agent), ("model-flags", json.dumps(model_flags))]
-                         + binding_fields(meta)
-                         + [("accepted-sha256", sha256_text(accepted)),
-                            ("rerun-check", str(rerun["n"]) if rerun else "none")])
-        snap = d / "snapshot"
-        (snap / "evidence").mkdir(parents=True)
-        names = [f"evidence/{i}-{Path(p).name}" for i, (p, _d) in
-                 enumerate(staged_evidence(meta), 1)]
-        manifest = {}
-        for (path, digest), name in zip(staged_evidence(meta), names):
-            got = copy_hashed(path, snap / name)
-            if got != digest:
-                write_verdict(a.id, n, None, f"its evidence {path} changed while the snapshot "
-                              "was taken", {}, "")
-                raise Refused(f"{a.id}: its evidence {path} changed while its snapshot was "
-                              "taken; check the finding still holds, correct it with "
-                              f"rs-memory amend {a.id} --evidence <file> …, then start its "
-                              "checks again")
-            manifest[name] = got
-        texts = {"claim.md": claim_text(a.id, meta, names), "accepted.md": accepted,
-                 "REFEREE.md": instruction.replace("{folder}", str(snap))}
-        if rerun:
-            texts["rerun.md"] = (rerun["dir"] / "rerun.md").read_text(encoding="utf-8")
-        for name, text in texts.items():
-            write_text(snap / name, text, mode=0o444)
-            manifest[name] = sha256_text(text)
-        write_text(snap / "MANIFEST.sha256",
-                   "".join(f"{h}  {name}\n" for name, h in sorted(manifest.items())), mode=0o444)
+        n, d = new_referee(a.id, meta, agent, model_flags, instruction)
         log, child = start_check(a.id, n, d, "referee", "referee.log")
         refresh_pages()
-    print(f"Referee of {a.id} started (check {n}, {agent} {' '.join(model_flags)}), "
-          f"reading only {snap}; its log is {log}. Waiting for its verdict.", flush=True)
+    print(referee_started(a.id, n, d, log, agent, model_flags), flush=True)
     wait_tethered(child)
     print(f"Referee of {a.id}: {check_result(a.id, n)}")
+
+
+def new_referee(ident: str, meta: dict, agent: str, model_flags: "list[str]",
+                instruction: str) -> "tuple[int, Path]":
+    """A referee's check folder with its snapshot, ready to start; the caller
+    holds the lock and has refused changed evidence."""
+    fc = finding_checks(ident, meta)
+    rerun = fc["reruns"][-1] if fc["reruns"] and fc["reruns"][-1]["state"] == "done" else None
+    accepted = accepted_record_text()
+    n, d = new_check(ident, "referee", [("agent", agent), ("model-flags", json.dumps(model_flags))]
+                     + binding_fields(meta)
+                     + [("accepted-sha256", sha256_text(accepted)),
+                        ("rerun-check", str(rerun["n"]) if rerun else "none")])
+    snap = d / "snapshot"
+    (snap / "evidence").mkdir(parents=True)
+    names = [f"evidence/{i}-{Path(p).name}" for i, (p, _d) in
+             enumerate(staged_evidence(meta), 1)]
+    manifest = {}
+    for (path, digest), name in zip(staged_evidence(meta), names):
+        got = copy_hashed(path, snap / name)
+        if got != digest:
+            write_verdict(ident, n, None, f"its evidence {path} changed while the snapshot "
+                          "was taken", {}, "")
+            raise Refused(f"{ident}: its evidence {path} changed while its snapshot was "
+                          "taken; check the finding still holds, correct it with "
+                          f"rs-memory amend {ident} --evidence <file> …, then start its "
+                          "checks again")
+        manifest[name] = got
+    texts = {"claim.md": claim_text(ident, meta, names), "accepted.md": accepted,
+             "REFEREE.md": instruction.replace("{folder}", str(snap))}
+    if rerun:
+        texts["rerun.md"] = (rerun["dir"] / "rerun.md").read_text(encoding="utf-8")
+    for name, text in texts.items():
+        write_text(snap / name, text, mode=0o444)
+        manifest[name] = sha256_text(text)
+    write_text(snap / "MANIFEST.sha256",
+               "".join(f"{h}  {name}\n" for name, h in sorted(manifest.items())), mode=0o444)
+    return n, d
+
+
+def referee_started(ident: str, n: int, d: Path, log: Path, agent: str,
+                    model_flags: "list[str]") -> str:
+    return (f"Referee of {ident} started (check {n}, {agent} {' '.join(model_flags)}), "
+            f"reading only {d / 'snapshot'}; its log is {log}. Waiting for its verdict.")
+
+
+def cmd_check(a) -> None:
+    """Both checks of several staged findings at once: every re-run and every
+    referee started together, each tied to this call like rerun's and
+    referee's, then waited for until all have ended, and each result printed
+    in their words. One call instead of one per check, which matters where a
+    call waits (pi). A finding with a reason it cannot be re-run gets its
+    referee only. Everything is checked before anything starts."""
+    refuse_under_guard("start checks")
+    require_checks("check")
+    ids = list(dict.fromkeys(a.ids))
+    agent = a.agent or detect_agent()
+    model_flags = referee_model(agent)
+    instruction = referee_instruction()
+    runs: "list[tuple[str, str, int, Path]]" = []
+    started: "list[tuple[str, str, int, Path, Path, subprocess.Popen]]" = []
+    with Lock():
+        metas = []
+        for ident in ids:
+            _path, meta = staged_finding(ident)
+            refuse_changed(ident, meta)
+            if not one(meta, "rerun") and not one(meta, "no-rerun"):
+                raise Refused(f"{ident} has no re-run command and no reason it cannot be "
+                              f"re-run; give one with rs-memory rerun-command {ident} --rerun CMD "
+                              "(or --no-rerun REASON), then check again; nothing was started")
+            metas.append((ident, meta))
+        for ident, meta in metas:
+            if one(meta, "rerun"):
+                runs.append((ident, "rerun", *new_rerun(ident, meta)))
+            runs.append((ident, "referee", *new_referee(ident, meta, agent, model_flags,
+                                                        instruction)))
+        for ident, kind, n, d in runs:
+            log, child = start_check(ident, n, d, kind, f"{kind}.log")
+            started.append((ident, kind, n, d, log, child))
+        refresh_pages()
+    for ident, meta in metas:
+        if not one(meta, "rerun"):
+            print(f"Re-run of {ident}: none: {one(meta, 'no-rerun')} (no re-run started)")
+    for ident, kind, n, d, log, _child in started:
+        print(rerun_started(ident, n, d, log) if kind == "rerun"
+              else referee_started(ident, n, d, log, agent, model_flags), flush=True)
+    wait_all_tethered([c for *_x, c in started])
+    for ident, kind, n, _d, _log, _child in started:
+        print(f"{'Re-run' if kind == 'rerun' else 'Referee'} of {ident}: "
+              f"{check_result(ident, n)}")
 
 
 def parse_claude_output(text: str) -> dict:
@@ -1960,11 +2270,11 @@ def cmd_view(a) -> None:
             for rel in RELATIONS:
                 if a.id in oe.get(rel, []):
                     print(f"{o} {rel} it: {oe['headline']} ({st[o]})")
-        if where == "staged" and a.id.startswith("F-") and checks_on():
+        if where == "staged" and a.id.startswith("F-") and checks_kit():
             print("\n".join(check_lines(a.id, e, "")))
         return
     print(knowledge_text(a.topic))
-    if checks_on():
+    if checks_kit():
         print("\n" + staged_text(True, a.topic))
 
 
@@ -2375,7 +2685,9 @@ class PageContext:
         self.rec = record_entries()
         self.st = standing(self.rec)
         self.staged = {i: parse_entry(p) for i, (w, p) in self.files.items() if w == "staged"}
-        self.checks = checks_on()
+        # The pages are the project's, whichever session writes them: they
+        # show a finding's checks wherever the project has them.
+        self.checks = checks_kit()
         self.companion = companion_on()
         # Who points at whom, for "superseded by" and the like.
         self.by: "dict[tuple[str, str], list[str]]" = {}
@@ -2389,7 +2701,12 @@ class PageContext:
         """A staged finding's checks in plain words, worked out once per
         refresh (it hashes the evidence)."""
         if ident not in self._checks:
-            self._checks[ident] = staged_check_words(finding_checks(ident, self.staged[ident]))
+            e = self.staged[ident]
+            fc = finding_checks(ident, e)
+            if one(e, "checks") == "off" and not (fc["reruns"] or fc["refs"]):
+                self._checks[ident] = (UNCHECKED_STAGED_WORDS, [])
+            else:
+                self._checks[ident] = staged_check_words(fc)
         return self._checks[ident]
 
     def page_of(self, ident: str) -> "Path | None":
@@ -2426,6 +2743,10 @@ class PageContext:
             last = m.end()
         out.append(md_escape(text[last:]))
         return md_lead("".join(out))
+
+
+# A staged finding staged with the checks off and never checked since.
+UNCHECKED_STAGED_WORDS = "not checked (staged with the checks off)"
 
 
 def rerun_words(rec: dict) -> str:
@@ -2500,22 +2821,47 @@ def record_check(e: dict, key: str) -> "dict | None":
 def accepted_check_words(e: dict) -> "tuple[str | None, dict | None]":
     """An accepted finding's checks in plain words (None when it has none),
     and the verdict it was accepted over, when it was."""
-    if not (e.get("referee") or e.get("rerun-check") or e.get("no-rerun")):
+    if not (e.get("referee") or e.get("rerun-check") or e.get("no-rerun") or e.get("unchecked")):
         return None, None
+    missing = unchecked_halves(e)
+    if len(missing) == 2:
+        return "not checked (accepted with the checks off)", None
     rr = record_check(e, "rerun-check")
     if rr is not None:
         r = rerun_words(rr)
     elif one(e, "no-rerun"):
         r = f"not possible: {one(e, 'no-rerun')}"
+    elif UNCHECKED_RERUN in missing:
+        r = "not checked"
     else:
         r = "on record" if e.get("rerun-check") else "none"
     verdict = record_check(e, "referee")
     if verdict is not None:
         v = one(verdict, "verdict")
+    elif UNCHECKED_REFEREE in missing:
+        v = "not checked"
     else:
         m = re.match(r"\Acheck \d+: (\w+)", one(e, "referee"))
         v = m.group(1) if m else "on record"
     return f"re-run: {r} · referee: {v}", verdict if e.get("objection") else None
+
+
+def unchecked_halves(e: dict) -> "list[str]":
+    """The checks an accepted finding was accepted without (its `unchecked`
+    field, written when the session's checks were off)."""
+    v = one(e, "unchecked")
+    return [h for h in (UNCHECKED_RERUN, UNCHECKED_REFEREE) if h in v]
+
+
+def unchecked_words(e: dict) -> str:
+    """" · not checked" (or which check it lacks) for an accepted finding
+    accepted without its checks; "" otherwise."""
+    missing = unchecked_halves(e)
+    if len(missing) == 2:
+        return " · not checked"
+    if missing:
+        return f" · {missing[0]} not checked"
+    return ""
 
 
 def standing_line(page: Path, ident: str, ctx: PageContext) -> str:
@@ -2662,6 +3008,7 @@ def entry_line(page: Path, e: dict, ctx: PageContext, with_standing: bool) -> st
     out = f"- {rel_link(page, result_page(ident), f'{ident} · {entry_title(e)}')} — {KIND_WORDS[ident[0]]}"
     if one(e, "scope"):
         out += f"; applies to {md(one(e, 'scope'))}"
+    out += unchecked_words(e)
     if with_standing:
         out += f" — {standing_line(page, ident, ctx)}"
     else:
@@ -2937,12 +3284,16 @@ def open_text(consolidation: "str | None" = None) -> str:
     # The jobs come right after the front page, whose last but one part is
     # In flight: what is still running is read before the rest.
     jobs_part = jobs_section()
+    switches = switches_open_line()
     if not (d / "front.md").exists() and not journal_files():
         return ("# rs-memory\nNo memory yet in this project. Write your first journal entry "
                 "with rs-memory note, and the in-flight work with rs-memory checkpoint.\n"
+                + (f"\n{switches}\n" if switches else "")
                 + (f"\n{jobs_part}\n" if jobs_part else ""))
     front = read_front()
     parts = [consolidation] if consolidation else []
+    if switches:
+        parts.append(switches)
     parts.append((d / "front.md").read_text(encoding="utf-8").rstrip()
                  if (d / "front.md").exists() else "# Front page\n(not written yet)")
     if jobs_part:
@@ -2953,7 +3304,7 @@ def open_text(consolidation: "str | None" = None) -> str:
     if not companion or record_entries():
         parts.append(knowledge_text())
     if not companion or any(w == "staged" for w, _p in claim_files().values()):
-        parts.append(staged_text(checks_on()))
+        parts.append(staged_text(checks_kit()))
     since = entries_since_mark()
     if since:
         lines = ["## Journal since the last consolidation"]
@@ -2975,6 +3326,23 @@ def open_text(consolidation: "str | None" = None) -> str:
         parts.append(rep)
     del front
     return "\n\n".join(parts) + "\n"
+
+
+def switches_open_line() -> "str | None":
+    """open's line on the switches this session works under, in a project
+    that has them; None elsewhere. A switches object that cannot be read is
+    said here, never read as the defaults."""
+    if not checks_kit():
+        return None
+    try:
+        sw = session_switches()
+        sid = session_id()
+    except Refused as e:
+        return f"Switches: cannot be read: {e}"
+    where = ("" if sid else " (this command could not tell which session it runs "
+             "in; `rs-memory switch` in the session says what holds there)")
+    return (f"Switches: {switch_words(sw)}{where}. The user switches them for one session "
+            f"with /rs-mode (pi: /skill:rs-mode).{switches_held(sw)}")
 
 
 def _utf16_len(s: str) -> int:
@@ -4342,6 +4710,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id")
     p.add_argument("--agent", choices=("claude", "pi"))
     p.set_defaults(fn=cmd_referee)
+
+    p = sub.add_parser("check", help="run the re-runs and referees of several staged findings "
+                       "in parallel and wait until all have ended")
+    p.add_argument("ids", nargs="+")
+    p.add_argument("--agent", choices=("claude", "pi"))
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("switch", help="show this session's subagents and checks switches, or "
+                       "switch them for this session only")
+    for k, vals in SWITCHES.items():
+        p.add_argument(f"--{k}", choices=vals)
+    p.set_defaults(fn=cmd_switch)
 
     p = sub.add_parser("accept", help="move staged claims into the record (the PI said so)")
     p.add_argument("ids", nargs="+")
