@@ -98,7 +98,7 @@ The memory command is part of the project's image, while RS's instructions to th
 
 At start, a hook gives the agent its front page: Claude's start hook, or pi's extension. The agent then works and writes at named moments: a finished unit of work, a dead end, a surprise, a correction.
 
-When the session ends, the end hook runs `close`. A headless run of the same agent reads the journal since the last consolidation and writes a new front page. The user's terminal is not held up. The old page is kept, and a run cut short is reported at the next start.
+When the user ends the session, the agent runs `close`: a headless run of the same agent reads the journal since the last consolidation and writes a new front page, and `close` waits for it, up to about ten minutes, then reports how it went. When the session ends without `close` (the window is closed), the end is only recorded, and nothing is started: the next session consolidates before the agent's first reply, so it starts from the new page. The old page is kept. A run that does not finish in time is stopped, the front page stays as it was, the next start says so, and the next start or `close` tries again.
 
 The user accepts a finding by saying so in the chat, for example "accept F-3". The front page lists what waits, with the words to say.
 
@@ -135,7 +135,7 @@ It keeps everything above that does not assume one line of inquiry: the journal 
 
 **The front page comes through the agent's own hooks.** Both agents receive it at start and after a compaction, so a wiped context recovers without the user. Claude's built-in memory is off in these projects, so the agent has only one memory.
 
-**Consolidation runs in the background at session end.** A headless run of the same agent writes the new page, using the user's model quota. A session killed with its container skips it; the next one consolidates everything since.
+**Consolidation is waited for, never left running.** A headless run of the same agent writes the new page, using the user's model quota, while the session that started it waits, so nothing runs unwatched. The cost is a wait of up to about ten minutes when the user ends the session, or before the first reply of the next session when the window was closed instead. A session killed with its container records no end, so its entries wait for the next `close`.
 
 **Skills are earned.** A procedure becomes a skill only after a successful use. It goes into both agents' skills folders, so Claude and pi share it.
 

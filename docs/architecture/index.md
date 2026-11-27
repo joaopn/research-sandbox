@@ -81,7 +81,7 @@ Each page ends with its full list of design decisions and their costs; these are
 - Memory is four things kept apart: front page, record, journal, skills.
 - The record is immutable; a finding enters it only when the user accepts it.
 - One command carries the memory's rules; the front page reaches both agents through their own hooks.
-- Consolidation runs in the background at session end, on the user's model quota.
+- Consolidation is waited for, at session end or at the next session's start, on the user's model quota; nothing runs unwatched.
 - The user reads pages written from the memory (a front page, what waits, what was accepted), not the memory itself; a page never overwrites the user's own file.
 - The logbook is the story and the record is the truth: where they disagree, the record's standing holds.
 - The companion is its own type, not a setting on the researcher, and the same memory command in a mode, so the journal, jobs, skills and paper check are shared.

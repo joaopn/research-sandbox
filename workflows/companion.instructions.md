@@ -30,7 +30,7 @@ To fix a staged claim before the PI decides, use `rs-memory amend F-12` with the
 
 **Skills.** When a procedure was needed and worked, and you expect to need it again, write it down as a candidate: `rs-memory skill propose <name> --description "<when to use it>" --body <file>` (plus `--file` for helper files). Log each use with `rs-memory skill used <name> --ok` or `--failed`; after a successful use, `rs-memory skill promote <name>` makes it a skill both agents load (named `earned-<name>`). Retire one that misleads with `rs-memory skill retire <name> --reason "…"`. Propose few: an unproven skill does more harm than none.
 
-**End of a session.** When the PI ends the session, run `rs-memory close`. It journals the end and, when there is something new, starts a short background run that consolidates the journal into the front page. It also runs by itself when the session ends without you.
+**End of a session.** When the PI ends the session, run `rs-memory close`. It journals the end and, when there is something new, consolidates the journal into the front page, waiting until that is done (up to about ten minutes), then says how it went. Under Claude Code give that Bash call a timeout of 600000 ms, so that it waits in the foreground rather than moving to the background after the default two minutes. A consolidation that does not finish in time is stopped and the front page stays as it was; `rs-memory open` says so, and the next session start or `close` tries again. When the session ends without you, the end is only recorded, and the next session consolidates before your first reply.
 
 ## Software
 
