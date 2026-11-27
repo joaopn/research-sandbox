@@ -38,7 +38,7 @@ flowchart TD
 | [Research](Research.md) | The research workflows compared: three built, one planned |
 | ↳ [Research workflow](Research-workflow.md) | Built: how a supervisor plans, runs and reviews workers |
 | ↳ [Researcher workflow](Researcher-workflow.md) | Built: one long-lived agent with a memory, the pages it writes for the user, and a logbook; the companion, the same agent for one-off and mixed tasks |
-| ↳ [Researcher with subagents](Researcher-with-subagents.md) | Built: a researcher that hands analyses to parallel helpers and has each finding re-run and refereed |
+| ↳ [Researcher with subagents](Researcher-with-subagents.md) | Built: a researcher whose helpers, checks and work packages are switches: by default it hands analyses to parallel helpers and has each staged finding re-run and refereed |
 | ↳ [Lab workflow](Lab-workflow.md) | Planned: several researchers, a board, a lab meeting, budgets |
 | [Boxes](Boxes.md) | Box types; what a box can see of its project |
 | [MCP servers](MCP-servers.md) | The shared gateway, its server list, wiring to agents and boxes; the older per-project registry |
@@ -90,8 +90,12 @@ Each page ends with its full list of design decisions and their costs; these are
 
 - Subagents keep nothing; knowledge stays in the researcher's one memory.
 - Analysts run in parallel and in the background; each result arrives on its own.
-- A finding is re-run and read by an independent referee before the user can accept it; the verdict goes to the researcher's record, and the user decides.
+- With the checks on, a finding is re-run and read by an independent referee before the user can accept it; the verdict goes to the researcher's record, and the user decides. With them off, a finding accepted unchecked says so.
 - A verdict and a re-run are bound to the claim and evidence they judged; a change voids both.
+- Subagents and checks are the project's default and switch per session; the planner is the project's alone.
+- Work packages are folders of the researcher's layout; one session at a time holds each, checked by its agent's process, and the memory is chosen by what a session holds.
+- Roles are skills inside the plain `claude` and `pi`; the shortcuts are new names, never a wrapper.
+- With the search service wired, all web access goes through it.
 
 The lab workflow's decisions are proposals until built; they are listed on [Lab workflow](Lab-workflow.md).
 
