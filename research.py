@@ -1623,15 +1623,15 @@ def cmd_search_status(args: argparse.Namespace) -> None:
               f"SearXNG {'yes' if out['images']['searxng'] else 'no'}   SearXNG: {out['searxng']}")
     if out["searches"] is not None:
         print("  searches: " + ", ".join(f"{k} {v}" for k, v in out["searches"].items()))
-    print(f"  sign-in: {out['credential']}   MCP gateway entry: {out['mcp_entry']}")
+    print(f"  sign-in: {out['credential']}   MCP gateway entry: {out['mcp_entry']}"
+          f"   VPN version's entry: {out['vpn_entry']}")
     if out["settings"]:
-        st = out["settings"]
-        for sr in st["searchers"]:
-            print(f"  searcher: {sr['name']} ({sr['model']}"
-                  + (f" {sr['effort']}" if sr["effort"] else "")
-                  + (", through the VPN" if sr["vpn"] else "") + ")")
-        print(f"  searches at once: {st['at_once']}   contact: "
-              + (st["contact"] or f"(generic: {search.GENERIC_CONTACT})"))
+        sr = out["settings"]["searcher"]
+        print(f"  searcher: {sr['name']} ({sr['model']}"
+              + (f" {sr['effort']}" if sr["effort"] else "")
+              + f", {sr['at_once']} at once)   contact: "
+              + (out["settings"]["contact"] or f"(generic: {search.GENERIC_CONTACT})")
+              + f"   VPN version: {'on' if out['settings']['vpn'] else 'off'}")
     if out["error"]:
         print(f"warning: {out['error']}", file=sys.stderr)
 
@@ -1661,16 +1661,15 @@ def cmd_search_settings(args: argparse.Namespace) -> None:
             die(cur["error"])
         return
     base = (cur["settings"] or search.default_settings())
-    # --name, --model and --effort change the first searcher; every other
-    # searcher and setting is carried over as saved.
-    first = dict(base["searchers"][0])
-    first.update({k: v for k, v in (("name", args.name), ("model", args.model),
-                                    ("effort", args.effort)) if v is not None})
+    sr = base["searcher"]
     req = _build(rscore.SearchSettingsRequest,
-                 searchers=[first] + base["searchers"][1:],
-                 at_once=base["at_once"] if args.at_once is None else args.at_once,
+                 name=sr["name"] if args.name is None else args.name,
+                 model=sr["model"] if args.model is None else args.model,
+                 effort=sr["effort"] if args.effort is None else args.effort,
+                 at_once=sr["at_once"] if args.at_once is None else args.at_once,
                  contact=base["contact"] if args.contact is None else args.contact,
-                 recent=base["recent"], sidebar=base["sidebar"])
+                 recent=base["recent"], sidebar=base["sidebar"], tiers=sr["tiers"],
+                 vpn=base["vpn"])
     out = _call(rscore.search_settings_set, req)
     print(json.dumps(out["settings"], indent=2, sort_keys=True))
 
@@ -3989,11 +3988,10 @@ def build_parser() -> argparse.ArgumentParser:
                         ).set_defaults(func=cmd_search_token)
     srch_sub.add_parser("token-clear", help="remove the stored token"
                         ).set_defaults(func=cmd_search_token_clear)
-    sse = srch_sub.add_parser("settings", help="show the searchers, or change the first "
-                                               "searcher or the shared settings")
-    sse.add_argument("--name", help="the first searcher's name")
-    sse.add_argument("--model", help="the first searcher's model")
-    sse.add_argument("--effort", help='the first searcher\'s effort level, or "" for none')
+    sse = srch_sub.add_parser("settings", help="show the searcher, or change fields of it")
+    sse.add_argument("--name")
+    sse.add_argument("--model")
+    sse.add_argument("--effort", help='an effort level, or "" for none')
     sse.add_argument("--at-once", type=int, dest="at_once")
     sse.add_argument("--contact", help='an email address, or "" for the generic one')
     sse.set_defaults(func=cmd_search_settings)

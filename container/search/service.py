@@ -5,13 +5,18 @@ Runs as root in the `rs-search` container (container/search/boot.sh starts it
 once the inner Docker answers), and does two things:
 
   - the caller-facing MCP server on SERVICE_PORT, behind the MCP gateway's
-    `search` entry: submit a question, check a search, collect its result,
-    and a file route (GET /mcp/files/<search id>/<file>) under the server's
+    `search` entry (MCP_PATH) and, while the VPN version is on, its
+    `search-vpn` entry (MCP_VPN_PATH, the same tools; a search asked there
+    is a VPN search): submit a question, check a search, collect its result,
+    and a file route (GET <path>/files/<search id>/<file>) under the server's
     registered path, which is where the gateway relays a caller's
-    `/search/files/...`. The caller is the `<project>/<consumer>` the gateway
-    puts in CALLER_HEADER (the gateway strips any copy a caller sends).
-    Searches are keyed on the caller's PROJECT: another project's search is
-    "not found", whatever its id;
+    `/search/files/...` (`/search-vpn/files/...`). The caller is the
+    `<project>/<consumer>` the gateway puts in CALLER_HEADER (the gateway
+    strips any copy a caller sends). Searches are keyed on the caller's
+    PROJECT and on the path they were asked through: another project's
+    search is "not found", whatever its id, and the caller's own search
+    asked through the other path is refused with that path's server name
+    (its files are not found);
   - each search, in the inner Docker: a private network, one search-agent
     container, a browser sidecar per browser tier that is on, and a named
     volume for its files, all named after the search id and removed BY NAME
@@ -21,9 +26,10 @@ once the inner Docker answers), and does two things:
     connected to a second, internal network of each search that only the
     search's agent joins (never to the search's own network, where its
     sidecars are), never the searches to each other;
-  - while a VPN configuration is delivered, the VPN gateway (kernel
-    WireGuard, NET_ADMIN only) and a second SearXNG routed through it. A
-    search of a VPN searcher runs every tool that touches a site in a
+  - while a VPN configuration is delivered (the host delivers it only while
+    the VPN version is ticked), the VPN gateway (kernel WireGuard, NET_ADMIN
+    only) and a second SearXNG routed through it. A VPN search (one asked
+    through MCP_VPN_PATH) runs every tool that touches a site in a
     sidecar on its `--internal` network (the plain tier too, over HTTP),
     each routed through the gateway by a one-shot helper and resolving
     through the tunnel; its agent reaches only its sidecars and, by a
@@ -71,7 +77,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8080                                   # search.SERVICE_PORT
 MCP_PATH = "/mcp"                             # search.MCP_PATH
-FILES_PREFIX = MCP_PATH + "/files/"
+MCP_VPN_PATH = "/mcp-vpn"                     # search.MCP_VPN_PATH
+# Each caller-facing path: whether its searches are VPN searches.
+MCP_PATHS = {MCP_PATH: False, MCP_VPN_PATH: True}
+FILES_SUFFIX = "/files/"
+# The servers' names on the gateway, as the tool descriptions and refusals
+# name them (search.MCP_SERVER_NAME / MCP_VPN_SERVER_NAME — MIRRORS).
+SERVER_NAMES = {False: "search", True: "search-vpn"}
 CALLER_HEADER = "X-RS-Caller"                 # search.CALLER_HEADER
 RUN_DIR = "/run/rs-search"                    # search.SERVICE_RUN_DIR
 SETTINGS_PATH = os.path.join(RUN_DIR, "settings.json")
@@ -433,55 +445,44 @@ def first_line(r: subprocess.CompletedProcess) -> str:
 
 # --- delivered files ---------------------------------------------------------------
 
-def _searcher_ok(s) -> bool:
-    return (isinstance(s, dict) and isinstance(s.get("name"), str)
-            and isinstance(s.get("model"), str) and isinstance(s.get("effort"), str)
-            and isinstance(s.get("vpn"), bool) and isinstance(s.get("tiers"), dict)
-            and set(s["tiers"]) == set(TIER_NAMES)
-            and all(isinstance(s["tiers"][n], bool) for n in TIER_NAMES))
-
-
 def read_settings() -> dict | None:
     """The settings the host delivered, or None (not delivered, or unusable:
-    the host writes only valid ones): {searchers, at_once, contact, recent}.
-    A record of an older host (one `searcher` holding `at_once`, perhaps
-    without `tiers`) reads as that one searcher, searching from this
-    installation's address with both browser tiers."""
+    the host writes only valid ones). `vpn`: whether the VPN version is
+    ticked (an older host sends none: off)."""
     try:
         with open(SETTINGS_PATH, "rb") as f:
             data = json.loads(f.read(DELIVERY_MAX_BYTES + 1))
-        if not isinstance(data, dict):
-            return None
-        if "searcher" in data:                  # an older host
-            old = data["searcher"]
-            data = {"searchers": [{"name": old["name"], "model": old["model"],
-                                   "effort": old["effort"],
-                                   "tiers": old.get("tiers", {n: True for n in TIER_NAMES}),
-                                   "vpn": False}],
-                    "at_once": old["at_once"], "contact": data["contact"],
-                    "recent": data.get("recent")}
-        at_once = data["at_once"]
-        searchers = data["searchers"]
-        if not (isinstance(at_once, int) and not isinstance(at_once, bool) and at_once >= 1
-                and isinstance(data["contact"], str) and isinstance(searchers, list)
-                and searchers and all(_searcher_ok(x) for x in searchers)
-                and any(not x["vpn"] for x in searchers)):
+        s = data["searcher"]
+        if not (isinstance(s["name"], str) and isinstance(s["model"], str)
+                and isinstance(s["effort"], str) and isinstance(s["at_once"], int)
+                and isinstance(data["contact"], str)):
             return None
         r = data.get("recent")
         if isinstance(r, bool) or not isinstance(r, int) or not 0 <= r <= RECENT_MAX:
             data["recent"] = DEFAULT_RECENT     # missing (an older host) or bad
+        t = s.get("tiers")
+        if t is None:
+            s["tiers"] = {n: True for n in TIER_NAMES}      # an older host: both on
+        elif not (isinstance(t, dict) and set(t) == set(TIER_NAMES)
+                  and all(isinstance(t[n], bool) for n in TIER_NAMES)):
+            return None
+        if not isinstance(data.setdefault("vpn", False), bool):
+            return None
         return data
     except (OSError, ValueError, RecursionError, KeyError, TypeError):
         return None
 
 
-def find_searcher(settings: dict, name: str) -> dict | None:
-    """The searcher of that name, or (no name) the first that does not
-    search through the VPN; None when there is none of that name."""
-    for s in settings["searchers"]:
-        if (s["name"] == name) if name else not s["vpn"]:
-            return s
-    return None
+def vpn_on() -> bool:
+    """Whether VPN searches can be asked: the VPN version ticked and a VPN
+    configuration delivered (whether its tunnel is up is checked when a
+    search starts)."""
+    settings = read_settings()
+    return bool(settings and settings["vpn"]) and read_vpn() is not None
+
+
+VPN_OFF = ("the VPN version of the search service is off: the operator turns it on and "
+           "stores a VPN configuration on the Search page")
 
 
 def token_present() -> bool:
@@ -1205,52 +1206,54 @@ class Searches:
 
     # --- the caller's three tools ---
 
-    def submit(self, project: str, consumer: str, question: str, searcher) -> dict:
-        settings, s = self._submit_settings(question, searcher)
+    def submit(self, project: str, consumer: str, question: str, searcher: str,
+               vpn: bool) -> dict:
+        settings = self._submit_settings(question, searcher, vpn)
         sid = secrets.token_hex(8)
         with self.lock:
             self._enqueue(sid, project, consumer, question.strip(), question.strip(),
-                          settings, s, None)
-        return {"search_id": sid, "searcher": s["name"], "state": "queued",
+                          settings, vpn, None)
+        s = settings["searcher"]
+        return {"search_id": sid, "searcher": s["name"], "vpn": vpn, "state": "queued",
                 "next": "go on with your work; search_check tells how it goes"}
 
     @staticmethod
-    def _submit_settings(question, searcher) -> tuple[dict, dict]:
-        """The settings a new search runs with and its searcher (the one
-        named, or the first that does not search through the VPN), after the
-        checks every search passes (settings saved, the searcher there, a
-        question of a size the agent's environment carries). ToolRefusal
-        otherwise."""
+    def _submit_settings(question, searcher: str, vpn: bool) -> dict:
+        """The settings a new search runs with, after the checks every search
+        passes (settings saved, the searcher named, a question of a size the
+        agent's environment carries; a VPN search, the VPN version on).
+        ToolRefusal otherwise."""
         settings = read_settings()
         if settings is None:
             raise ToolRefusal("the search service has no settings yet; the operator "
-                              "saves the searchers on the Search page")
-        if searcher is not None and not isinstance(searcher, str):
-            raise ToolRefusal("the searcher is named by its name")
-        s = find_searcher(settings, searcher or "")
-        if s is None:
-            raise ToolRefusal(f"there is no searcher named {searcher}; the searchers are: "
-                              + ", ".join(x["name"] for x in settings["searchers"]))
+                              "saves the searcher on the Search page")
+        s = settings["searcher"]
+        if searcher and searcher != s["name"]:
+            raise ToolRefusal(f"there is no searcher named {searcher}; the searchers "
+                              f"are: {s['name']}")
+        if vpn and not vpn_on():
+            raise ToolRefusal(VPN_OFF)
         if not isinstance(question, str) or not question.strip():
             raise ToolRefusal("the question is empty")
         if len(question) > QUESTION_MAX_CHARS:
             raise ToolRefusal(f"the question is longer than {QUESTION_MAX_CHARS} "
                               "characters; put long material in a file the "
                               "question names instead")
-        return settings, s
+        return settings
 
     def _enqueue(self, sid: str, project: str, consumer: str, question: str, prompt: str,
-                 settings: dict, s: dict, conversation: str | None) -> None:
-        """Under the lock: a new search of searcher `s` in the table and at
-        the end of the one queue, and its thread. `question` is what its rows
-        show, `prompt` what its agent is asked (the same but for an ask that
-        includes its conversation); `conversation` is an ask's conversation
-        id."""
+                 settings: dict, vpn: bool, conversation: str | None) -> None:
+        """Under the lock: a new search in the table and at the end of the one
+        queue, and its thread. `question` is what its rows show, `prompt` what
+        its agent is asked (the same but for an ask that includes its
+        conversation); `vpn` whether it is a VPN search; `conversation` is an
+        ask's conversation id."""
+        s = settings["searcher"]
         self.table[sid] = {
             "id": sid, "project": project, "consumer": consumer,
             "question": question, "prompt": prompt, "conversation": conversation,
             "searcher": s["name"], "model": s["model"], "effort": s["effort"],
-            "tiers": dict(s["tiers"]), "vpn": s["vpn"], "contact": settings["contact"],
+            "tiers": dict(s["tiers"]), "vpn": vpn, "contact": settings["contact"],
             "state": "queued", "submitted_at": time.time(),
             "started_at": None, "finished_at": None, "outcome": None,
             "stream": AgentStream(), "stop": False}
@@ -1261,16 +1264,15 @@ class Searches:
 
     # --- the operator's asks (the Search page's Quick Search) ---
 
-    def ask(self, question, conversation, include: bool, searcher) -> dict:
+    def ask(self, question, conversation, include: bool, vpn: bool) -> dict:
         """The operator's question: a search like any other (the same queue,
-        searchers and sign-in) under OPERATOR_PROJECT, of the searcher named
-        (None: the first that does not search through the VPN), added to a
-        conversation (a new one when `conversation` is None). With `include`
+        searcher and sign-in) under OPERATOR_PROJECT, a VPN search when `vpn`,
+        added to a conversation (a new one when `conversation` is None). With `include`
         the searcher is asked the conversation's earlier questions and
         answers too; the rows show only what the operator typed. The
         conversation is saved before the search is queued: a save that fails
         starts nothing."""
-        settings, s = self._submit_settings(question, searcher)
+        settings = self._submit_settings(question, "", vpn)
         question = question.strip()
         with self.lock:
             if self.conv_error:
@@ -1287,8 +1289,8 @@ class Searches:
                     raise ToolRefusal(TOO_LONG_TO_INCLUDE)
             sid = secrets.token_hex(8)
             now = time.time()
-            entry = {"id": sid, "question": question, "searcher": s["name"],
-                     "submitted_at": now, "view": None, "report": None}
+            entry = {"id": sid, "question": question, "searcher": settings["searcher"]["name"],
+                     "vpn": vpn, "submitted_at": now, "view": None, "report": None}
             if conv is None:
                 cid = secrets.token_hex(8)
                 conv = {"id": cid, "created_at": now, "updated_at": now, "asks": [entry]}
@@ -1302,7 +1304,7 @@ class Searches:
                 raise ToolRefusal(problem)
             self.conversations = kept
             self._enqueue(sid, OPERATOR_PROJECT, OPERATOR_CONSUMER, question, prompt,
-                          settings, s, cid)
+                          settings, vpn, cid)
         return {"conversation": cid, "ask": sid, "state": "queued"}
 
     @staticmethod
@@ -1367,7 +1369,7 @@ class Searches:
         asks = []
         for a in conv["asks"]:
             row = {"id": a["id"], "question": a["question"], "searcher": a["searcher"],
-                   "ahead": None, "reason": None, "summary": None, "sources": [], "tiers": []}
+                   "vpn": a["vpn"], "ahead": None, "reason": None, "summary": None, "sources": [], "tiers": []}
             rec = live.get(a["id"])
             if a["view"] is not None:
                 v, rep = a["view"], a["report"]
@@ -1484,10 +1486,15 @@ class Searches:
             lost = False
             for c in convs:
                 for a in c["asks"]:
+                    # An ask saved before VPN searches existed was a normal one.
+                    a.setdefault("vpn", False)
+                    if a["view"] is not None:
+                        a["view"].setdefault("vpn", a["vpn"])
                     if a["view"] is None:
                         lost = True
                         a["view"] = {"id": a["id"], "state": "failed",
                                      "question": a["question"], "searcher": a["searcher"],
+                                     "vpn": a["vpn"],
                                      "tokens": 0, "waited_s": 0, "ran_s": 0,
                                      "reason": ASK_LOST, "work": [], "truncated": False}
             self.conversations = convs
@@ -1523,15 +1530,20 @@ class Searches:
             return f"the conversations could not be saved ({e.strerror or 'write failed'})"
         return None
 
-    def get(self, project: str, sid: str) -> dict:
-        """The caller's own search, or a not-found refusal (another project's
-        search is not found either)."""
+    def get(self, project: str, sid: str, vpn: bool) -> dict:
+        """The caller's own search asked through this path (`vpn`: the
+        search-vpn server's), or a not-found refusal (another project's search
+        is not found either). The caller's own search asked through the other
+        server is refused with that server's name."""
         if not isinstance(sid, str) or not ID_RE.match(sid):
             raise ToolRefusal("no search with that id was found for this project")
         with self.lock:
             rec = self.table.get(sid)
             if rec is None or rec["project"] != project:
                 raise ToolRefusal("no search with that id was found for this project")
+            if rec["vpn"] != vpn:
+                raise ToolRefusal(f"that search was asked through the {SERVER_NAMES[rec['vpn']]} "
+                                  "MCP server; check and collect it there")
             return dict(rec)
 
     @staticmethod
@@ -1543,10 +1555,10 @@ class Searches:
                 "ran_s": (round((rec["finished_at"] or now) - rec["started_at"])
                           if rec["started_at"] else 0)}
 
-    def check(self, project: str, sid: str) -> dict:
-        rec = self.get(project, sid)
+    def check(self, project: str, sid: str, vpn: bool) -> dict:
+        rec = self.get(project, sid, vpn)
         out = {"search_id": sid, "state": rec["state"], "searcher": rec["searcher"],
-               "question": rec["question"], **self._times(rec),
+               "vpn": rec["vpn"], "question": rec["question"], **self._times(rec),
                "tokens": rec["stream"].tokens()}
         if rec["state"] == "queued":
             with self.lock:
@@ -1565,8 +1577,8 @@ class Searches:
                            "(it ends the search and removes its files)")
         return out
 
-    def collect(self, project: str, sid: str, keep: bool) -> dict:
-        rec = self.get(project, sid)
+    def collect(self, project: str, sid: str, keep: bool, vpn: bool) -> dict:
+        rec = self.get(project, sid, vpn)
         if rec["state"] not in ENDED:
             return {"search_id": sid, "state": rec["state"],
                     "next": "the search has not ended yet; search_check tells how it goes"}
@@ -1627,7 +1639,7 @@ class Searches:
         return {"searches": [
             {"id": r["id"], "project": r["project"], "consumer": r["consumer"],
              "question": r["question"][:LIST_QUESTION_MAX_CHARS], "searcher": r["searcher"],
-             "state": r["state"], **self._times(r), "tokens": r["stream"].tokens()}
+             "vpn": r["vpn"], "state": r["state"], **self._times(r), "tokens": r["stream"].tokens()}
             for r in recs], "recent": recent, "recent_kept": kept}
 
     def _trim_recent(self) -> int:
@@ -1651,7 +1663,7 @@ class Searches:
                        if "summary" in rec["outcome"] else None),
             "project": rec["project"], "consumer": rec["consumer"],
             "question": rec["question"][:LIST_QUESTION_MAX_CHARS],
-            "searcher": rec["searcher"], "state": rec["state"],
+            "searcher": rec["searcher"], "vpn": rec["vpn"], "state": rec["state"],
             "reason": rec["outcome"]["reason"][:RECENT_REASON_MAX_CHARS],
             "ended_at": rec["finished_at"],
             "ran_s": (round(rec["finished_at"] - rec["started_at"])
@@ -1689,7 +1701,7 @@ class Searches:
             rec = self.table.get(sid)
             if rec is not None:
                 out = {"id": sid, "state": rec["state"], "question": rec["question"],
-                       "searcher": rec["searcher"]}
+                       "searcher": rec["searcher"], "vpn": rec["vpn"]}
                 o = rec.get("outcome") or {}
                 if rec["state"] in ENDED and "summary" in o:
                     return {**out, "has_report": True,
@@ -1700,7 +1712,7 @@ class Searches:
                 for e in self.recent:
                     if e["id"] == sid:
                         out = {"id": sid, "state": e["state"], "question": e["view"]["question"],
-                               "searcher": e["searcher"]}
+                               "searcher": e["searcher"], "vpn": e["vpn"]}
                         raw = e["report"]
                         break
                 else:
@@ -1708,7 +1720,7 @@ class Searches:
                     if a is None:
                         return None
                     out = {"id": sid, "state": a["view"]["state"], "question": a["question"],
-                           "searcher": a["view"]["searcher"]}
+                           "searcher": a["view"]["searcher"], "vpn": a["vpn"]}
                     if a["report"] is None:
                         return {**out, "has_report": False}
                     return {**out, "has_report": True,
@@ -1735,8 +1747,8 @@ class Searches:
         dropped = dropped or calls_dropped
         work = sorted(tools + calls + texts, key=lambda e: e["ts"])
         out = {"id": rec["id"], "state": rec["state"], "question": rec["question"],
-               "searcher": rec["searcher"], "tokens": rec["stream"].tokens(),
-               **self._times(rec),
+               "searcher": rec["searcher"], "vpn": rec["vpn"],
+               "tokens": rec["stream"].tokens(), **self._times(rec),
                "reason": rec["outcome"]["reason"] if rec["state"] in ENDED else None,
                "work": [], "truncated": False}
         for entry in work[-VIEW_TAIL_ENTRIES:]:
@@ -1816,7 +1828,7 @@ class Searches:
                 if sid not in self.queue:
                     return False
                 settings = read_settings()
-                at_once = settings["at_once"] if settings else 1
+                at_once = settings["searcher"]["at_once"] if settings else 1
                 if self.queue and self.queue[0] == sid and self.running < at_once:
                     self.queue.popleft()
                     self.running += 1
@@ -1910,8 +1922,10 @@ def _is_count(v) -> bool:
 
 def _ask_shape_ok(a) -> bool:
     """One ask of the conversations file as the service writes it."""
-    if not (isinstance(a, dict) and set(a) == {"id", "question", "searcher", "submitted_at",
-                                               "view", "report"}
+    # `vpn` is absent from an ask saved before VPN searches existed.
+    if not (isinstance(a, dict) and set(a) - {"vpn"} == {"id", "question", "searcher",
+                                                         "submitted_at", "view", "report"}
+            and isinstance(a.get("vpn", False), bool)
             and isinstance(a["id"], str) and ID_RE.match(a["id"])
             and isinstance(a["question"], str) and a["question"]
             and isinstance(a["searcher"], str) and _is_num(a["submitted_at"])):
@@ -1920,6 +1934,7 @@ def _ask_shape_ok(a) -> bool:
     if v is not None and not (
             isinstance(v, dict) and v.get("id") == a["id"] and v.get("state") in ENDED
             and isinstance(v.get("question"), str) and isinstance(v.get("searcher"), str)
+            and isinstance(v.get("vpn", False), bool)
             and all(_is_count(v.get(k)) for k in ("tokens", "waited_s", "ran_s"))
             and isinstance(v.get("reason"), str) and isinstance(v.get("truncated"), bool)
             and isinstance(v.get("work"), list)
@@ -2399,18 +2414,15 @@ def address_blocks(tiers) -> list[str]:
 
 def address_block_note(n: int, vpn_search: bool) -> str:
     """One sentence for the asking agent: how many sites refused the search
-    by its address and, for a search from this installation's address, which
-    searchers reach sites from another one (the VPN searchers)."""
+    by its address and, for a search from this installation's address while
+    the VPN version is on, that the search-vpn server reaches sites from
+    another one."""
     head = f"{n} site{'s' if n != 1 else ''} refused this search by its address"
     if vpn_search:
         return head + " (the VPN's address)"
-    settings = read_settings()
-    vpns = [s["name"] for s in settings["searchers"] if s["vpn"]] if settings else []
-    if len(vpns) == 1:
-        return head + f"; the VPN searcher {vpns[0]} reaches sites from another address"
-    if vpns:
-        return head + (f"; the VPN searchers {', '.join(vpns[:-1])} and {vpns[-1]} reach "
-                       "sites from another address")
+    if vpn_on():
+        return head + (f"; the {SERVER_NAMES[True]} MCP server reaches sites from the VPN's "
+                       "address, if you have it")
     return head
 
 
@@ -2687,8 +2699,7 @@ TOOLS = [
                      "properties": {"question": {"type": "string"},
                                     "searcher": {"type": "string",
                                                  "description": "the searcher's name; "
-                                                                "the default one when "
-                                                                "omitted"}},
+                                                                "the only one when omitted"}},
                      "required": ["question"]}},
     {"name": "search_check",
      "description": ("How a search goes: queued, running (and what it is doing), or "
@@ -2711,25 +2722,22 @@ TOOLS = [
 ]
 
 
-def tools_listed() -> list[dict]:
-    """The tools as a caller lists them: search_submit's description names
-    the searchers saved now, which one is the default, and what a VPN
-    searcher is for."""
-    settings = read_settings()
-    if settings is None:
+def tools_listed(vpn: bool) -> list[dict]:
+    """The tools as a caller lists them on one path. On search-vpn's,
+    search_submit's description says that its searches reach sites from the
+    VPN's address; on search's, while the VPN version is on, that the
+    search-vpn server does."""
+    if vpn:
+        extra = (" This server's searches reach every site from the VPN's address, not "
+                 "this installation's; its tools see only the searches asked through it.")
+    elif vpn_on():
+        extra = (f" The {SERVER_NAMES[True]} MCP server, if you have it, runs the same "
+                 "searches reaching every site from the VPN's address instead of this "
+                 "installation's: use it when a search's outcome says sites refused it by "
+                 "its address.")
+    else:
         return TOOLS
-    default = find_searcher(settings, "")
-    names = []
-    for x in settings["searchers"]:
-        tags = (["the default"] if x is default else []) + (
-            ["reaches sites from the VPN's address"] if x["vpn"] else [])
-        names.append(x["name"] + (f" ({', '.join(tags)})" if tags else ""))
-    text = (TOOLS[0]["description"] + " The searchers: " + "; ".join(names) + ".")
-    if any(x["vpn"] for x in settings["searchers"]):
-        text += (" A VPN searcher's searches reach sites from the VPN's address instead "
-                 "of this installation's: ask one when a search's outcome says sites "
-                 "refused it by its address.")
-    return [dict(TOOLS[0], description=text), *TOOLS[1:]]
+    return [dict(TOOLS[0], description=TOOLS[0]["description"] + extra), *TOOLS[1:]]
 
 
 def _rpc_error(rid, code: int, message: str) -> dict:
@@ -2741,25 +2749,26 @@ def _tool_result(data, is_error: bool = False) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
-def call_tool(caller: tuple[str, str] | None, name: str, args: dict) -> dict:
+def call_tool(caller: tuple[str, str] | None, name: str, args: dict, vpn: bool) -> dict:
     if caller is None:
         return _tool_result("this server is reached through RS's MCP gateway only", True)
     project, consumer = caller
     try:
         if name == "search_submit":
             return _tool_result(SEARCHES.submit(project, consumer, args.get("question"),
-                                                args.get("searcher") or None))
+                                                args.get("searcher") or "", vpn))
         if name == "search_check":
-            return _tool_result(SEARCHES.check(project, args.get("search_id")))
+            return _tool_result(SEARCHES.check(project, args.get("search_id"), vpn))
         if name == "search_collect":
             return _tool_result(SEARCHES.collect(project, args.get("search_id"),
-                                                 args.get("keep") is True))
+                                                 args.get("keep") is True, vpn))
     except ToolRefusal as e:
         return _tool_result(str(e), True)
     return _tool_result(f"no tool named {name}", True)
 
 
-def handle_rpc(msg, caller) -> dict | None:
+def handle_rpc(msg, caller, vpn: bool) -> dict | None:
+    """One JSON-RPC message on a caller-facing path (`vpn`: search-vpn's)."""
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" \
             or not isinstance(msg.get("method"), str):
         return _rpc_error(msg.get("id") if isinstance(msg, dict) else None,
@@ -2777,11 +2786,11 @@ def handle_rpc(msg, caller) -> dict | None:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": rid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": tools_listed()}}
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": tools_listed(vpn)}}
     if method == "tools/call":
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         return {"jsonrpc": "2.0", "id": rid,
-                "result": call_tool(caller, str(params.get("name")), args)}
+                "result": call_tool(caller, str(params.get("name")), args, vpn)}
     # Claude Code's `server/discover` and anything else this server does not know.
     return _rpc_error(rid, -32601, f"method not found: {method}")
 
@@ -2835,7 +2844,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if path.startswith("/admin/"):
             return self._admin(path, post=True)
-        if path.rstrip("/") != MCP_PATH:
+        vpn = MCP_PATHS.get(path.rstrip("/"))
+        if vpn is None:
             return self._json(404, {"error": "not found"})
         raw = self._body()
         try:
@@ -2844,9 +2854,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, _rpc_error(None, -32700, "parse error"))
         caller = parse_caller(self.headers.get(CALLER_HEADER))
         if isinstance(msg, list):
-            replies = [r for r in (handle_rpc(m, caller) for m in msg) if r is not None]
+            replies = [r for r in (handle_rpc(m, caller, vpn) for m in msg) if r is not None]
             return self._json(200, replies) if replies else self._send(202)
-        reply = handle_rpc(msg, caller)
+        reply = handle_rpc(msg, caller, vpn)
         if reply is None:
             return self._send(202)
         return self._json(200, reply)
@@ -2855,11 +2865,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if path.startswith("/admin/"):
             return self._admin(path, post=False)
-        if path.startswith(FILES_PREFIX):
-            return self._file(path[len(FILES_PREFIX):])
-        if path.rstrip("/") == MCP_PATH:
-            # No server-initiated stream: every reply is the POST's own.
-            return self._send(405, b"", extra={"Allow": "POST"})
+        for mcp_path, vpn in MCP_PATHS.items():
+            if path.startswith(mcp_path + FILES_SUFFIX):
+                return self._file(path[len(mcp_path + FILES_SUFFIX):], vpn)
+            if path.rstrip("/") == mcp_path:
+                # No server-initiated stream: every reply is the POST's own.
+                return self._send(405, b"", extra={"Allow": "POST"})
         return self._json(404, {"error": "not found"})
 
     do_HEAD = do_GET
@@ -2867,14 +2878,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         return self._send(405, b"", extra={"Allow": "POST"})
 
-    def _file(self, rest: str) -> None:
+    def _file(self, rest: str, vpn: bool) -> None:
+        """A search's file, under the path the search was asked through."""
         caller = parse_caller(self.headers.get(CALLER_HEADER))
         sid, _, fname = urllib.parse.unquote(rest).partition("/")
         missing = {"error": "no such file for this project"}
         if caller is None or not ID_RE.match(sid) or not FILE_NAME_RE.match(fname):
             return self._json(404, missing)
         try:
-            SEARCHES.get(caller[0], sid)
+            SEARCHES.get(caller[0], sid, vpn)
         except ToolRefusal:
             return self._json(404, missing)
         root = volume_root(SEARCH_PREFIX + sid)
@@ -2910,8 +2922,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _ask(self) -> None:
         """POST /admin/ask: {"question", "conversation" (an id or null),
-        "include", "searcher" (a name or null)} as the host sends it (an older
-        host sends no searcher). A refusal is 422 with its text."""
+        "include", "vpn"} as the host sends it (an older host sends no vpn: a
+        normal search). A refusal is 422 with its text."""
         try:
             length = int(self.headers.get("Content-Length") or "0")
         except ValueError:
@@ -2923,11 +2935,11 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length) or b"")
         except (ValueError, RecursionError):
             body = None
-        if isinstance(body, dict) and "searcher" not in body:
-            body["searcher"] = None
+        if isinstance(body, dict) and "vpn" not in body:
+            body["vpn"] = False
         if not (isinstance(body, dict)
-                and set(body) == {"question", "conversation", "include", "searcher"}
-                and (body["searcher"] is None or isinstance(body["searcher"], str))
+                and set(body) == {"question", "conversation", "include", "vpn"}
+                and isinstance(body["vpn"], bool)
                 and isinstance(body["question"], str) and isinstance(body["include"], bool)
                 and (body["conversation"] is None
                      or (isinstance(body["conversation"], str)
@@ -2935,7 +2947,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(422, {"error": "the question did not arrive as RS sends it"})
         try:
             return self._json(200, SEARCHES.ask(body["question"], body["conversation"],
-                                                body["include"], body["searcher"]))
+                                                body["include"], body["vpn"]))
         except ToolRefusal as e:
             return self._json(422, {"error": str(e)})
 

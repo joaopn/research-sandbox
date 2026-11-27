@@ -23663,7 +23663,8 @@ def resume_aldine_with_fleet() -> None:
 # One search service for the whole installation, turned on by the operator
 # (Services → Search or `research search on`), resumed by `research start`
 # only when it was turned on, and offered to agents as the MCP gateway server
-# `search`. Names, the container's exact shape and the host files are in
+# `search` and, while the VPN version is on with a VPN configuration stored,
+# `search-vpn`. Names, the container's exact shape and the host files are in
 # cli/search.py; the service program is container/search/service.py.
 
 # How long Turn on / start waits for the service to answer after (re)creating
@@ -23839,15 +23840,49 @@ def _mcp_gateway_search_front(deadline: float | None) -> None:
         print(f"warning: {problem}", file=sys.stderr)
 
 
-def _search_list_ready() -> None:
+def _search_list_ready(vpn: bool = False) -> None:
     """Refuse before any long step when the server list cannot take RS's
-    entry: unreadable, written by a newer RS, or holding another `search`."""
+    entry: unreadable, written by a newer RS, or holding another `search`
+    (`vpn`: or another `search-vpn`, when the VPN version's entry is due)."""
     try:
         data = mcp_servers.load()
     except mcp_servers.ServerListError as e:
         raise search.SearchError(str(e)) from None
-    if search.gateway_entry_conflict(data):
-        raise search.SearchError(search.CONFLICT_TEXT.format(name=search.MCP_SERVER_NAME))
+    for name in (search.MCP_SERVER_NAME, *((search.MCP_VPN_SERVER_NAME,) if vpn else ())):
+        if search.gateway_entry_conflict(data, name):
+            raise search.SearchError(search.conflict_text(name))
+
+
+def _search_vpn_wanted() -> bool:
+    """Whether the VPN version is due: ticked in the settings and a VPN
+    configuration stored (SearchError for a damaged settings or VPN file)."""
+    return bool(_search_settings()["vpn"]) and search.read_vpn_file() is not None
+
+
+def _search_vpn_entry(want: bool, *, blocking: bool, deadline: float | None) -> None:
+    """Put RS's `search-vpn` entry on the gateway's list (`want`) or take it
+    off (only RS's own: another server of that name is left as it is, and
+    taking it off unwires it everywhere). Nothing changes when the list
+    already says so. SearchError on a refusal."""
+    name = search.MCP_VPN_SERVER_NAME
+    state, data, _why = mcp_servers.read()
+    if state == mcp_servers.OK:
+        entry = data["servers"].get(name)
+        if (want and search.is_rs_entry(name, entry)) or (not want and entry is None):
+            return
+    try:
+        if want:
+            def change(data: dict) -> None:
+                try:
+                    search.apply_gateway_entry(data, name)
+                except search.SearchError as e:
+                    raise mcp_servers.ServerListError(str(e)) from None
+            _mcp_change(change, blocking=blocking, deadline=deadline)
+        else:
+            mcp_server_remove(McpServerNameRequest(name=name), blocking=blocking,
+                              deadline=deadline, if_url=search.MCP_VPN_URL)
+    except ValidationError as e:
+        raise search.SearchError(str(e)) from None
 
 
 def _search_image_id(ref: str, deadline: float | None = None) -> str:
@@ -24099,12 +24134,17 @@ _SEARCH_DELIVERED_WHAT = {search.SETTINGS_FILE_NAME: "settings",
 def _search_deliver(deadline: float | None, *, only_vpn: bool = False) -> None:
     """Hand the running service its settings, its token and its VPN
     configuration (or take the token or the VPN configuration away), over
-    stdin into its tmpfs — never on a command line. `only_vpn`: the VPN
-    configuration alone (a change of it)."""
+    stdin into its tmpfs — never on a command line. The VPN configuration
+    goes only while the VPN version is ticked (unticked, the service holds no
+    key and runs no gateway). `only_vpn`: the VPN configuration alone (a
+    change of it)."""
     vpn = search.read_vpn_file()
+    current = _search_settings() if vpn is not None or not only_vpn else None
+    if current is not None and not current["vpn"]:
+        vpn = None
     steps = []
     if not only_vpn:
-        settings = search.service_settings(_search_settings())
+        settings = search.service_settings(current)
         token = search.read_token_file()
         steps.append((["put", search.SETTINGS_FILE_NAME], json.dumps(settings) + "\n"))
         steps.append((["put", search.TOKEN_FILE_NAME], token) if token is not None
@@ -24129,11 +24169,12 @@ def _search_up(progress) -> None:
     _search_settings()                  # a damaged settings file refuses first
     search.read_token_file()            # so does a damaged token file
     search.read_vpn_file()              # and a damaged VPN configuration
+    vpn_wanted = _search_vpn_wanted()
     if not dist_present(DEFAULT_AGENT):
         raise search.SearchError("the Claude download is not on this computer; pull "
                                  "it under Host → Software, then turn the search "
                                  "service on")
-    _search_list_ready()
+    _search_list_ready(vpn=vpn_wanted)
     try:
         search.set_on(True)
     except OSError as e:
@@ -24200,6 +24241,9 @@ def _search_up(progress) -> None:
         _mcp_change(change, blocking=True, deadline=None)
     except ValidationError as e:
         raise search.SearchError(str(e)) from None
+    # The VPN version's entry, by the settings and the VPN file as they are
+    # now (a change since the check above is the next save's to apply).
+    _search_vpn_entry(_search_vpn_wanted(), blocking=True, deadline=None)
 
 
 def search_on(progress=None) -> dict:
@@ -24246,15 +24290,17 @@ def _search_drop_network(name: str, deadline: float | None) -> None:
 
 
 def search_off(*, blocking: bool = True, deadline: float | None = None) -> dict:
-    """Turn the search service off: its gateway entry (only when it is RS's —
-    which also unwires it everywhere), the container (every running search
-    ends with it) and both networks go; the inner Docker's volume (the staged
+    """Turn the search service off: its gateway entries, `search-vpn` and
+    `search` (each only when it is RS's — which also unwires it everywhere),
+    the container (every running search ends with it) and both networks go; the inner Docker's volume (the staged
     images), the conversations' volume, the settings and the token stay, so
     turning it on again finds them. Bounded by `deadline` on the broker; idempotent, so a refusal
     half-way is finished by running it again."""
     try:
-        mcp_server_remove(McpServerNameRequest(name=search.MCP_SERVER_NAME),
-                          blocking=blocking, deadline=deadline, if_url=search.MCP_URL)
+        for name, url in ((search.MCP_VPN_SERVER_NAME, search.MCP_VPN_URL),
+                          (search.MCP_SERVER_NAME, search.MCP_URL)):
+            mcp_server_remove(McpServerNameRequest(name=name), blocking=blocking,
+                              deadline=deadline, if_url=url)
         try:
             search.set_on(False)
         except OSError as e:
@@ -24276,14 +24322,15 @@ def search_off(*, blocking: bool = True, deadline: float | None = None) -> dict:
 
 def search_status(deadline: float | None = None) -> dict:
     """What the Search page shows: on or off, the container's state and
-    whether it runs this installation's version, the gateway entry, whether a
+    whether it runs this installation's version, the gateway entries (`search`
+    as mcp_entry, `search-vpn` as vpn_entry), whether a
     sign-in is stored (never its value), the settings, the staged images, the
     searches by state. Cheap and bounded: ONE deadline, taken first, shared by
     every docker call. Never raises for a state it can name."""
     deadline = _mcp_deadline() if deadline is None else deadline
     out: dict[str, Any] = {"on": search.is_on(), "container": "absent", "current": False,
                            "searxng_version": None, "mcp_entry": "absent",
-                           "credential": "absent", "settings": None, "answering": None,
+                           "vpn_entry": "absent", "credential": "absent", "settings": None, "answering": None,
                            "images": None, "searxng": None, "searches": None,
                            "error": None}
     errors: list[str] = []
@@ -24305,8 +24352,14 @@ def search_status(deadline: float | None = None) -> dict:
     state, data, _why = mcp_servers.read()
     if state != mcp_servers.OK:
         out["mcp_entry"] = "unreadable"
-    elif search.MCP_SERVER_NAME in data["servers"]:
-        out["mcp_entry"] = "conflict" if search.gateway_entry_conflict(data) else "listed"
+    else:
+        for key, name in (("mcp_entry", search.MCP_SERVER_NAME),
+                          ("vpn_entry", search.MCP_VPN_SERVER_NAME)):
+            if name in data["servers"]:
+                out[key] = ("conflict" if search.gateway_entry_conflict(data, name)
+                            else "listed")
+    if state != mcp_servers.OK:
+        out["vpn_entry"] = "unreadable"
     try:
         cstate, labels = _search_container(deadline)
         out["container"] = cstate
@@ -24374,33 +24427,43 @@ class SearchTokenRequest:
 
 @dataclass(frozen=True)
 class SearchSettingsRequest:
-    # The searchers (search.SEARCHER_KEYS each, fresh copies), searches at
-    # once (for all of them together), the contact, the recent list's length
-    # and the sidebar switch: the whole record, saved whole.
-    searchers: list
+    name: str
+    model: str
+    effort: str
     at_once: int
     contact: str
     recent: int
     sidebar: bool
+    # {"browser": bool, "stealth": bool} (search.TIER_NAMES), a fresh copy.
+    tiers: dict
+    # The VPN version (the `search-vpn` server) on or off.
+    vpn: bool
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "SearchSettingsRequest":
-        missing = [k for k in ("searchers", "at_once", "contact", "recent", "sidebar")
-                   if k not in kw]
+        missing = [k for k in ("name", "model", "effort", "at_once", "contact", "recent",
+                               "sidebar", "tiers", "vpn") if k not in kw]
         if missing:
-            raise ValidationError(f"the search settings need {', '.join(missing)}")
-        for problem in (search.at_once_problem(kw["at_once"]),
+            raise ValidationError(f"the searcher needs {', '.join(missing)}")
+        for problem in (search.searcher_name_problem(kw["name"]),
+                        search.at_once_problem(kw["at_once"]),
                         search.contact_problem(kw["contact"]),
                         search.recent_problem(kw["recent"]),
                         search.sidebar_problem(kw["sidebar"]),
-                        search.searchers_problem(kw["searchers"], _search_model_ok)):
+                        search.tiers_problem(kw["tiers"]),
+                        search.vpn_problem(kw["vpn"])):
             if problem:
                 raise ValidationError(problem)
-        return cls(searchers=[{"name": x["name"], "model": x["model"], "effort": x["effort"],
-                               "tiers": {t: x["tiers"][t] for t in search.TIER_NAMES},
-                               "vpn": x["vpn"]} for x in kw["searchers"]],
-                   at_once=kw["at_once"], contact=kw["contact"].strip(), recent=kw["recent"],
-                   sidebar=kw["sidebar"])
+        model, effort = kw["model"], kw["effort"]
+        if not isinstance(model, str) or not isinstance(effort, str):
+            raise ValidationError("the model and the effort must be text")
+        problem = _search_model_ok(model, effort)
+        if problem:
+            raise ValidationError(problem)
+        return cls(name=kw["name"], model=model, effort=effort, at_once=kw["at_once"],
+                   contact=kw["contact"].strip(), recent=kw["recent"],
+                   sidebar=kw["sidebar"],
+                   tiers={t: kw["tiers"][t] for t in search.TIER_NAMES}, vpn=kw["vpn"])
 
 
 def search_token_set(req: SearchTokenRequest, *, blocking: bool = True,
@@ -24459,24 +24522,37 @@ def search_settings_get() -> dict:
 
 def search_settings_set(req: SearchSettingsRequest, *, blocking: bool = True,
                         deadline: float | None = None) -> dict:
-    """Save the whole record, every searcher (replacing a damaged file too:
-    the page sends every field), and hand it to a running service. A VPN
-    searcher needs a stored VPN configuration."""
+    """Save the whole searcher (replacing a damaged file too: the page sends
+    every field) and hand it to a running service. The VPN version follows
+    the tick: ticked with a VPN configuration stored (and the service on),
+    `search-vpn` is listed and the service runs its gateway; unticked, both
+    go. Ticking it with no configuration stored is saved as it is (the page
+    then asks for one)."""
     deadline = _mcp_deadline() if deadline is None and not blocking else deadline
     data = {"version": search.SETTINGS_VERSION,
-            "searchers": [dict(x, tiers=dict(x["tiers"])) for x in req.searchers],
-            "at_once": req.at_once, "contact": req.contact, "recent": req.recent,
-            "sidebar": req.sidebar}
+            "searcher": {"name": req.name, "model": req.model, "effort": req.effort,
+                         "at_once": req.at_once, "tiers": dict(req.tiers)},
+            "contact": req.contact, "recent": req.recent, "sidebar": req.sidebar,
+            "vpn": req.vpn}
     try:
         with _search_lock(blocking):
-            if any(x["vpn"] for x in data["searchers"]) and search.read_vpn_file() is None:
-                raise search.SearchError(search.SEARCHERS_NO_VPN)
+            try:
+                was_vpn = _search_settings()["vpn"]
+            except search.SearchError:
+                was_vpn = None              # a damaged record is replaced
+            want = search.is_on() and req.vpn and search.read_vpn_file() is not None
+            if want:
+                _search_list_ready(vpn=True)        # another `search-vpn` refuses the save
             try:
                 search.write_settings(data)
             except OSError as e:
                 raise search.SearchError("cannot save the search settings on the host "
                                          f"({e.strerror or 'write failed'})") from None
         out = _search_deliver_if_running(deadline)
+        if out["delivered"] and was_vpn != req.vpn:
+            _search_tunnel(deadline, apply=True)    # the gateway up, or gone
+        if search.is_on():
+            _search_vpn_entry(want, blocking=blocking, deadline=deadline)
     except search.SearchError as e:
         raise ValidationError(str(e)) from None
     return {"settings": data, **out}
@@ -24511,7 +24587,9 @@ def search_clear(deadline: float | None = None) -> dict:
 SEARCH_VPN_ONE_FORM = ("give the VPN configuration either as the configuration file or "
                        "as its fields, not both")
 SEARCH_VPN_NONE_GIVEN = "give the VPN configuration as the configuration file or as its fields"
-SEARCH_VPN_IN_USE = "remove the VPN searchers first"
+# A VPN configuration stored while the VPN version is unticked: the service
+# holds no key and runs no gateway.
+SEARCH_VPN_UNTICKED = "the VPN version is off (Enable the VPN version turns it on)"
 # The tunnel's states as the service reports them (service.py — MIRROR).
 _SEARCH_TUNNEL_STATES = ("up", "down", "off")
 
@@ -24575,6 +24653,14 @@ def _search_tunnel(deadline: float | None, apply: bool) -> dict:
             "error": None if err is None else err[:_SEARCH_REASON_MAX]}
 
 
+def _search_tunnel_shown(record: dict | None, deadline: float | None, apply: bool) -> dict:
+    """The tunnel as the page shows it: off (and why) while the VPN version
+    is unticked with a configuration stored, else as the service sees it."""
+    if record is not None and not _search_settings()["vpn"]:
+        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_VPN_UNTICKED}
+    return _search_tunnel(deadline, apply=apply)
+
+
 def _search_vpn_reply(record: dict | None, tunnel: dict) -> dict:
     pub = search.vpn_public(record)
     return {"configured": pub["configured"], "endpoint": pub["endpoint"],
@@ -24594,7 +24680,7 @@ def search_vpn(deadline: float | None = None) -> dict:
         return dict(_search_vpn_reply(None, {"tunnel": "off", "handshake_s": None,
                                              "error": str(e)}))
     try:
-        tunnel = _search_tunnel(deadline, apply=False)
+        tunnel = _search_tunnel_shown(record, deadline, apply=False)
     except search.SearchError as e:
         tunnel = {"tunnel": "off", "handshake_s": None, "error": str(e)}
     return _search_vpn_reply(record, tunnel)
@@ -24604,11 +24690,16 @@ def search_vpn_set(req: SearchVpnRequest, *, blocking: bool = True,
                    deadline: float | None = None) -> dict:
     """Store the VPN configuration (0600; a damaged one is replaced), move the
     service's router destination to its server, hand it to a running service
-    (which brings its gateway's tunnel up) and answer the VPN's status."""
+    (which brings its gateway's tunnel up while the VPN version is ticked),
+    list `search-vpn` when the VPN version is ticked and the service is on,
+    and answer the VPN's status."""
     deadline = _mcp_deadline() if deadline is None and not blocking else deadline
     try:
         record = _search_vpn_resolve(req.record)
         with _search_lock(blocking):
+            want = search.is_on() and _search_settings()["vpn"]
+            if want:
+                _search_list_ready(vpn=True)        # another `search-vpn` refuses the store
             try:
                 old = search.read_vpn_file()
             except search.SearchError:
@@ -24622,21 +24713,23 @@ def search_vpn_set(req: SearchVpnRequest, *, blocking: bool = True,
         state, labels = _search_container(deadline)
         if state == "running" and labels.get(search.OWNER_LABEL) == search.OWNER_VALUE:
             _search_deliver(deadline, only_vpn=True)
-        tunnel = _search_tunnel(deadline, apply=True)
+        tunnel = _search_tunnel_shown(record, deadline, apply=True)
+        if want:
+            _search_vpn_entry(True, blocking=blocking, deadline=deadline)
     except search.SearchError as e:
         raise ValidationError(str(e)) from None
     return _search_vpn_reply(record, tunnel)
 
 
 def search_vpn_clear(*, blocking: bool = True, deadline: float | None = None) -> dict:
-    """Remove the VPN configuration from the host, the router and a running
-    service (whose gateway goes with it). Refused while a searcher searches
-    through the VPN."""
+    """Remove the VPN configuration: `search-vpn` goes from the gateway's
+    list first (unwired everywhere), then the configuration from the host,
+    the router and a running service (whose gateway goes with it). The VPN
+    version's tick is kept as saved."""
     deadline = _mcp_deadline() if deadline is None and not blocking else deadline
     try:
+        _search_vpn_entry(False, blocking=blocking, deadline=deadline)
         with _search_lock(blocking):
-            if any(x["vpn"] for x in _search_settings()["searchers"]):
-                raise search.SearchError(SEARCH_VPN_IN_USE)
             try:
                 old = search.read_vpn_file()
             except search.SearchError:
@@ -24809,6 +24902,7 @@ def search_list(deadline: float | None = None) -> dict:
             "consumer": _search_reply_str(s.get("consumer"), _SEARCH_NAME_MAX),
             "question": _search_reply_str(s.get("question"), _SEARCH_LIST_QUESTION_MAX),
             "searcher": _search_reply_str(s.get("searcher"), _SEARCH_NAME_MAX),
+            "vpn": _search_reply_bool(s.get("vpn")),
             "state": _search_reply_choice(s.get("state"), _SEARCH_ACTIVE_STATES),
             "waited_s": _search_reply_int(s.get("waited_s")),
             "ran_s": _search_reply_int(s.get("ran_s")),
@@ -24822,6 +24916,7 @@ def search_list(deadline: float | None = None) -> dict:
             "consumer": _search_reply_str(s.get("consumer"), _SEARCH_NAME_MAX),
             "question": _search_reply_str(s.get("question"), _SEARCH_LIST_QUESTION_MAX),
             "searcher": _search_reply_str(s.get("searcher"), _SEARCH_NAME_MAX),
+            "vpn": _search_reply_bool(s.get("vpn")),
             "state": _search_reply_choice(s.get("state"), _SEARCH_ENDED_STATES),
             "reason": _search_reply_str(s.get("reason"), _SEARCH_RECENT_REASON_MAX),
             "ended_at": _search_reply_ts(s.get("ended_at")),
@@ -24865,6 +24960,7 @@ def search_view(req: SearchIdRequest, deadline: float | None = None) -> dict:
             "state": _search_reply_choice(v.get("state"), _SEARCH_STATES),
             "question": _search_reply_str(v.get("question"), _SEARCH_QUESTION_MAX),
             "searcher": _search_reply_str(v.get("searcher"), _SEARCH_NAME_MAX),
+            "vpn": _search_reply_bool(v.get("vpn")),
             "tokens": _search_reply_int(v.get("tokens")),
             "waited_s": _search_reply_int(v.get("waited_s")),
             "ran_s": _search_reply_int(v.get("ran_s")),
@@ -24941,6 +25037,7 @@ def search_report(req: SearchIdRequest, deadline: float | None = None) -> dict:
             "state": _search_reply_choice(v.get("state"), _SEARCH_STATES),
             "question": _search_reply_str(v.get("question"), _SEARCH_QUESTION_MAX),
             "searcher": _search_reply_str(v.get("searcher"), _SEARCH_NAME_MAX),
+            "vpn": _search_reply_bool(v.get("vpn")),
             "summary": _search_report_text(v.get("summary")),
             "sources": _search_report_items(v.get("sources"), _SEARCH_SOURCE_FIELDS),
             "tiers": _search_report_items(v.get("tiers"), _SEARCH_TIER_FIELDS)}
@@ -24986,6 +25083,9 @@ def search_test(deadline: float | None = None) -> dict:
 
 SEARCH_NO_CONVERSATION = "no conversation with that id is kept"   # service.py NO_SUCH_CONVERSATION
 SEARCH_EMPTY_QUESTION = "the question is empty"
+SEARCH_ASK_NO_VPN = ("the VPN version of the search service is not on: tick Enable the VPN "
+                     "version and store a VPN configuration under Settings, or ask without "
+                     "Through the VPN")
 
 
 @dataclass(frozen=True)
@@ -24996,9 +25096,8 @@ class SearchAskRequest:
     question: str
     conversation: str | None
     include: bool
-    # The searcher asked, by name; None: the first that does not search
-    # through the VPN (the service picks it).
-    searcher: str | None = None
+    # Through the VPN version (`search-vpn`'s searches) or not.
+    vpn: bool = False
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "SearchAskRequest":
@@ -25015,13 +25114,10 @@ class SearchAskRequest:
         include = kw.get("include")
         if not isinstance(include, bool):
             raise ValidationError("including the conversation is either on or off")
-        searcher = kw.get("searcher")
-        if searcher is not None:
-            problem = search.searcher_name_problem(searcher)
-            if problem:
-                raise ValidationError(problem)
-        return cls(question=question.strip(), conversation=cid, include=include,
-                   searcher=searcher)
+        vpn = kw.get("vpn", False)
+        if not isinstance(vpn, bool):
+            raise ValidationError("asking through the VPN is either on or off")
+        return cls(question=question.strip(), conversation=cid, include=include, vpn=vpn)
 
 
 @dataclass(frozen=True)
@@ -25047,11 +25143,18 @@ def _search_refusal(refusal: Any, fallback: str) -> ValidationError:
 
 def search_ask(req: SearchAskRequest, deadline: float | None = None) -> dict:
     """Ask the searcher a question from the Search page: it waits in the same
-    queue as the agents' searches and runs like one. {"conversation", "ask",
-    "state": "queued"}."""
+    queue as the agents' searches and runs like one (`vpn`: as a search of
+    `search-vpn`, refused while the VPN version is not on with a VPN
+    configuration stored). {"conversation", "ask", "state": "queued"}."""
     deadline = _mcp_deadline() if deadline is None else deadline
+    if req.vpn:
+        try:
+            if not _search_vpn_wanted():
+                raise ValidationError(SEARCH_ASK_NO_VPN)
+        except search.SearchError as e:
+            raise ValidationError(str(e)) from None
     body = json.dumps({"question": req.question, "conversation": req.conversation,
-                       "include": req.include, "searcher": req.searcher}, ensure_ascii=False)
+                       "include": req.include, "vpn": req.vpn}, ensure_ascii=False)
     how, out = _search_ask(["ask"], deadline, body=body)
     if how == "refused":
         raise _search_refusal(out, SEARCH_NO_ANSWER)
@@ -25098,7 +25201,7 @@ def _search_ask_row(raw: Any) -> dict:
     work = [_search_work_entry(e) for e in work]
     return {"id": _search_reply_id(a.get("id")),
             "question": _search_reply_str(a.get("question"), _SEARCH_QUESTION_MAX),
-            "searcher": _search_reply_str(a.get("searcher"), _SEARCH_NAME_MAX),
+            "vpn": _search_reply_bool(a.get("vpn")),
             "state": state,
             "waited_s": _search_reply_int(a.get("waited_s")),
             "ran_s": _search_reply_int(a.get("ran_s")),

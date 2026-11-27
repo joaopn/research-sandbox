@@ -676,7 +676,7 @@ def _verb_search_vpn_set(args: dict, _progress=None) -> dict:
 
 
 def _verb_search_vpn_clear(_args: dict, _progress=None) -> dict:
-    """Remove the VPN configuration (refused while a VPN searcher exists)."""
+    """Remove the VPN configuration (and the `search-vpn` server with it)."""
     deadline = rscore._mcp_deadline()
     _search_not_turning_on()
     return rscore.search_vpn_clear(blocking=False, deadline=deadline)
@@ -728,7 +728,7 @@ def _verb_search_test(_args: dict, _progress=None) -> dict:
 def _verb_search_ask(args: dict, _progress=None) -> dict:
     """The operator's question (Quick Search): a search in the same queue as the
     agents' (fields `question`, `conversation`, `include`, and optionally
-    `searcher`)."""
+    `vpn`)."""
     deadline = rscore._mcp_deadline()
     _search_not_turning_on()
     safe = {k: v for k, v in args.items() if k in SEARCH_ASK_WEBUI_FIELDS}
@@ -1637,11 +1637,10 @@ MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 # The search service's sign-in: the long-lived token `claude setup-token`
 # prints (a SECRET: repr=False on the request, never in a result or a log).
 SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
-# The searchers (each its name, model, effort, browser tiers and VPN flag),
-# searches at once, the contact address, the recent list and the sidebar
-# switch, saved whole.
-SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"searchers", "at_once", "contact", "recent",
-                                          "sidebar"})
+# The one searcher, the contact address, the recent list, the sidebar switch
+# and the VPN version's tick, saved whole.
+SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact",
+                                          "recent", "sidebar", "tiers", "vpn"})
 # The VPN configuration: the provider's file as text, OR its fields typed by
 # hand (an object). Both hold the tunnel's private key (a SECRET: repr=False
 # on the request, never in a result or a log).
@@ -1650,8 +1649,9 @@ SEARCH_VPN_WEBUI_FIELDS = frozenset({"config", "manual"})
 # by its id.
 SEARCH_ID_WEBUI_FIELDS = frozenset({"id"})
 # The operator's question from the Search page: the text, the conversation it
-# continues (or null for a new one), and whether to include that conversation.
-SEARCH_ASK_WEBUI_FIELDS = frozenset({"question", "conversation", "include", "searcher"})
+# continues (or null for a new one), whether to include that conversation, and
+# whether to ask it through the VPN version.
+SEARCH_ASK_WEBUI_FIELDS = frozenset({"question", "conversation", "include", "vpn"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # Put one version pin back to the shipped value (the Host → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is

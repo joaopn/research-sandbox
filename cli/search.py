@@ -25,16 +25,20 @@ installation, turned on by the operator (Services → Search):
 
 Each search runs inside the service's inner Docker in containers made for it
 alone (container/search/service.py). The service is offered to agents as the
-MCP gateway server ``search``; the gateway passes the caller's project and
-consumer on to it (CALLER_HEADER) and to no other server.
+MCP gateway server ``search`` and, while the VPN version is on and a VPN
+configuration is stored, as a second server ``search-vpn`` (the same tools at
+a second path, whose searches reach sites only through the VPN); each is wired
+to projects on its own. The gateway passes the caller's project and consumer
+on to these two (CALLER_HEADER) and to no other server.
 
 Host state lives under ``~/.research-sandbox/search/`` (never mounted into a
-container): the "on" record, the searchers' settings, the long-lived Claude
+container): the "on" record, the searcher's settings, the long-lived Claude
 token (0600) and the VPN configuration (0600, it holds the tunnel's private
-key). The settings, the token and the VPN configuration reach the service
-over a `docker exec` stdin, into a tmpfs only root in the service reads, at
-every start and at every change; the VPN configuration goes on from there
-only to the service's VPN gateway, over stdin again.
+key). The settings, the token and (while the VPN version is on) the VPN
+configuration reach the service over a `docker exec` stdin, into a tmpfs only
+root in the service reads, at every start and at every change; the VPN
+configuration goes on from there only to the service's VPN gateway, over
+stdin again.
 
 The lifecycle (on / off / status / resume at `research start`) lives in
 rscore; this module decides names, the container's exact shape, and the
@@ -69,8 +73,8 @@ BROWSER_IMAGE = "rs-search-browser:latest"
 STEALTH_IMAGE = "rs-search-stealth:latest"
 # The VPN gateway's image (container/search/Dockerfile.vpn: WireGuard's tools,
 # iproute2 and iptables on Alpine), built and staged the same way. The service
-# runs one container of it while a VPN configuration is stored (the gateway
-# VPN searches route through), and one-shot containers of it that set a VPN
+# runs one container of it while the VPN version is on with a VPN configuration
+# stored (the gateway VPN searches route through), and one-shot containers of it that set a VPN
 # search's sidecars' route.
 VPN_IMAGE = "rs-search-vpn:latest"
 # Every search image the host builds from this tree, with its Dockerfile (in
@@ -105,9 +109,12 @@ OWNER_VALUE = "1"
 SEARXNG_LABEL = "research.search.searxng"
 IMAGE_LABEL = "research.search.image"          # the service image's content identity
 
-# The caller-facing server (the MCP endpoint and the file route below it).
+# The caller-facing server (the MCP endpoint and the file route below it):
+# normal searches at MCP_PATH, VPN searches at MCP_VPN_PATH (service.py —
+# MIRRORS).
 SERVICE_PORT = 8080
 MCP_PATH = "/mcp"
+MCP_VPN_PATH = "/mcp-vpn"
 
 # The MCP gateway entry RS keeps for it (an ordinary entry of the server list;
 # RS recognises its own by the address, as it does Aldine's).
@@ -115,6 +122,16 @@ MCP_SERVER_NAME = "search"
 MCP_URL = f"http://{SERVICE_CONTAINER}:{SERVICE_PORT}{MCP_PATH}"
 MCP_DESCRIPTION = ("RS's search service: hand over a question, collect a "
                    "written answer with its sources and files")
+# The VPN version's entry: listed while the service is on, the VPN version is
+# ticked and a VPN configuration is stored; taken off when any of the three
+# stops holding.
+MCP_VPN_SERVER_NAME = "search-vpn"
+MCP_VPN_URL = f"http://{SERVICE_CONTAINER}:{SERVICE_PORT}{MCP_VPN_PATH}"
+MCP_VPN_DESCRIPTION = ("RS's search service through a VPN: the same as search, with "
+                       "every site reached from the VPN's address")
+# RS's own entries, each at exactly its address.
+RS_ENTRIES = {MCP_SERVER_NAME: (MCP_URL, MCP_DESCRIPTION),
+              MCP_VPN_SERVER_NAME: (MCP_VPN_URL, MCP_VPN_DESCRIPTION)}
 # The gateway sets this header (`<project>/<consumer>`) on requests to an
 # entry the rendered list marks with PASS_CALLER_KEY, strips it from every
 # caller's request to every server, and sends it to no other server. MIRROR
@@ -205,10 +222,7 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # --- the searcher ------------------------------------------------------------------
 
-# 2: a list of searchers, with searches at once beside them. A record of
-# version 1 (one `searcher`, which held `at_once`) reads as that one searcher.
-SETTINGS_VERSION = 2
-SETTINGS_VERSION_ONE_SEARCHER = 1
+SETTINGS_VERSION = 1
 # A searcher's name: what a caller names in its submit. The server-name rule
 # (a lowercase letter, then lowercase letters, digits and dashes).
 SEARCHER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -265,9 +279,6 @@ _CONTACT_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 # and the searcher tries them only after the plain tier failed. A settings
 # file saved before the setting existed reads as both on.
 TIER_NAMES = ("browser", "stealth")
-# What a searcher is: its name, model and effort, its browser tiers and
-# whether its searches reach sites through the VPN.
-SEARCHER_KEYS = ("name", "model", "effort", "tiers", "vpn")
 
 
 class SearchError(Exception):
@@ -393,29 +404,41 @@ CONFLICT_TEXT = (
     "so the search service cannot be added under that name; rename or remove "
     "that server under Services → MCP and turn the search service on again "
     "under Services → Search")
+CONFLICT_VPN_TEXT = (
+    "the MCP server list already has a server named {name} at another address, "
+    "so the VPN version of the search service cannot be added under that name; "
+    "rename or remove that server under Services → MCP and save the search "
+    "settings again under Services → Search")
+
+
+def conflict_text(name: str) -> str:
+    return (CONFLICT_VPN_TEXT if name == MCP_VPN_SERVER_NAME else CONFLICT_TEXT).format(
+        name=name)
 
 
 def is_rs_entry(name: str, entry: Any) -> bool:
-    """Whether (name, entry) of the server list is RS's own search entry: the
-    name, an address entry (not a server RS runs) at exactly RS's address."""
-    return (name == MCP_SERVER_NAME and isinstance(entry, dict)
-            and "run" not in entry and entry.get("url") == MCP_URL)
+    """Whether (name, entry) of the server list is one of RS's own search
+    entries: `search` or `search-vpn`, an address entry (not a server RS
+    runs) at exactly that name's address."""
+    return (name in RS_ENTRIES and isinstance(entry, dict)
+            and "run" not in entry and entry.get("url") == RS_ENTRIES[name][0])
 
 
-def gateway_entry_conflict(data: dict[str, Any]) -> bool:
-    """True when the list holds a `search` entry that is not RS's."""
-    entry = data["servers"].get(MCP_SERVER_NAME)
-    return entry is not None and not is_rs_entry(MCP_SERVER_NAME, entry)
+def gateway_entry_conflict(data: dict[str, Any], name: str = MCP_SERVER_NAME) -> bool:
+    """True when the list holds an entry of that name (`search` or
+    `search-vpn`) that is not RS's."""
+    entry = data["servers"].get(name)
+    return entry is not None and not is_rs_entry(name, entry)
 
 
-def apply_gateway_entry(data: dict[str, Any]) -> None:
-    """Put RS's search entry into a loaded server list (in place). RS's own
-    entry is kept as it is; any other `search` is a conflict (SearchError)
-    and the list is left untouched."""
-    if gateway_entry_conflict(data):
-        raise SearchError(CONFLICT_TEXT.format(name=MCP_SERVER_NAME))
-    data["servers"].setdefault(MCP_SERVER_NAME, {"url": MCP_URL,
-                                                 "description": MCP_DESCRIPTION})
+def apply_gateway_entry(data: dict[str, Any], name: str = MCP_SERVER_NAME) -> None:
+    """Put RS's entry of that name into a loaded server list (in place). RS's
+    own entry is kept as it is; any other of that name is a conflict
+    (SearchError) and the list is left untouched."""
+    if gateway_entry_conflict(data, name):
+        raise SearchError(conflict_text(name))
+    url, description = RS_ENTRIES[name]
+    data["servers"].setdefault(name, {"url": url, "description": description})
 
 
 # --- settings (pure) -----------------------------------------------------------------
@@ -424,15 +447,12 @@ def default_tiers() -> dict[str, bool]:
     return {t: True for t in TIER_NAMES}
 
 
-def default_searcher() -> dict[str, Any]:
-    return {"name": DEFAULT_SEARCHER_NAME, "model": DEFAULT_MODEL, "effort": DEFAULT_EFFORT,
-            "tiers": default_tiers(), "vpn": False}
-
-
 def default_settings() -> dict[str, Any]:
-    return {"version": SETTINGS_VERSION, "searchers": [default_searcher()],
-            "at_once": DEFAULT_AT_ONCE, "contact": "", "recent": DEFAULT_RECENT,
-            "sidebar": False}
+    return {"version": SETTINGS_VERSION,
+            "searcher": {"name": DEFAULT_SEARCHER_NAME, "model": DEFAULT_MODEL,
+                         "effort": DEFAULT_EFFORT, "at_once": DEFAULT_AT_ONCE,
+                         "tiers": default_tiers()},
+            "contact": "", "recent": DEFAULT_RECENT, "sidebar": False, "vpn": False}
 
 
 def tiers_problem(value: Any) -> str | None:
@@ -470,6 +490,12 @@ def sidebar_problem(value: Any) -> str | None:
     return None
 
 
+def vpn_problem(value: Any) -> str | None:
+    if not isinstance(value, bool):
+        return "the VPN version of the search service is either on or off"
+    return None
+
+
 def contact_problem(value: Any) -> str | None:
     if not isinstance(value, str):
         return "the contact address must be text"
@@ -479,89 +505,40 @@ def contact_problem(value: Any) -> str | None:
     return None
 
 
-SEARCHERS_EMPTY = "there must be at least one searcher"
-SEARCHERS_NO_NORMAL = ("at least one searcher must search from this installation's own "
-                       "address (not through the VPN)")
-SEARCHERS_NO_VPN = "store a VPN configuration under VPN first"
-
-
-def searchers_problem(value: Any, model_ok) -> str | None:
-    """Why `value` is not a valid list of searchers, or None: at least one,
-    each with every key of SEARCHER_KEYS, names of the name rule and each
-    once, at least one that does not search through the VPN, and a model and
-    effort the catalog offers (`model_ok`)."""
-    if not isinstance(value, list) or not value:
-        return SEARCHERS_EMPTY
-    names: list[str] = []
-    for s in value:
-        if not isinstance(s, dict) or set(s) != set(SEARCHER_KEYS):
-            return ("each searcher has a name, a model, an effort, its browser tiers "
-                    "and whether it searches through the VPN, and nothing else")
-        for problem in (searcher_name_problem(s["name"]), tiers_problem(s["tiers"])):
-            if problem:
-                return problem
-        if not isinstance(s["vpn"], bool):
-            return "a searcher either searches through the VPN or not"
-        if not isinstance(s["model"], str) or not isinstance(s["effort"], str):
-            return "a searcher's model and effort must be text"
-        problem = model_ok(s["model"], s["effort"])
-        if problem:
-            return f"the searcher {s['name']}: {problem}"
-        names.append(s["name"])
-    if len(set(names)) != len(names):
-        dup = next(n for n in names if names.count(n) > 1)
-        return f"two searchers are named {dup}; each searcher needs its own name"
-    if all(s["vpn"] for s in value):
-        return SEARCHERS_NO_NORMAL
-    return None
-
-
-def _from_one_searcher(data: Any) -> dict[str, Any] | None:
-    """A version-1 record (one `searcher` holding `at_once`, saved before the
-    list of searchers) as the version-2 shape, or None when it is not one RS
-    wrote. Its searcher keeps its fields and searches from this
-    installation's address; a searcher without `tiers`, a record without
-    `recent` or `sidebar` were saved before those settings existed."""
-    if not isinstance(data, dict) \
-            or set(data) - {"recent", "sidebar"} != {"version", "searcher", "contact"}:
-        return None
-    s = data["searcher"]
-    if not isinstance(s, dict) or set(s) - {"tiers"} != {"name", "model", "effort", "at_once"}:
-        return None
-    out = {"version": SETTINGS_VERSION,
-           "searchers": [{"name": s["name"], "model": s["model"], "effort": s["effort"],
-                          "tiers": s.get("tiers", default_tiers()), "vpn": False}],
-           "at_once": s["at_once"], "contact": data["contact"]}
-    for k in ("recent", "sidebar"):
-        if k in data:
-            out[k] = data[k]
-    return out
-
-
 def settings_problem(data: Any, model_ok) -> str | None:
-    """Why `data` (the version-2 shape) is not a valid settings record, or
-    None. `model_ok(model, effort)` is the catalog's check (rscore passes it
-    in: this module does not import the model catalog)."""
-    if not isinstance(data, dict) or set(data) != {"version", "searchers", "at_once",
-                                                   "contact", "recent", "sidebar"}:
+    """Why `data` is not a valid settings record, or None. `model_ok(model,
+    effort)` is the catalog's check (rscore passes it in: this module does
+    not import the model catalog). A record without `recent`, `sidebar` or
+    `vpn`, or a searcher without `tiers`, is valid: it was saved before that
+    setting existed (read_settings fills the default)."""
+    if not isinstance(data, dict) \
+            or set(data) - {"recent", "sidebar", "vpn"} != {"version", "searcher", "contact"}:
         return "it does not have the expected shape"
     if data["version"] != SETTINGS_VERSION or isinstance(data["version"], bool):
         return "it was written by another version of RS"
-    for problem in (at_once_problem(data["at_once"]), contact_problem(data["contact"]),
-                    recent_problem(data["recent"]), sidebar_problem(data["sidebar"])):
+    s = data["searcher"]
+    if not isinstance(s, dict) or set(s) - {"tiers"} != {"name", "model", "effort", "at_once"}:
+        return "its searcher does not have the expected shape"
+    for problem in (searcher_name_problem(s["name"]), at_once_problem(s["at_once"]),
+                    tiers_problem(s["tiers"]) if "tiers" in s else None,
+                    contact_problem(data["contact"]),
+                    recent_problem(data["recent"]) if "recent" in data else None,
+                    sidebar_problem(data["sidebar"]) if "sidebar" in data else None,
+                    vpn_problem(data["vpn"]) if "vpn" in data else None):
         if problem:
             return problem
-    return searchers_problem(data["searchers"], model_ok)
+    if not isinstance(s["model"], str) or not isinstance(s["effort"], str):
+        return "its model and effort must be text"
+    return model_ok(s["model"], s["effort"])
 
 
 SETTINGS_DAMAGED = ("the search settings kept on the host cannot be used ({why}); "
-                    "save the searchers again on the Search page to replace them")
+                    "save the searcher again on the Search page to replace them")
 
 
 def read_settings(model_ok, path: Path | None = None) -> dict[str, Any]:
-    """The settings (the defaults when none were saved), in the version-2
-    shape: a record saved with one searcher reads as that searcher. SearchError
-    when the file is there but unreadable or not one RS wrote."""
+    """The settings (the defaults when none were saved). SearchError when the
+    file is there but unreadable or not one RS wrote."""
     path = SETTINGS_PATH if path is None else path
     try:
         raw = path.read_bytes()
@@ -574,32 +551,23 @@ def read_settings(model_ok, path: Path | None = None) -> dict[str, Any]:
         data = json.loads(raw)
     except (ValueError, RecursionError):
         raise SearchError(SETTINGS_DAMAGED.format(why="it is not valid JSON")) from None
-    if isinstance(data, dict) and data.get("version") == SETTINGS_VERSION_ONE_SEARCHER \
-            and not isinstance(data.get("version"), bool):
-        converted = _from_one_searcher(data)
-        if converted is None:
-            raise SearchError(SETTINGS_DAMAGED.format(
-                why="its searcher does not have the expected shape"))
-        converted.setdefault("recent", DEFAULT_RECENT)  # saved before the setting existed
-        converted.setdefault("sidebar", False)          # likewise
-        data = converted
     problem = settings_problem(data, model_ok)
     if problem:
         raise SearchError(SETTINGS_DAMAGED.format(why=problem))
+    data.setdefault("recent", DEFAULT_RECENT)       # saved before the setting existed
+    data.setdefault("sidebar", False)               # likewise
+    data.setdefault("vpn", False)                   # likewise
+    data["searcher"].setdefault("tiers", default_tiers())     # likewise
     return data
 
 
-def first_normal_searcher(data: dict[str, Any]) -> dict[str, Any]:
-    """The searcher a question goes to when none is named: the first one
-    that does not search through the VPN (a valid record has one)."""
-    return next(s for s in data["searchers"] if not s["vpn"])
-
-
 def service_settings(data: dict[str, Any]) -> dict[str, Any]:
-    """What the service is handed: the settings with the contact filled."""
-    return {"version": SETTINGS_VERSION, "searchers": [dict(s) for s in data["searchers"]],
-            "at_once": data["at_once"], "contact": data["contact"] or GENERIC_CONTACT,
-            "recent": data["recent"]}
+    """What the service is handed: the settings with the contact filled (the
+    searcher carries its `tiers`, filled by read_settings) and whether the
+    VPN version is on."""
+    return {"version": SETTINGS_VERSION, "searcher": dict(data["searcher"]),
+            "contact": data["contact"] or GENERIC_CONTACT, "recent": data["recent"],
+            "vpn": data["vpn"]}
 
 
 # --- host files ------------------------------------------------------------------
