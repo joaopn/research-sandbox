@@ -20,8 +20,18 @@ iptables -P FORWARD DROP
 # Allow established/related connections (return traffic)
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-# NAT: masquerade outbound traffic on eth0 (dev-sandbox, the external interface)
-iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+# NAT: masquerade every new connection the router forwards, whatever its way
+# out is called. FORWARD accepts only traffic bound for outside the project
+# networks (each bridge's rules drop the private ranges, apart from named MCP
+# destinations, which leave the same way), so every forwarded connection leaves
+# through the router's way out. Naming that interface (`-o eth0`) broke once the
+# rs-sandbox endpoint was reconnected (the gateway re-pin at `research start`)
+# or the router restarted with its project networks attached: eth0 then named a
+# project network, and traffic from an --internal network (the search
+# service's egress), which the host never translates, left with its own address
+# and got no reply (B305). Loopback is left alone, so the router's own traffic
+# to Docker's resolver keeps its address.
+iptables -t nat -A POSTROUTING ! -o lo -j MASQUERADE
 
 # --- Re-apply persisted per-network rules ---
 # One bad record never takes the router down: each replay is tolerated and
