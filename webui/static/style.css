@@ -2681,6 +2681,24 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-tiers { flex-basis: 100%; }
 .searchsvc-tier-list { display: flex; flex-direction: column; gap: 4px; }
 .searchsvc-tier { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+/* Settings → Searchers: one row per searcher (its Through the VPN switch on a
+   line of its own under the tiers), a line between rows; the service-wide
+   fields under the list. */
+.searchsvc-searcher-vpn { flex-basis: 100%; }
+.searchsvc-searchers > .searchsvc-searcher + .searchsvc-searcher { border-top: 1px solid var(--border); }
+/* Settings → VPN: the status line, the two ways in (a pasted or chosen
+   WireGuard file, or its fields by hand), one shown at a time. The panes
+   carry display rules, so [hidden] is restated for them. */
+.searchsvc-vpn-status { flex-wrap: wrap; }
+.searchsvc-vpn-modes { flex-wrap: wrap; gap: 16px; }
+.searchsvc-vpn-file { margin: 0 10px; display: flex; flex-direction: column; gap: 6px; }
+.searchsvc-vpn-file[hidden], .searchsvc-vpn-manual[hidden] { display: none; }
+.searchsvc-input.searchsvc-vpn-conf {
+    width: 40em;
+    max-width: 100%;
+    resize: vertical;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+}
 /* Quick Search: the conversations on the side, the conversation and its
    composer. Self-scoped classes only (the textarea carries .searchsvc-input,
    no bare textarea rule). */
@@ -2825,6 +2843,10 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-ask-acts { display: flex; gap: 6px; margin-top: 8px; }
 .searchsvc-composer { flex-shrink: 0; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--bg-input); }
 .searchsvc-composer-row { display: flex; gap: 8px; align-items: flex-end; }
+/* Quick Search: the searcher picker above the question (hidden with one searcher). */
+.searchsvc-ask-pick { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.searchsvc-ask-pick[hidden] { display: none; }
+.searchsvc-input.searchsvc-ask-searcher { width: auto; }
 .searchsvc-input.searchsvc-ask-text { flex: 1 1 auto; width: auto; min-width: 0; resize: vertical; font-family: inherit; }
 .searchsvc-composer-hint { margin-top: 6px; font-size: 12px; color: var(--fg-faint); }
 .searchsvc-include { margin-top: 4px; font-size: 12px; color: var(--fg-muted); }

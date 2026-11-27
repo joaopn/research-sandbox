@@ -999,12 +999,17 @@ async def broker_aldine_session_handler(request: web.Request) -> web.Response:
 # fourth leg of the request-field ↔ SEARCH_*_WEBUI_FIELDS ↔ app.js payload
 # lockstep. The token is a secret: it travels in this request's body to the
 # broker and nowhere else (no log line, no reply carries it).
-_SEARCH_SETTINGS_FIELDS = ("name", "model", "effort", "at_once", "contact", "recent",
-                           "tiers", "sidebar")
+_SEARCH_SETTINGS_FIELDS = ("searchers", "at_once", "contact", "recent", "sidebar")
 # The operator's own ask (Services → Search → Quick Search): the question, the
-# conversation it belongs to (null = a new one) and whether the conversation's
-# earlier questions and answers go with it.
-_SEARCH_ASK_FIELDS = ("question", "conversation", "include")
+# conversation it belongs to (null = a new one), whether the conversation's
+# earlier questions and answers go with it, and which searcher answers it (by
+# name; optional).
+_SEARCH_ASK_FIELDS = ("question", "conversation", "include", "searcher")
+# The VPN profile (Search → Settings → VPN): the pasted WireGuard file's text
+# OR the fields typed by hand. Both carry the private key, so the body is a
+# secret like the token: relayed to the broker and nowhere else (no log line;
+# the broker's status reply never carries a key).
+_SEARCH_VPN_FIELDS = ("config", "manual")
 
 
 async def _search_body(request: web.Request) -> dict:
@@ -1030,11 +1035,12 @@ async def broker_search_settings_handler(request: web.Request) -> web.Response:
 
 
 async def broker_search_settings_set_handler(request: web.Request) -> web.Response:
-    """POST /broker/search/settings {name, model, effort, at_once, contact,
-    recent, tiers, sidebar} — save the searcher (with its browser tiers), the
-    contact address, how many ended searches the page lists and whether the
-    sidebar shows Search (all eight; saving replaces the file). An absent
-    key is sent as absent, so the broker refuses it cleanly."""
+    """POST /broker/search/settings {searchers, at_once, contact, recent,
+    sidebar} — save the list of searchers (each with its name, model, effort,
+    browser tiers and whether it goes through the VPN), the contact address,
+    how many ended searches the page lists and whether the sidebar shows
+    Search (all five; saving replaces the file). An absent key is sent as
+    absent, so the broker refuses it cleanly."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     body = await _search_body(request)
@@ -1054,9 +1060,30 @@ async def broker_search_token_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_search_vpn_handler(request: web.Request) -> web.Response:
+    """GET /broker/search/vpn — whether a VPN profile is stored, its endpoint,
+    address and DNS, and the tunnel's state (never a key)."""
+    status, body = await _relay(request, "search_vpn")
+    return web.json_response(body, status=status)
+
+
+async def broker_search_vpn_set_handler(request: web.Request) -> web.Response:
+    """POST /broker/search/vpn {config | manual} — store the VPN profile, from
+    the pasted WireGuard file or the fields typed by hand. The body holds the
+    private key: it is relayed and never logged; the answer is the status,
+    which carries no key. An absent field is sent as absent, so the broker
+    refuses it cleanly."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _search_body(request)
+    args = {k: body[k] for k in _SEARCH_VPN_FIELDS if k in body}
+    status, reply = await _relay(request, "search_vpn_set", args)
+    return web.json_response(reply, status=status)
+
+
 def _search_plain_post(verb: str):
     """A POST that carries no field (token-clear, off, clear, test, the
-    conversations' clear)."""
+    conversations' clear, the VPN profile's removal)."""
     async def handler(request: web.Request) -> web.Response:
         if not origin_ok(request):
             return web.Response(status=403, text="origin rejected")
@@ -1103,8 +1130,8 @@ async def broker_search_stop_handler(request: web.Request) -> web.Response:
 
 
 async def broker_search_ask_handler(request: web.Request) -> web.Response:
-    """POST /broker/search/ask {question, conversation, include} — the
-    operator's own question to the searcher, queued like an agent's. The
+    """POST /broker/search/ask {question, conversation, include, searcher} —
+    the operator's own question to a searcher, queued like an agent's. The
     answer names the conversation and the ask; an absent field is sent as
     absent, so the broker refuses it cleanly."""
     if not origin_ok(request):
@@ -4932,6 +4959,9 @@ def main() -> None:
     app.router.add_post("/broker/search/settings", broker_search_settings_set_handler)
     app.router.add_post("/broker/search/token", broker_search_token_handler)
     app.router.add_post("/broker/search/token-clear", _search_plain_post("search_token_clear"))
+    app.router.add_get("/broker/search/vpn", broker_search_vpn_handler)
+    app.router.add_post("/broker/search/vpn", broker_search_vpn_set_handler)
+    app.router.add_post("/broker/search/vpn-clear", _search_plain_post("search_vpn_clear"))
     app.router.add_post("/broker/search/off", _search_plain_post("search_off"))
     app.router.add_post("/broker/search/clear", _search_plain_post("search_clear"))
     app.router.add_get("/broker/search/list", broker_search_list_handler)

@@ -8735,6 +8735,40 @@ const SEARCH_TIERS_HINT =
     "web search), then the browser, then the stealth browser. A tier switched " +
     "off is never used. Each running search starts its own browsers for the " +
     "tiers that are on, and they take memory while it runs.";
+// Beside a searcher's Through the VPN switch: what it does, or, while no VPN
+// configuration is stored, why it cannot be switched on.
+const SEARCH_VPN_SWITCH_NOTE = "its searches reach sites only through the VPN";
+const SEARCH_VPN_SWITCH_NOTE_OFF = "no VPN configuration is stored: save one in the VPN section below";
+// Under the searchers.
+const SEARCHERS_HINT =
+    "Agents see the searchers by name and pick one when they submit a question. "
+    + "At least one searcher must be a normal one (not through the VPN). More "
+    + "searches than \"searches at once\" wait their turn, whichever searcher they ask.";
+// The VPN section's one line.
+const SEARCH_VPN_HINT =
+    "VPN searches reach sites from the VPN's address; their model traffic stays on "
+    + "this machine's. WireGuard only; the keys are never shown again.";
+// The tunnel's state (the VPN status' `tunnel`), for a stored configuration.
+const SEARCH_VPN_TUNNEL_TEXT = {
+    up: "tunnel up",
+    down: "tunnel down: VPN searches reach no site",
+    off: "tunnel off while the search service is not running",
+};
+// The VPN entered by hand: [the key the service takes, the caption, secret
+// (a password field, cleared after a save), optional (left out when empty)].
+const SEARCH_VPN_FIELDS = [
+    ["private_key", "Private key", true, false],
+    ["address", "Address", false, false],
+    ["dns", "DNS", false, false],
+    ["public_key", "Server public key", false, false],
+    ["endpoint", "Endpoint", false, false],
+    ["allowed_ips", "Allowed IPs", false, false],
+    ["preshared_key", "Preshared key (optional)", true, true],
+    ["keepalive", "Keepalive (optional)", false, true],
+];
+// What Allowed IPs starts as: every IPv4 address, the whole route through the
+// tunnel (what a provider's file says for a full-tunnel VPN).
+const SEARCH_VPN_ALLOWED_DEFAULT = "0.0.0.0/0";
 // The gateway entry's state, when it is not the normal "listed".
 const SEARCH_ENTRY_TEXT = {
     absent: "it is not on the MCP server list (Turn on lists it)",
@@ -8841,9 +8875,9 @@ function searchBarParts(view, a, refresh) {
         b.onclick = () => mcpConfirmDialog(view, {
             title: "Turn the search service off",
             text: "Its container and networks are removed, and every running search "
-                + "ends with it. The sign-in, the searcher and the downloaded images "
-                + "are kept, so turning it on again finds them. Every agent loses "
-                + "the MCP server search.",
+                + "ends with it. The sign-in, the searchers, the VPN configuration and "
+                + "the downloaded images are kept, so turning it on again finds them. "
+                + "Every agent loses the MCP server search.",
             confirmLabel: "Turn off",
             path: "/broker/search/off",
             payload: {},
@@ -8905,8 +8939,8 @@ async function searchTurnOn(view, btn, errEl) {
 
 // Services → Search. The status read decides the page (the transport-vs-verb
 // split: no answer is the broker-unreachable card, a refusal its own text);
-// the searcher's settings are a second read whose failure stays in its
-// section.
+// the searchers' settings and the VPN's status are two more reads whose
+// failures stay in their sections.
 async function renderSearchInto(view) {
     view.innerHTML = "";
     view.classList.remove("searchsvc-ask-view");
@@ -8938,8 +8972,21 @@ async function renderSearchInto(view) {
         }
     } catch (e) { /* the section's "unavailable" line */ }
     if (!view.isConnected) return undefined;
+    let vpn = null, vpnErr = null;
+    try {
+        const vres = await fetch("/broker/search/vpn");
+        if (vres.status === 401) {
+            return view.isConnected ? renderMgmtLogin(view, landing) : undefined;
+        }
+        if (vres.status === 200) {
+            const vbody = await vres.json();
+            if (vbody && vbody.ok && vbody.result) vpn = vbody.result;
+            else vpnErr = mgmtErrText(vbody);
+        }
+    } catch (e) { /* the VPN section's "unavailable" line */ }
+    if (!view.isConnected) return undefined;
     searchNoteRunning(body.result);
-    renderSearchScreen(view, body.result, settings, settingsErr);
+    renderSearchScreen(view, body.result, settings, settingsErr, vpn, vpnErr);
     return undefined;
 }
 
@@ -8991,7 +9038,7 @@ function searchSubStrip() {
 // waiting, running and recent search) or Settings (the service itself). Under
 // Services the sub-tab strip comes first; on the Search page the main strip
 // carries the tabs.
-function renderSearchScreen(view, a, settings, settingsErr) {
+function renderSearchScreen(view, a, settings, settingsErr, vpn, vpnErr) {
     const flash = searchFlash;
     searchFlash = null;
     view.innerHTML = "";
@@ -9006,12 +9053,12 @@ function renderSearchScreen(view, a, settings, settingsErr) {
         runs.start();
         return;
     }
-    searchSettingsPane(view, a, settings, settingsErr, flash);
+    searchSettingsPane(view, a, settings, settingsErr, flash, vpn || null, vpnErr || null);
 }
 
 // Settings: the bar (on/off, Clear ended), what the service is, the sign-in
-// with Test, the searcher and the sidebar switch.
-function searchSettingsPane(view, a, settings, settingsErr, flash) {
+// with Test, the searchers, the VPN and the sidebar switch.
+function searchSettingsPane(view, a, settings, settingsErr, flash, vpn, vpnErr) {
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => rerenderView(view);
     view.appendChild(el("div", {
@@ -9021,7 +9068,8 @@ function searchSettingsPane(view, a, settings, settingsErr, flash) {
     if (barFlash) view.appendChild(barFlash);
     view.appendChild(el("div", { class: "hint searchsvc-hint" }, [SEARCH_HINT]));
     view.appendChild(searchSignInSection(view, a, flash));
-    view.appendChild(searchSearcherSection(view, settings, settingsErr, flash));
+    view.appendChild(searchSearcherSection(view, settings, settingsErr, flash, vpn));
+    view.appendChild(searchVpnSection(view, vpn, vpnErr, flash));
     if (settings) view.appendChild(searchLayoutSection(view, settings, flash));
     paintSoftwareLabels();
 }
@@ -9158,43 +9206,37 @@ function searchTiers(s) {
     return { browser: t.browser !== false, stealth: t.stealth !== false };
 }
 
-// Searcher: the one searcher's name, model and effort, searches at once, the
-// contact address and the browser tiers, saved together (the broker replaces
-// the whole file, so the saved sidebar switch goes with them).
-function searchSearcherSection(view, cfg, cfgErr, flash) {
-    const landing = view.__rsRender || renderSearchInto;
-    const wrap = el("div", { class: "mgmt-infra" }, [
-        el("h3", { class: "mgmt-infra-title" }, ["Searcher"]),
-    ]);
-    if (!cfg) {
-        wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row" }, [
-            cfgErr ? el("span", { class: "mgmt-reviewer-err" }, [cfgErr])
-                   : el("span", { class: "type-badge" }, ["unavailable"]),
-        ]));
-        return wrap;
-    }
-    const cur = cfg.settings || cfg.defaults || {};
-    const s = cur.searcher || {};
+// The saved searchers as the list Save sends ({name, model, effort, tiers,
+// vpn} each): a reply with one `searcher` object and no `searchers` list (a
+// settings file saved before the list) is a one-row list, a normal searcher.
+function searchSearchers(cur) {
+    const raw = Array.isArray(cur && cur.searchers) ? cur.searchers
+        : (cur && cur.searcher && typeof cur.searcher === "object" ? [cur.searcher] : []);
+    return raw.filter((s) => s && typeof s === "object").map((s) => ({
+        name: s.name === undefined || s.name === null ? "" : String(s.name),
+        model: s.model || "", effort: s.effort || "",
+        tiers: searchTiers(s), vpn: s.vpn === true,
+    }));
+}
+
+// Searches at once: the service-wide field, or, in a reply from before the
+// searcher list, the one searcher's.
+function searchAtOnce(cur) {
+    if (cur && cur.at_once !== undefined && cur.at_once !== null) return cur.at_once;
+    return cur && cur.searcher ? cur.searcher.at_once : undefined;
+}
+
+// One searcher's row of the list: its name, model and effort, Remove, its
+// browser tiers and whether it goes through the VPN (a switch that waits for a
+// stored VPN configuration).
+function searchSearcherRow(cfg, s, vpnReady) {
     const name = el("input", { type: "text", class: "searchsvc-input", spellcheck: "false" });
     name.value = s.name || "";
     const picker = modelPicker({
         models: cfg.models || [], efforts: cfg.efforts || [],
         defaults: { search: { model: s.model || "", effort: s.effort || "" } },
     }, "search", "", "", {});
-    const max = Number.isSafeInteger(cfg.max_at_once) ? cfg.max_at_once : 0;
-    const atOnce = el("input", { type: "number", class: "searchsvc-input searchsvc-input-num",
-                                 min: "1", max: String(max), step: "1" });
-    atOnce.value = s.at_once !== undefined && s.at_once !== null ? String(s.at_once) : "";
-    const maxRecent = Number.isSafeInteger(cfg.max_recent) ? cfg.max_recent : 0;
-    const recent = el("input", { type: "number", class: "searchsvc-input searchsvc-input-num",
-                                 min: "0", max: String(maxRecent), step: "1" });
-    recent.value = cur.recent !== undefined && cur.recent !== null ? String(cur.recent) : "";
-    const contact = el("input", {
-        type: "email", class: "searchsvc-input searchsvc-input-wide", spellcheck: "false",
-        placeholder: cfg.generic_contact ? "empty: " + cfg.generic_contact : "",
-    });
-    contact.value = cur.contact || "";
-    // The browser tiers: a line of their own in the form, a switch and its
+    // The browser tiers: a line of their own in the row, a switch and its
     // explanation each (a plain label, no .field wrapper to bleed into it).
     const tiers = searchTiers(s);
     const tierBoxes = {};
@@ -9210,6 +9252,88 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
             ]);
         })), SEARCH_TIERS_HINT);
     tierCell.classList.add("searchsvc-tiers");
+    const vpnBox = el("input", { type: "checkbox" });
+    vpnBox.checked = s.vpn === true;
+    vpnBox.disabled = !vpnReady;
+    const vpnCell = el("div", { class: "searchsvc-tier searchsvc-searcher-vpn" }, [
+        el("label", { class: "mgmt-check searchsvc-switch" }, [
+            vpnBox, el("span", {}, ["Through the VPN"])]),
+        el("span", { class: "mgmt-settings-note" },
+           [vpnReady ? SEARCH_VPN_SWITCH_NOTE : SEARCH_VPN_SWITCH_NOTE_OFF]),
+    ]);
+    const remove = el("button", { class: "btn-small" }, ["Remove"]);
+    const node = el("div", { class: "mgmt-row mgmt-infra-row searchsvc-form searchsvc-searcher" }, [
+        searchCell("name", name), picker.row, remove, tierCell, vpnCell,
+    ]);
+    return {
+        node, remove,
+        value: () => {
+            const v = picker.value();
+            return {
+                name: name.value.trim(), model: v.model, effort: v.effort,
+                tiers: { browser: tierBoxes.browser.checked, stealth: tierBoxes.stealth.checked },
+                vpn: vpnBox.checked,
+            };
+        },
+    };
+}
+
+// Searchers: the list of searchers (Add searcher, Remove on each row), then
+// the service-wide fields — searches at once, recent searches kept, the
+// contact address — and one Save for all of it (the broker replaces the whole
+// file, so the saved sidebar switch goes with them).
+function searchSearcherSection(view, cfg, cfgErr, flash, vpn) {
+    const landing = view.__rsRender || renderSearchInto;
+    const wrap = el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Searchers"]),
+    ]);
+    if (!cfg) {
+        wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row" }, [
+            cfgErr ? el("span", { class: "mgmt-reviewer-err" }, [cfgErr])
+                   : el("span", { class: "type-badge" }, ["unavailable"]),
+        ]));
+        return wrap;
+    }
+    const cur = cfg.settings || cfg.defaults || {};
+    const vpnReady = !!(vpn && vpn.configured === true);
+    const listEl = el("div", { class: "searchsvc-searchers" }, []);
+    const rows = [];
+    const paintRemove = () => {
+        for (const r of rows) r.remove.disabled = rows.length < 2;
+    };
+    const addRow = (s) => {
+        const r = searchSearcherRow(cfg, s, vpnReady);
+        r.remove.onclick = () => {
+            if (rows.length < 2) return;
+            rows.splice(rows.indexOf(r), 1);
+            r.node.remove();
+            paintRemove();
+        };
+        rows.push(r);
+        listEl.appendChild(r.node);
+        paintRemove();
+    };
+    const saved = searchSearchers(cur);
+    for (const s of (saved.length ? saved : [{ tiers: searchTiers(null), vpn: false }])) addRow(s);
+    // A new row starts from the default searcher's model and effort.
+    const fresh = searchSearchers(cfg.defaults || {})[0] || {};
+    const add = el("button", { class: "btn-small" }, ["Add searcher"]);
+    add.onclick = () => addRow({ name: "", model: fresh.model || "", effort: fresh.effort || "",
+                                 tiers: searchTiers(null), vpn: false });
+    const max = Number.isSafeInteger(cfg.max_at_once) ? cfg.max_at_once : 0;
+    const atOnce = el("input", { type: "number", class: "searchsvc-input searchsvc-input-num",
+                                 min: "1", max: String(max), step: "1" });
+    const savedAtOnce = searchAtOnce(cur);
+    atOnce.value = savedAtOnce !== undefined && savedAtOnce !== null ? String(savedAtOnce) : "";
+    const maxRecent = Number.isSafeInteger(cfg.max_recent) ? cfg.max_recent : 0;
+    const recent = el("input", { type: "number", class: "searchsvc-input searchsvc-input-num",
+                                 min: "0", max: String(maxRecent), step: "1" });
+    recent.value = cur.recent !== undefined && cur.recent !== null ? String(cur.recent) : "";
+    const contact = el("input", {
+        type: "email", class: "searchsvc-input searchsvc-input-wide", spellcheck: "false",
+        placeholder: cfg.generic_contact ? "empty: " + cfg.generic_contact : "",
+    });
+    contact.value = cur.contact || "";
     // A damaged settings file: the broker's text (the form shows the defaults,
     // and Save replaces the file).
     const errEl = el("span", { class: "mgmt-reviewer-err" }, [cfg.error || ""]);
@@ -9229,14 +9353,12 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
             errEl.textContent = `Recent searches kept is a whole number from 0 to ${maxRecent}.`;
             return;
         }
-        const v = picker.value();
         busy = true;
         save.disabled = true;
         errEl.textContent = "";
         const { status, body } = await mcpPost("/broker/search/settings", {
-            name: name.value.trim(), model: v.model, effort: v.effort,
+            searchers: rows.map((r) => r.value()),
             at_once: n, contact: contact.value.trim(), recent: kept,
-            tiers: { browser: tierBoxes.browser.checked, stealth: tierBoxes.stealth.checked },
             // The switch below saves at once, so the saved value is its state.
             sidebar: cur.sidebar === true,
         });
@@ -9252,37 +9374,212 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         searchFlash = { where: "searcher", text: searchSavedText("Saved.", body.result) };
         rerenderView(view);
     };
-    wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row searchsvc-form" }, [
-        searchCell("name", name),
-        picker.row,
+    wrap.appendChild(listEl);
+    wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row searchsvc-add-row" }, [add]));
+    wrap.appendChild(el("div", { class: "mgmt-row mgmt-infra-row searchsvc-form searchsvc-wide-form" }, [
         searchCell("searches at once", atOnce),
         searchCell("recent searches kept", recent),
         searchCell("contact address", contact, SEARCH_CONTACT_HINT),
-        tierCell,
         save,
         errEl,
     ]));
-    const saved = searchFlashEl("searcher", flash);
-    if (saved) wrap.appendChild(saved);
-    wrap.appendChild(el("div", { class: "mgmt-settings-hint" }, [
-        "Agents name the searcher when they submit a question; with one searcher "
-        + "they can leave it out. More searches than this wait their turn."]));
+    const said = searchFlashEl("searcher", flash);
+    if (said) wrap.appendChild(said);
+    wrap.appendChild(el("div", { class: "mgmt-settings-hint" }, [SEARCHERS_HINT]));
     return wrap;
+}
+
+// How long ago the tunnel's last handshake was, from its age in seconds.
+function searchVpnAgo(sec) {
+    if (typeof sec !== "number" || !Number.isFinite(sec) || sec < 0) return "no handshake yet";
+    const s = Math.floor(sec);
+    if (s < 60) return `last handshake ${s} s ago`;
+    if (s < 3600) return `last handshake ${Math.floor(s / 60)} min ago`;
+    return `last handshake ${Math.floor(s / 3600)} h ago`;
+}
+
+// The VPN's status line (`v` = the search_vpn result): not configured, or the
+// tunnel's state with the endpoint, the address, the DNS and the last
+// handshake (up) or the error (down). Every value lands as text; no key is
+// ever part of the reply, and none is shown.
+function searchVpnStatusParts(v) {
+    if (!v.configured) {
+        return [el("span", { class: "state-stopped" }, ["no VPN configuration is stored"])];
+    }
+    const tunnel = String(v.tunnel || "");
+    const parts = [el("span", { class: tunnel === "up" ? "state-running" : "state-stopped" },
+                      [SEARCH_VPN_TUNNEL_TEXT[tunnel] || "tunnel " + tunnel])];
+    if (v.endpoint) {
+        const ip = v.endpoint_ip && v.endpoint_ip !== v.endpoint ? ` (${String(v.endpoint_ip)})` : "";
+        parts.push(el("span", { class: "type-badge" }, ["endpoint " + String(v.endpoint) + ip]));
+    }
+    if (v.address) parts.push(el("span", { class: "type-badge" }, ["address " + String(v.address)]));
+    const dns = Array.isArray(v.dns) ? v.dns.map(String).filter((d) => d) : [];
+    if (dns.length) parts.push(el("span", { class: "type-badge" }, ["DNS " + dns.join(", ")]));
+    if (tunnel === "up") parts.push(el("span", { class: "type-badge" }, [searchVpnAgo(v.handshake_s)]));
+    if (v.error) parts.push(el("span", { class: "mcp-test mcp-test-bad" }, [String(v.error)]));
+    // What RS leaves out of a stored configuration (its IPv6 parts).
+    if (v.note) parts.push(el("span", { class: "mgmt-settings-note" }, [String(v.note)]));
+    return parts;
+}
+
+// VPN: the status first, Remove beside it; then the two ways in, switched by
+// a pair of radio buttons — the WireGuard configuration file (pasted, or read
+// from a local file into the box by "Choose file…": nothing leaves the
+// browser until Save) or its fields typed by hand — and one Save. The keys
+// are secrets like the sign-in token: password fields (the file's box is
+// emptied too) cleared once a save is answered, never filled from a reply.
+function searchVpnSection(view, vpn, vpnErr, flash) {
+    const landing = view.__rsRender || renderSearchInto;
+    const status = el("div", { class: "mgmt-row mgmt-infra-row searchsvc-vpn-status" },
+        vpn ? searchVpnStatusParts(vpn)
+            : [vpnErr ? el("span", { class: "mgmt-reviewer-err" }, [vpnErr])
+                      : el("span", { class: "type-badge" }, ["unavailable"])]);
+    if (vpn && vpn.configured) {
+        const remove = el("button", { class: "btn-small" }, ["Remove"]);
+        remove.onclick = () => mcpConfirmDialog(view, {
+            title: "Remove the VPN configuration",
+            text: "The stored VPN configuration, its keys included, is deleted from this "
+                + "machine and the tunnel is closed. A searcher that goes through the VPN "
+                + "must be removed or switched to normal first.",
+            confirmLabel: "Remove",
+            path: "/broker/search/vpn-clear",
+            payload: {},
+            onOk: () => { searchFlash = { where: "vpn", text: "The VPN configuration is removed." }; },
+        });
+        status.appendChild(remove);
+    }
+    // The way in: the configuration file (the default) or by hand.
+    let mode = "file";
+    const radio = (key, label) => {
+        const r = el("input", { type: "radio", name: "searchsvc-vpn-mode", value: key });
+        r.checked = key === mode;
+        r.onchange = () => { if (r.checked) setMode(key); };
+        return { r, node: el("label", { class: "mgmt-check searchsvc-switch" }, [r, el("span", {}, [label])]) };
+    };
+    const fileRadio = radio("file", "Configuration file");
+    const handRadio = radio("manual", "By hand");
+    const conf = el("textarea", {
+        class: "searchsvc-input searchsvc-vpn-conf", rows: "8", spellcheck: "false",
+        autocomplete: "off", placeholder: "[Interface]\nPrivateKey = …\n\n[Peer]\n…",
+    });
+    const fileIn = el("input", { type: "file", accept: ".conf,text/plain" });
+    fileIn.hidden = true;
+    const choose = el("button", { class: "btn-small", type: "button" }, ["Choose file…"]);
+    choose.onclick = () => fileIn.click();
+    const errEl = el("span", { class: "mgmt-reviewer-err" }, []);
+    fileIn.onchange = () => {
+        const f = fileIn.files && fileIn.files[0];
+        if (!f) return;
+        const reader = new FileReader();
+        reader.onload = () => { conf.value = String(reader.result || ""); errEl.textContent = ""; };
+        reader.onerror = () => { errEl.textContent = "The file could not be read."; };
+        reader.readAsText(f);
+        // Choosing the same file again reads it again.
+        fileIn.value = "";
+    };
+    const filePane = el("div", { class: "searchsvc-vpn-file" }, [
+        conf, el("div", { class: "searchsvc-vpn-file-acts" }, [choose, fileIn]),
+    ]);
+    const inputs = {};
+    const handPane = el("div", { class: "mgmt-row mgmt-infra-row searchsvc-form searchsvc-vpn-manual" },
+        SEARCH_VPN_FIELDS.map(([key, caption, secret]) => {
+            const input = el("input", {
+                type: secret ? "password" : "text", class: "searchsvc-input",
+                spellcheck: "false",
+                // "new-password": the browser must not fill in a saved password
+                // (the master password) here, where Save would store it as a key.
+                autocomplete: secret ? "new-password" : "off",
+            });
+            if (key === "allowed_ips") input.value = SEARCH_VPN_ALLOWED_DEFAULT;
+            inputs[key] = input;
+            return searchCell(caption, input);
+        }));
+    inputs.private_key.classList.add("searchsvc-input-wide");
+    inputs.public_key.classList.add("searchsvc-input-wide");
+    inputs.preshared_key.classList.add("searchsvc-input-wide");
+    inputs.keepalive.classList.add("searchsvc-input-num");
+    inputs.keepalive.setAttribute("placeholder", "seconds");
+    const setMode = (key) => {
+        mode = key;
+        filePane.hidden = key !== "file";
+        handPane.hidden = key !== "manual";
+        errEl.textContent = "";
+    };
+    setMode(mode);
+    const clearSecrets = () => {
+        conf.value = "";
+        for (const [key, , secret] of SEARCH_VPN_FIELDS) if (secret) inputs[key].value = "";
+    };
+    const save = el("button", { class: "btn-small" }, ["Save"]);
+    let busy = false;
+    save.onclick = async () => {
+        if (busy) return;
+        let payload;
+        if (mode === "file") {
+            if (!conf.value.trim()) {
+                errEl.textContent = "Paste the configuration file, or choose it, first.";
+                return;
+            }
+            payload = { config: conf.value };
+        } else {
+            const manual = {};
+            for (const [key, , , optional] of SEARCH_VPN_FIELDS) {
+                const v = inputs[key].value.trim();
+                if (optional && !v) continue;
+                manual[key] = v;
+            }
+            if (manual.keepalive !== undefined) {
+                if (!/^[0-9]+$/.test(manual.keepalive)) {
+                    errEl.textContent = "Keepalive is a whole number of seconds.";
+                    return;
+                }
+                manual.keepalive = Number(manual.keepalive);
+            }
+            payload = { manual };
+        }
+        busy = true;
+        save.disabled = true;
+        errEl.textContent = "";
+        const { status: code, body } = await mcpPost("/broker/search/vpn", payload);
+        clearSecrets();
+        busy = false;
+        save.disabled = false;
+        const redirect = mgmtStatusRedirect(view, code, landing);
+        if (redirect) return redirect();
+        if (code !== 200 || !body.ok) {
+            // The service's refusal (not WireGuard, a missing key, …) as it said it.
+            errEl.textContent = code === 200 ? mgmtErrText(body) : "Connection failed.";
+            return;
+        }
+        searchFlash = { where: "vpn", text: "The VPN configuration is stored." };
+        rerenderView(view);
+    };
+    return el("div", { class: "mgmt-infra searchsvc-vpn" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["VPN"]),
+        status,
+        searchFlashEl("vpn", flash),
+        el("div", { class: "mgmt-row mgmt-infra-row searchsvc-vpn-modes" }, [fileRadio.node, handRadio.node]),
+        filePane,
+        handPane,
+        el("div", { class: "mgmt-row mgmt-infra-row" }, [save, errEl]),
+        el("div", { class: "mgmt-settings-hint" }, [SEARCH_VPN_HINT]),
+    ]);
 }
 
 const SEARCH_SIDEBAR_HINT =
     "Adds Search to the sidebar, above Services. Opening it shows Quick Search, "
     + "Activity and Settings as its tabs, the way a project shows its terminal and "
     + "editor. Services → Search stays where it is. Kept on the host with the "
-    + "searcher, so every browser shows the same.";
+    + "searchers, so every browser shows the same.";
 
 // Layout: the switch that shows Search in the sidebar. It saves by itself, at
-// once, with the searcher as it is saved (the broker replaces the whole file;
-// unsaved edits in the form above are not sent), then rebuilds the sidebar.
+// once, with the searchers as they are saved (the broker replaces the whole
+// file; unsaved edits in the form above are not sent), then rebuilds the
+// sidebar.
 function searchLayoutSection(view, cfg, flash) {
     const landing = view.__rsRender || renderSearchInto;
     const cur = cfg.settings || cfg.defaults || {};
-    const s = cur.searcher || {};
     const box = el("input", { type: "checkbox" });
     box.checked = cur.sidebar === true;
     const errEl = el("span", { class: "mgmt-reviewer-err" }, []);
@@ -9294,9 +9591,8 @@ function searchLayoutSection(view, cfg, flash) {
         box.disabled = true;
         errEl.textContent = "";
         const { status, body } = await mcpPost("/broker/search/settings", {
-            name: s.name, model: s.model, effort: s.effort, at_once: s.at_once,
-            contact: cur.contact || "", recent: cur.recent, tiers: searchTiers(s),
-            sidebar: want,
+            searchers: searchSearchers(cur), at_once: searchAtOnce(cur),
+            contact: cur.contact || "", recent: cur.recent, sidebar: want,
         });
         busy = false;
         box.disabled = false;
@@ -9912,7 +10208,17 @@ function installSearchSideDrag(handle, chat) {
 function searchAskPane(view, settings, flash) {
     const landing = view.__rsRender || renderSearchInto;
     const cur = settings ? (settings.settings || settings.defaults || {}) : {};
-    const searcherName = cur.searcher && cur.searcher.name ? String(cur.searcher.name) : "";
+    // The searcher picker: the searchers by name, the first normal one chosen;
+    // hidden when there is only one (its name still goes with each ask).
+    const searchers = searchSearchers(cur).filter((s) => s.name);
+    const pick = el("select", { class: "searchsvc-input searchsvc-ask-searcher", "aria-label": "searcher" },
+        searchers.map((s) => el("option", { value: s.name },
+                                [s.name + (s.vpn ? " (through the VPN)" : "")])));
+    const firstNormal = searchers.find((s) => !s.vpn) || searchers[0];
+    pick.value = firstNormal ? firstNormal.name : "";
+    const pickRow = el("div", { class: "searchsvc-ask-pick" }, [
+        el("span", { class: "model-cap" }, ["searcher"]), pick]);
+    pickRow.hidden = searchers.length < 2;
     // The conversations read's own error (its stored conversations cannot be
     // read): its text, with Clear conversations as the remedy.
     const problem = el("div", { class: "searchsvc-ask-problem" }, []);
@@ -9938,13 +10244,16 @@ function searchAskPane(view, settings, flash) {
     const askBtn = el("button", { class: "btn" }, ["Ask"]);
     const include = el("input", { type: "checkbox" });
     const askErr = el("div", { class: "mgmt-reviewer-err searchsvc-ask-err" }, []);
+    const hintText = () => "Each message is a new, independent search"
+        + (pick.value ? ` with searcher ${pick.value}.` : ".");
+    const hint = el("div", { class: "searchsvc-composer-hint" }, [hintText()]);
+    pick.onchange = () => { hint.textContent = hintText(); };
     const conv = el("div", { class: "searchsvc-conv" }, [
         msgs, convNote,
         el("div", { class: "searchsvc-composer" }, [
+            pickRow,
             el("div", { class: "searchsvc-composer-row" }, [question, askBtn]),
-            el("div", { class: "searchsvc-composer-hint" }, [
-                "Each message is a new, independent search"
-                + (searcherName ? ` with searcher ${searcherName}.` : ".")]),
+            hint,
             el("label", { class: "mgmt-check searchsvc-include" }, [
                 include, el("span", {}, ["include this conversation's earlier questions and answers"])]),
             askErr,
@@ -10291,9 +10600,9 @@ function searchAskPane(view, settings, flash) {
         sending = true;
         askBtn.disabled = true;
         askErr.textContent = "";
-        const { status, body } = await mcpPost("/broker/search/ask", {
-            question: q, conversation: searchAskSelected, include: include.checked,
-        });
+        const ask = { question: q, conversation: searchAskSelected, include: include.checked };
+        if (pick.value) ask.searcher = pick.value;
+        const { status, body } = await mcpPost("/broker/search/ask", ask);
         sending = false;
         askBtn.disabled = false;
         if (!live()) return halt();
