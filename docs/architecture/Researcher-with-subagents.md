@@ -73,7 +73,7 @@ Under Claude the analyst and the surveyor each run the model and effort set for 
 
 ## The referee's model
 
-Under Claude the referee runs the model set for the whole installation in **Host → Defaults → Referee**, Sonnet at high effort by default. A new project of this type starts with it, and a project's own is set when the project is created, or later in ⚙; the next referee run uses the change, and nothing restarts. Under pi the referee runs the project's pi model.
+Under Claude the referee runs the model set for the whole installation in **Host → Defaults → Referee**, Sonnet at high effort by default. A new project of this type starts with it, and a project's own is set when the project is created, or later in ⚙; the next referee run uses the change, and nothing restarts. Under pi the referee runs its own model and thinking level when they are set on pi's tab, when the project is created or later in ⚙ (the next referee run uses a change, and nothing restarts), and otherwise the project's pi Agent model. A new project of this type with pi needs one of the two, and there is no installation default for pi's referee, since pi names its models by provider.
 
 ## Design decisions
 

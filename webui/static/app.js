@@ -12467,9 +12467,18 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             ]),
         ]),
     ]);
-    // pi's analyst (a researcher-subagents workflow; pi has no surveyor, and
-    // pi's referee runs the model above): its own model and thinking level,
-    // empty = pi's default. Changed later in the project's ⚙ Agents box.
+    // pi's referee and analyst (a researcher-subagents workflow; pi has no
+    // surveyor): each its own model and thinking level. The referee's empty
+    // model = the Agent model above (create refuses when both are empty); the
+    // analyst's empty = pi's default. Changed later in the project's ⚙ Agents box.
+    const piRefereeModelI = el("input", {
+        type: "text", autocomplete: "off", spellcheck: "false",
+        placeholder: "provider/model (empty: the Agent model)",
+    });
+    const piRefereeThinkingS = el("select", {}, [
+        el("option", { value: "" }, ["pi's default"]),
+        ...PI_THINKING_LEVELS.map((lv) => el("option", { value: lv }, [lv])),
+    ]);
     const piAnalystModelI = el("input", {
         type: "text", autocomplete: "off", spellcheck: "false",
         placeholder: "provider/model (empty: pi's default)",
@@ -12479,8 +12488,20 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         ...PI_THINKING_LEVELS.map((lv) => el("option", { value: lv }, [lv])),
     ]);
     if (isSubagents) {
-        piPanel.appendChild(el("div", { class: "hint" }, [
-            "pi's referee, which checks a finding before you accept it, runs this model.",
+        piPanel.appendChild(el("div", { class: "field" }, [
+            el("label", {}, ["Referee"]),
+            el("div", { class: "model-row agent-pi-row" }, [
+                el("div", { class: "model-cell agent-pi-model" }, [
+                    el("span", { class: "model-cap" }, ["model"]), piRefereeModelI,
+                ]),
+                el("div", { class: "model-cell" }, [
+                    el("span", { class: "model-cap" }, ["thinking"]), piRefereeThinkingS,
+                ]),
+            ]),
+            el("div", { class: "hint" }, [
+                "Checks a finding before you accept it. Empty: the Agent model above. " +
+                "One of the two needs a model.",
+            ]),
         ]));
         piPanel.appendChild(el("div", { class: "field" }, [
             el("label", {}, ["Analyst"]),
@@ -12635,6 +12656,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             if (m) out.pi_model = m;
             if (piThinkingS.value) out.pi_thinking = piThinkingS.value;
             if (isSubagents) {
+                const rm = piRefereeModelI.value.trim();
+                if (rm) out.pi_referee_model = rm;
+                if (piRefereeThinkingS.value) out.pi_referee_thinking = piRefereeThinkingS.value;
                 const am = piAnalystModelI.value.trim();
                 if (am) out.pi_analyst_model = am;
                 if (piAnalystThinkingS.value) out.pi_analyst_thinking = piAnalystThinkingS.value;
@@ -13037,7 +13061,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 // rejects them elsewhere, and the pickers are filtered to match);
                 // analyst_*/surveyor_*/referee_* on a researcher-subagents
                 // workflow only, likewise; pi_model/pi_thinking while pi is on,
-                // and pi_analyst_* there too on that workflow. Every key is in
+                // and pi_referee_*/pi_analyst_* there too on that workflow. Every key is in
                 // CREATE_WEBUI_FIELDS.
                 ...agentModelPayload(),
             };
@@ -16346,8 +16370,8 @@ function agentsBoxContent(name, d, cat, staged) {
             [ct, modelPicker(cat, ct, title, hint, { unchanged: true })])
         : [];
     // A researcher-subagents project: the finding referee's model under
-    // Claude (pi's referee runs pi's model). Read at each referee run, so a
-    // change restarts nothing.
+    // Claude (pi's referee has its own row on pi's tab). Read at each referee
+    // run, so a change restarts nothing.
     const referee = d.subagents === true ? (d.referee || { model: "", effort: "" }) : null;
     const refereePicker = referee && cat
         ? modelPicker(cat, "referee", "Referee",
@@ -16439,6 +16463,30 @@ function agentsBoxContent(name, d, cat, staged) {
     ]);
     piAnalystThinkS.value = HARNESS_PI_THINKING.includes(piAnalystInit.thinking)
         ? piAnalystInit.thinking : "";
+    // pi's referee: its own model and thinking level, empty model = the
+    // Agent model above. Read at each referee run, so a change restarts nothing.
+    const piRefereeInit = d.pi_referee || { model: "", thinking: "" };
+    const piRefereeModelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+                                          placeholder: "provider/model (empty: the Agent model)" });
+    piRefereeModelI.value = piRefereeInit.model || "";
+    const piRefereeThinkS = el("select", {}, [
+        el("option", { value: "" }, ["pi's default"]),
+        ...HARNESS_PI_THINKING.map((lv) => el("option", { value: lv }, [lv])),
+    ]);
+    piRefereeThinkS.value = HARNESS_PI_THINKING.includes(piRefereeInit.thinking)
+        ? piRefereeInit.thinking : "";
+    const piRefereeNode = referee ? el("div", { class: "field" }, [
+        el("label", {}, ["Referee"]),
+        el("div", { class: "model-row agent-pi-row" }, [
+            el("div", { class: "model-cell agent-pi-model" }, [
+                el("span", { class: "model-cap" }, ["model"]), piRefereeModelI]),
+            el("div", { class: "model-cell" }, [
+                el("span", { class: "model-cap" }, ["thinking"]), piRefereeThinkS]),
+        ]),
+        el("div", { class: "hint" }, [
+            "Checks a finding before you accept it. Empty: the Agent model above. " +
+            "One of the two needs a model. The next referee run uses a change."]),
+    ]) : null;
     const piAnalystNode = referee ? el("div", { class: "field" }, [
         el("label", {}, ["Analyst"]),
         el("div", { class: "model-row agent-pi-row" }, [
@@ -16467,9 +16515,7 @@ function agentsBoxContent(name, d, cat, staged) {
         el("div", { class: "hint" }, [
             "What pi's settings say now — a model picked inside pi shows here.",
         ]),
-        referee ? el("div", { class: "hint" }, [
-            "pi's referee, which checks a finding before you accept it, runs this model.",
-        ]) : null,
+        piRefereeNode,
         piAnalystNode,
         piRows.node,
     ]);
@@ -16509,6 +16555,9 @@ function agentsBoxContent(name, d, cat, staged) {
     apply.onclick = () => { applyMsg.textContent = agentsBoxApply(name, d, {
         on, local, isDind, isResearch, harness, sw, tp, claudeRows, piRows, researchPickers,
         refereePicker, helperPickers,
+        piReferee: piRefereeNode ? { model: () => piRefereeModelI.value.trim(),
+                                     thinking: () => piRefereeThinkS.value,
+                                     init: piRefereeInit } : null,
         piAnalyst: piAnalystNode ? { model: () => piAnalystModelI.value.trim(),
                                      thinking: () => piAnalystThinkS.value,
                                      init: piAnalystInit } : null,
@@ -17058,6 +17107,16 @@ function agentsBoxApply(name, d, f) {
             }
         });
     }
+    if (f.piReferee && f.on.has("pi")) {
+        const rm = f.piReferee.model(), rt = f.piReferee.thinking();
+        const wasM = f.piReferee.init.model || "", wasT = f.piReferee.init.thinking || "";
+        if (rm !== wasM || rt !== wasT) {
+            setOrReset("pi_referee_model", rm, wasM, null);
+            setOrReset("pi_referee_thinking", rt, wasT, null);
+            lines.push(`pi's Referee: ${rm || "the Agent model"}, thinking ` +
+                       `${rt || "pi's default"}; the next referee run uses it, nothing is restarted.`);
+        }
+    }
     if (f.piAnalyst && f.on.has("pi")) {
         const am = f.piAnalyst.model(), at = f.piAnalyst.thinking();
         const wasM = f.piAnalyst.init.model || "", wasT = f.piAnalyst.init.thinking || "";
@@ -17074,7 +17133,7 @@ function agentsBoxApply(name, d, f) {
     // next helper or referee reads the new definition): only a change made of
     // those alone gets the hint that says so, every other change keeps the
     // restart hint.
-    const LIVE_FIELDS = /^(referee|analyst|surveyor|pi_analyst)_/;
+    const LIVE_FIELDS = /^(referee|analyst|surveyor|pi_analyst|pi_referee)_/;
     const liveOnly = Object.keys(payload).every((k) => LIVE_FIELDS.test(k) ||
         (k === "reset" && payload.reset.every((r) => LIVE_FIELDS.test(r))));
     const validate = () => {
@@ -17084,6 +17143,10 @@ function agentsBoxApply(name, d, f) {
         }
         if (payload.pi_model && !HARNESS_PI_MODEL_PATTERN.test(payload.pi_model)) {
             return "Write pi's model as provider/model, e.g. openrouter/anthropic/claude-opus-latest.";
+        }
+        if (payload.pi_referee_model && !HARNESS_PI_MODEL_PATTERN.test(payload.pi_referee_model)) {
+            return "Write pi's Referee model as provider/model, e.g. " +
+                   "openrouter/anthropic/claude-opus-latest.";
         }
         if (payload.pi_analyst_model && !HARNESS_PI_MODEL_PATTERN.test(payload.pi_analyst_model)) {
             return "Write pi's Analyst model as provider/model, e.g. " +
