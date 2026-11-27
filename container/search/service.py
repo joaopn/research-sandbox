@@ -26,6 +26,11 @@ remove one of the files the host hands over (settings, token) in RUN_DIR;
 the running server from inside the container (the admin routes answer
 127.0.0.1 only): the operator's list of waiting and running searches, a
 read-only view of one search's work, stopping one, and testing the sign-in.
+`admin ask` (its body on stdin), `admin conversations|conversations-clear`
+and `admin conversation ID` are the Search page's Quick Ask: the operator's
+own questions, searches in the same queue under a project no caller can be,
+collected by the service itself at their end and kept, with their answers,
+in conversations on a volume of their own.
 
 Stdlib only (the dind image's conda Python).
 """
@@ -33,6 +38,7 @@ Stdlib only (the dind image's conda Python).
 from __future__ import annotations
 
 import collections
+import errno
 import json
 import math
 import os
@@ -194,6 +200,57 @@ STOPPED_QUEUED = "the search was stopped by the operator before it started"
 STOPPED_WITH_REPORT = "the search was stopped by the operator after it wrote its report"
 STOPPED_NO_REPORT = "the search was stopped by the operator before it wrote a report"
 NO_SUCH_SEARCH = "no search with that id is waiting or running"
+
+# --- the operator's asks and their conversations ------------------------------------
+
+# The identity an ask from the Search page is recorded under. A project name
+# starts with a letter or a digit (PROJECT_RE, the gateway's caller header is
+# checked against it), so no caller of the MCP server can ever be this
+# project: an ask is never found, checked, downloaded from or collected by an
+# agent.
+OPERATOR_PROJECT = "-operator-"
+OPERATOR_CONSUMER = "webui"
+# Where the conversations are kept: a named volume of the service container
+# (search.CONVERSATIONS_VOLUME at search.SERVICE_CONVERSATIONS_DIR — MIRROR),
+# kept at Turn off like its inner Docker's. Only this service writes there,
+# and nothing of a search reaches it.
+CONVERSATIONS_DIR = "/var/lib/rs-search-conversations"
+CONVERSATIONS_NAME = "conversations.json"
+CONVERSATIONS_VERSION = 1
+# How many conversations are kept; the oldest (the one asked in longest ago)
+# goes when a new one starts. A conversation is one line of the page's list,
+# and the asks are the operator's own (a handful a day at most), so 20 is a
+# few weeks of them: a list read without scrolling far. The whole file is
+# written again at every ask's start and end. At half, a busy week pushes out a
+# thread still being followed; at ten times the list becomes an archive the
+# page is not meant to be (a report worth keeping is copied out of it), and
+# every save writes ten times as much.
+CONVERSATIONS_MAX = 20
+# The largest conversations file the service reads (and so the largest it
+# writes: past this the oldest conversations go first, as past
+# CONVERSATIONS_MAX, and one conversation alone past it loses its oldest
+# asks). One ask keeps its full report (REPORT_MAX_BYTES at most, a few to
+# tens of KB in practice), its work view (about 220 KB at worst, see
+# Searches.recent) and its question (QUESTION_MAX_CHARS): 1.4 MB at worst, tens
+# of KB in practice, so CONVERSATIONS_MAX conversations of ten real asks each
+# are a few MB. 64 MiB is several times a heavy real store and still read at
+# start and written at every save in well under a second. At half a store
+# holding a few reports at the cap could reach it; at ten times the service's
+# memory (it holds the store) and every save become the cost.
+CONVERSATIONS_MAX_BYTES = 64 * 1024 * 1024
+# One ask's request body (`admin ask`'s stdin): the question of at most
+# QUESTION_MAX_CHARS characters as JSON, where one character can take 12 bytes
+# (a character outside the BMP written as two \u escapes), plus the
+# conversation id and the include flag (well under a KiB).
+ASK_BODY_MAX_BYTES = QUESTION_MAX_CHARS * 12 + 1024
+NO_SUCH_CONVERSATION = "no conversation with that id is kept"
+TOO_LONG_TO_INCLUDE = ("this conversation is too long to include; start a new one or "
+                       "untick the box")
+CONVERSATIONS_DAMAGED = ("the conversations kept by the search service cannot be read "
+                         "({why}), so none is shown and no question is asked until they "
+                         "are cleared; Clear conversations removes the file")
+ASK_LOST = "the search service stopped before this question was answered"
+ASK_NOT_ENDED = "it had not ended when this question was asked"
 
 # --- the sign-in test -----------------------------------------------------------------
 
@@ -591,10 +648,32 @@ class Searches:
         # so RECENT_MAX x that, about 100 MB, when every search left a report at
         # the cap; real reports are a few KB, a full list well under a MB.
         self.recent: collections.deque = collections.deque()
+        # The operator's conversations (load_conversations at start), the one
+        # asked in last first; each ask in it keeps what its message shows once
+        # it ended (its work view as it ended and its full report). `conv_error`
+        # is the damaged-file text while the file on disk cannot be read as RS
+        # wrote it: the file is then left as it is, the reads answer with the
+        # text and every ask is refused, until Clear conversations.
+        self.conversations: list[dict] = []
+        self.conv_error: str | None = None
 
     # --- the caller's three tools ---
 
     def submit(self, project: str, consumer: str, question: str, searcher: str) -> dict:
+        settings = self._submit_settings(question, searcher)
+        sid = secrets.token_hex(8)
+        with self.lock:
+            self._enqueue(sid, project, consumer, question.strip(), question.strip(),
+                          settings, None)
+        s = settings["searcher"]
+        return {"search_id": sid, "searcher": s["name"], "state": "queued",
+                "next": "go on with your work; search_check tells how it goes"}
+
+    @staticmethod
+    def _submit_settings(question, searcher: str) -> dict:
+        """The settings a new search runs with, after the checks every search
+        passes (settings saved, the searcher named, a question of a size the
+        agent's environment carries). ToolRefusal otherwise."""
         settings = read_settings()
         if settings is None:
             raise ToolRefusal("the search service has no settings yet; the operator "
@@ -609,22 +688,286 @@ class Searches:
             raise ToolRefusal(f"the question is longer than {QUESTION_MAX_CHARS} "
                               "characters; put long material in a file the "
                               "question names instead")
-        sid = secrets.token_hex(8)
-        rec = {"id": sid, "project": project, "consumer": consumer,
-               "question": question.strip(), "searcher": s["name"],
-               "model": s["model"], "effort": s["effort"],
-               "contact": settings["contact"],
-               "state": "queued", "submitted_at": time.time(),
-               "started_at": None, "finished_at": None, "outcome": None,
-               "stream": AgentStream(), "stop": False}
-        with self.lock:
-            self.table[sid] = rec
-            self.queue.append(sid)
-            self.lock.notify_all()
+        return settings
+
+    def _enqueue(self, sid: str, project: str, consumer: str, question: str, prompt: str,
+                 settings: dict, conversation: str | None) -> None:
+        """Under the lock: a new search in the table and at the end of the one
+        queue, and its thread. `question` is what its rows show, `prompt` what
+        its agent is asked (the same but for an ask that includes its
+        conversation); `conversation` is an ask's conversation id."""
+        s = settings["searcher"]
+        self.table[sid] = {
+            "id": sid, "project": project, "consumer": consumer,
+            "question": question, "prompt": prompt, "conversation": conversation,
+            "searcher": s["name"], "model": s["model"], "effort": s["effort"],
+            "contact": settings["contact"],
+            "state": "queued", "submitted_at": time.time(),
+            "started_at": None, "finished_at": None, "outcome": None,
+            "stream": AgentStream(), "stop": False}
+        self.queue.append(sid)
+        self.lock.notify_all()
         threading.Thread(target=self._run, args=(sid,), daemon=True).start()
         log(f"submit {sid} for {project}/{consumer}")
-        return {"search_id": sid, "searcher": s["name"], "state": "queued",
-                "next": "go on with your work; search_check tells how it goes"}
+
+    # --- the operator's asks (the Search page's Quick Ask) ---
+
+    def ask(self, question, conversation, include: bool) -> dict:
+        """The operator's question: a search like any other (the same queue,
+        searcher and sign-in) under OPERATOR_PROJECT, added to a conversation
+        (a new one when `conversation` is None). With `include` the searcher is
+        asked the conversation's earlier questions and answers too; the rows
+        show only what the operator typed. The conversation is saved before the
+        search is queued: a save that fails starts nothing."""
+        settings = self._submit_settings(question, "")
+        question = question.strip()
+        with self.lock:
+            if self.conv_error:
+                raise ToolRefusal(self.conv_error)
+            conv = None
+            if conversation is not None:
+                conv = next((c for c in self.conversations if c["id"] == conversation), None)
+                if conv is None:
+                    raise ToolRefusal(NO_SUCH_CONVERSATION)
+            prompt = question
+            if include and conv is not None:
+                prompt = self._compose(conv, question)
+                if len(prompt) > QUESTION_MAX_CHARS:
+                    raise ToolRefusal(TOO_LONG_TO_INCLUDE)
+            sid = secrets.token_hex(8)
+            now = time.time()
+            entry = {"id": sid, "question": question, "searcher": settings["searcher"]["name"],
+                     "submitted_at": now, "view": None, "report": None}
+            if conv is None:
+                cid = secrets.token_hex(8)
+                conv = {"id": cid, "created_at": now, "updated_at": now, "asks": [entry]}
+                kept = [conv] + self.conversations[:CONVERSATIONS_MAX - 1]
+            else:
+                cid = conv["id"]
+                conv = dict(conv, updated_at=now, asks=conv["asks"] + [entry])
+                kept = [conv] + [c for c in self.conversations if c["id"] != cid]
+            problem = self._save_conversations(kept)
+            if problem:
+                raise ToolRefusal(problem)
+            self.conversations = kept
+            self._enqueue(sid, OPERATOR_PROJECT, OPERATOR_CONSUMER, question, prompt,
+                          settings, cid)
+        return {"conversation": cid, "ask": sid, "state": "queued"}
+
+    @staticmethod
+    def _compose(conv: dict, question: str) -> str:
+        """What the searcher is asked when the conversation is included: every
+        earlier question with its answer (the summary and the numbered
+        sources, or why there is none), oldest first, then the new question."""
+        lines = ["The earlier questions of this conversation and their answers, oldest "
+                 "first:", ""]
+        for n, a in enumerate(conv["asks"], 1):
+            lines.append(f"Question {n}: {a['question']}")
+            rep, view = a["report"], a["view"]
+            if rep is not None:
+                lines.append(f"Answer {n}: {_as_text(rep.get('summary'))}")
+                sources = rep.get("sources")
+                items = sources if isinstance(sources, list) else [sources]
+                if items:
+                    lines.append(f"Sources of answer {n}:")
+                for i, s in enumerate(items, 1):
+                    num = s.get("n") if isinstance(s, dict) else None
+                    num = num if isinstance(num, int) and not isinstance(num, bool) else i
+                    lines.append(f"[{num}] {_source_line(s)}")
+            elif view is not None:
+                lines.append(f"Answer {n}: (no answer: {view['reason']})")
+            else:
+                lines.append(f"Answer {n}: (no answer: {ASK_NOT_ENDED})")
+            lines.append("")
+        lines.append(f"The new question: {question}")
+        return "\n".join(lines)
+
+    def _ask_state(self, a: dict) -> str:
+        """Under the lock: an ask's state (live while it is in the table)."""
+        if a["view"] is not None:
+            return a["view"]["state"]
+        rec = self.table.get(a["id"])
+        return rec["state"] if rec is not None else "failed"
+
+    def conversations_list(self) -> dict:
+        with self.lock:
+            if self.conv_error:
+                return {"conversations": [], "kept": CONVERSATIONS_MAX, "error": self.conv_error}
+            return {"conversations": [
+                {"id": c["id"], "title": c["asks"][0]["question"][:LIST_QUESTION_MAX_CHARS],
+                 "updated_at": c["updated_at"], "asks": len(c["asks"]),
+                 "last_state": self._ask_state(c["asks"][-1])}
+                for c in self.conversations], "kept": CONVERSATIONS_MAX, "error": None}
+
+    def conversation(self, cid: str) -> dict:
+        """One conversation, its asks oldest first: an ended one as its entry
+        keeps it, a waiting or running one live from the table (its place in
+        the queue, its work so far). ToolRefusal when it is not kept (or the
+        file is damaged)."""
+        with self.lock:
+            if self.conv_error:
+                raise ToolRefusal(self.conv_error)
+            conv = next((c for c in self.conversations if c["id"] == cid), None)
+            if conv is None:
+                raise ToolRefusal(NO_SUCH_CONVERSATION)
+            queue = list(self.queue)
+            live = {a["id"]: dict(self.table[a["id"]]) for a in conv["asks"]
+                    if a["view"] is None and a["id"] in self.table}
+        asks = []
+        for a in conv["asks"]:
+            row = {"id": a["id"], "question": a["question"], "ahead": None, "reason": None,
+                   "summary": None, "sources": [], "tiers": []}
+            rec = live.get(a["id"])
+            if a["view"] is not None:
+                v, rep = a["view"], a["report"]
+                row.update(state=v["state"], waited_s=v["waited_s"], ran_s=v["ran_s"],
+                           tokens=v["tokens"], reason=v["reason"], work=v["work"])
+                if rep is not None:
+                    # The summary as text, so null means "no report".
+                    row.update(summary=_as_text(rep.get("summary")),
+                               sources=rep.get("sources"), tiers=rep.get("tiers"))
+            elif rec is not None:
+                tools = self._trace_tools(a["id"]) if rec["state"] != "queued" else []
+                v = self._build_view(rec, tools)
+                row.update(state=v["state"], waited_s=v["waited_s"], ran_s=v["ran_s"],
+                           tokens=v["tokens"], reason=v["reason"], work=v["work"])
+                if rec["state"] == "queued":
+                    row["ahead"] = queue.index(a["id"]) if a["id"] in queue else 0
+            else:
+                row.update(state="failed", waited_s=0, ran_s=0, tokens=0, reason=ASK_LOST,
+                           work=[])
+            asks.append(row)
+        return {"id": cid, "title": conv["asks"][0]["question"][:LIST_QUESTION_MAX_CHARS],
+                "asks": asks}
+
+    def conversations_clear(self) -> dict:
+        """Clear conversations: the file goes, by its name (a damaged one
+        too), and the store is empty. An ask still running keeps running and
+        is collected at its end as any ask is; it is no longer in any
+        conversation."""
+        with self.lock:
+            n = len(self.conversations)
+            try:
+                os.unlink(os.path.join(CONVERSATIONS_DIR, CONVERSATIONS_NAME))
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                raise ToolRefusal("the conversations could not be removed "
+                                  f"({e.strerror or 'remove failed'})")
+            self.conversations = []
+            self.conv_error = None
+        log(f"conversations cleared ({n})")
+        return {"cleared": n}
+
+    def _find_ask(self, sid: str) -> dict | None:
+        """Under the lock: an ended ask's entry in the conversations."""
+        for c in self.conversations:
+            for a in c["asks"]:
+                if a["id"] == sid and a["view"] is not None:
+                    return a
+        return None
+
+    def _ask_ended(self, rec: dict, line: dict) -> None:
+        """Under the lock, once per ask, when it ends (any way), after its
+        recent line: what its message shows from now on goes into its
+        conversation entry, which is saved (a failed save is logged; the
+        store keeps it, and the next save writes it)."""
+        sid, cid = rec["id"], rec["conversation"]
+        report = ({k: rec["outcome"][k] for k in ("summary", "sources", "tiers")}
+                  if "summary" in rec["outcome"] else None)
+        kept = []
+        found = False
+        for c in self.conversations:
+            if c["id"] == cid:
+                found = True
+                c = dict(c, asks=[dict(a, view=line["view"], report=report) if a["id"] == sid
+                                  else a for a in c["asks"]])
+            kept.append(c)
+        if not found:
+            return                          # cleared, or dropped as the oldest meanwhile
+        self.conversations = kept
+        problem = self._save_conversations(kept)
+        if problem:
+            log(f"ask {sid}: {problem}")
+
+    def _collect_ask(self, sid: str) -> None:
+        """Outside the lock, after _ask_ended: no agent collects an ask, so the
+        service does, at once: its container, network and volume (its files)
+        by name, and its row in the table."""
+        problems = remove_search(sid)
+        with self.lock:
+            self.table.pop(sid, None)
+        log(f"collected ask {sid}" + (f" ({'; '.join(problems)})" if problems else ""))
+
+    # --- the conversations file ---
+
+    def load_conversations(self) -> None:
+        """At start: the conversations file, or the damaged-file state (the
+        file is left untouched). An ask that had not ended when the service
+        stopped ends now, as failed, and the file is saved."""
+        convs, why = _read_conversations()
+        with self.lock:
+            if why is not None:
+                self.conv_error = CONVERSATIONS_DAMAGED.format(why=why)
+                log(f"conversations: {why}; kept as they are until cleared")
+                return
+            lost = False
+            for c in convs:
+                for a in c["asks"]:
+                    if a["view"] is None:
+                        lost = True
+                        a["view"] = {"id": a["id"], "state": "failed",
+                                     "question": a["question"], "searcher": a["searcher"],
+                                     "tokens": 0, "waited_s": 0, "ran_s": 0,
+                                     "reason": ASK_LOST, "work": [], "truncated": False}
+            self.conversations = convs
+            if lost:
+                problem = self._save_conversations(convs)
+                if problem:
+                    log(f"conversations: {problem}")
+        log(f"conversations: {len(convs)} kept")
+
+    def _save_conversations(self, convs: list[dict]) -> str | None:
+        """Under the lock: write the conversations (fresh temp + rename in
+        their folder; never opens an existing name). Past
+        CONVERSATIONS_MAX_BYTES the oldest conversations go from `convs` (in
+        place) first, then the oldest asks of the last one left. None, or why
+        it could not be written."""
+        def encode() -> bytes:
+            return json.dumps({"version": CONVERSATIONS_VERSION, "conversations": convs},
+                              ensure_ascii=False, separators=(",", ":")).encode()
+        data = encode()
+        while len(data) > CONVERSATIONS_MAX_BYTES:
+            if len(convs) > 1:
+                dropped = convs.pop()
+                log(f"conversation {dropped['id']} dropped: the conversations reached "
+                    f"{CONVERSATIONS_MAX_BYTES} bytes")
+            elif convs and len(convs[0]["asks"]) > 1:
+                convs[0] = dict(convs[0], asks=convs[0]["asks"][1:])
+                log(f"the oldest ask of conversation {convs[0]['id']} dropped: it reached "
+                    f"{CONVERSATIONS_MAX_BYTES} bytes")
+            else:
+                break
+            data = encode()
+        tmp = os.path.join(CONVERSATIONS_DIR, f".{CONVERSATIONS_NAME}.{secrets.token_hex(4)}")
+        try:
+            os.makedirs(CONVERSATIONS_DIR, mode=0o700, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, os.path.join(CONVERSATIONS_DIR, CONVERSATIONS_NAME))
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            return f"the conversations could not be saved ({e.strerror or 'write failed'})"
+        return None
 
     def get(self, project: str, sid: str) -> dict:
         """The caller's own search, or a not-found refusal (another project's
@@ -742,12 +1085,12 @@ class Searches:
             self.recent.pop()
         return kept
 
-    def _record_end(self, rec: dict, tools: list[dict]) -> None:
+    def _record_end(self, rec: dict, tools: list[dict]) -> dict:
         """Under the lock, once per search, when it ends (any way): its line
         in the recent list, with its work view as it ended (`tools`: its
         trace's tool calls, read outside the lock before it ended), and its
-        report when it ended with one."""
-        self.recent.appendleft({
+        report when it ended with one. Returns the line."""
+        line = {
             "id": rec["id"], "view": self._build_view(rec, tools),
             "report": (json.dumps({k: rec["outcome"][k] for k in ("summary", "sources", "tiers")},
                                   ensure_ascii=False, separators=(",", ":")).encode()
@@ -759,13 +1102,16 @@ class Searches:
             "ended_at": rec["finished_at"],
             "ran_s": (round(rec["finished_at"] - rec["started_at"])
                       if rec["started_at"] else 0),
-            "tokens": rec["stream"].tokens()})
+            "tokens": rec["stream"].tokens()}
+        self.recent.appendleft(line)
         self._trim_recent()
+        return line
 
     def view(self, sid: str) -> dict | None:
         """The operator's read-only view of one search: live while it is in
         the table (ended and not collected too), else as it ended, from its
-        recent line. None when it is in neither."""
+        recent line or (an ask) its conversation entry. None when it is in
+        none of them."""
         with self.lock:
             rec = self.table.get(sid)
             rec = dict(rec) if rec is not None else None
@@ -774,16 +1120,17 @@ class Searches:
                 for e in self.recent:
                     if e["id"] == sid:
                         return dict(e["view"])
-                return None
+                a = self._find_ask(sid)
+                return dict(a["view"]) if a is not None else None
         tools = self._trace_tools(sid) if rec["state"] != "queued" else []
         return self._build_view(rec, tools)
 
     def report(self, sid: str) -> dict | None:
         """The operator's read of one search's report, as the agent wrote it:
         from the table while it is there (ended with a report), else from its
-        recent line. `has_report` is False for a search the service knows that
-        has none (still running, or ended without one). None when it is in
-        neither."""
+        recent line or (an ask) its conversation entry. `has_report` is False
+        for a search the service knows that has none (still running, or ended
+        without one). None when it is in none of them."""
         with self.lock:
             rec = self.table.get(sid)
             if rec is not None:
@@ -803,7 +1150,15 @@ class Searches:
                         raw = e["report"]
                         break
                 else:
-                    return None
+                    a = self._find_ask(sid)
+                    if a is None:
+                        return None
+                    out = {"id": sid, "state": a["view"]["state"], "question": a["question"],
+                           "searcher": a["view"]["searcher"]}
+                    if a["report"] is None:
+                        return {**out, "has_report": False}
+                    return {**out, "has_report": True,
+                            **{k: a["report"][k] for k in ("summary", "sources", "tiers")}}
         if raw is None:
             return {**out, "has_report": False}
         return {**out, "has_report": True, **json.loads(raw)}
@@ -850,7 +1205,9 @@ class Searches:
                 rec["state"] = "failed"
                 rec["finished_at"] = time.time()
                 rec["outcome"] = {"reason": STOPPED_QUEUED}
-                self._record_end(rec, [])           # never started: no volume, no work
+                line = self._record_end(rec, [])    # never started: no volume, no work
+                if rec["conversation"] is not None:
+                    self._ask_ended(rec, line)
                 self.lock.notify_all()
                 state = "failed"
             else:
@@ -858,6 +1215,8 @@ class Searches:
                 state = rec["state"]
         if state == "failed":
             log(f"search {sid} failed: {STOPPED_QUEUED}")
+            if rec["project"] == OPERATOR_PROJECT:
+                self._collect_ask(sid)
         else:
             docker("kill", SEARCH_PREFIX + sid)
             log(f"stop {sid} asked by the operator")
@@ -908,16 +1267,22 @@ class Searches:
         # is gone, so the trace is final, and no collect can remove the
         # volume yet.
         tools = self._trace_tools(sid)
+        ask = False
         with self.lock:
             rec = self.table.get(sid)
             if rec is not None:
                 rec["state"] = state
                 rec["finished_at"] = time.time()
                 rec["outcome"] = outcome
-                self._record_end(rec, tools)
+                line = self._record_end(rec, tools)
+                ask = rec["project"] == OPERATOR_PROJECT
+                if ask and rec["conversation"] is not None:
+                    self._ask_ended(rec, line)
             self.running -= 1
             self.lock.notify_all()
         log(f"search {sid} {state}: {outcome['reason']}")
+        if ask:
+            self._collect_ask(sid)
 
     def _run(self, sid: str) -> None:
         if not self._wait_turn(sid):
@@ -943,6 +1308,139 @@ SEARCHES = Searches()
 
 class ToolRefusal(Exception):
     """A tool error whose text the caller reads."""
+
+
+def _as_text(value) -> str:
+    """A value of a report as text: a string as it is, anything else as its
+    JSON (the agent wrote it; any JSON value is possible)."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (ValueError, TypeError, RecursionError):
+        return ""
+
+
+def _source_line(s) -> str:
+    """One source of a report as one line: title · address · DOI (the keys
+    the agent is told to use and their likely variants, as the host reads
+    them; cli/rscore.py _SEARCH_SOURCE_FIELDS), or the item as text when it is
+    not an object."""
+    if not isinstance(s, dict):
+        return _as_text(s)
+    parts = []
+    for keys in (("title", "name"), ("url", "address", "link"), ("doi",)):
+        key = next((k for k in keys if k in s), None)
+        if key is not None and _as_text(s[key]).strip():
+            parts.append(_as_text(s[key]).strip())
+    return " · ".join(parts)
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _is_count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _ask_shape_ok(a) -> bool:
+    """One ask of the conversations file as the service writes it."""
+    if not (isinstance(a, dict) and set(a) == {"id", "question", "searcher", "submitted_at",
+                                               "view", "report"}
+            and isinstance(a["id"], str) and ID_RE.match(a["id"])
+            and isinstance(a["question"], str) and a["question"]
+            and isinstance(a["searcher"], str) and _is_num(a["submitted_at"])):
+        return False
+    v, rep = a["view"], a["report"]
+    if v is not None and not (
+            isinstance(v, dict) and v.get("id") == a["id"] and v.get("state") in ENDED
+            and isinstance(v.get("question"), str) and isinstance(v.get("searcher"), str)
+            and all(_is_count(v.get(k)) for k in ("tokens", "waited_s", "ran_s"))
+            and isinstance(v.get("reason"), str) and isinstance(v.get("truncated"), bool)
+            and isinstance(v.get("work"), list)
+            and all(isinstance(e, dict) and _is_num(e.get("ts"))
+                    and e.get("kind") in ("tool", "text") for e in v["work"])):
+        return False
+    if rep is not None and not (isinstance(rep, dict) and set(rep) == {"summary", "sources",
+                                                                       "tiers"}):
+        return False
+    return not (v is None and rep is not None)
+
+
+def _conversations_shape(data) -> list | None:
+    """The conversations of a parsed file, or None when it is not one the
+    service writes (its version, keys, ids, counts and the fields every read
+    uses)."""
+    if not (isinstance(data, dict) and set(data) == {"version", "conversations"}
+            and data["version"] == CONVERSATIONS_VERSION
+            and not isinstance(data["version"], bool)
+            and isinstance(data["conversations"], list)
+            and len(data["conversations"]) <= CONVERSATIONS_MAX):
+        return None
+    seen: set = set()
+    for c in data["conversations"]:
+        if not (isinstance(c, dict) and set(c) == {"id", "created_at", "updated_at", "asks"}
+                and isinstance(c["id"], str) and ID_RE.match(c["id"])
+                and _is_num(c["created_at"]) and _is_num(c["updated_at"])
+                and isinstance(c["asks"], list) and c["asks"]
+                and all(_ask_shape_ok(a) for a in c["asks"])):
+            return None
+        ids = [c["id"]] + [a["id"] for a in c["asks"]]
+        if seen & set(ids) or len(set(ids)) != len(ids):
+            return None
+        seen.update(ids)
+    return data["conversations"]
+
+
+def _read_conversations() -> tuple[list, str | None]:
+    """(the kept conversations, None), or ([], why the file is not one the
+    service wrote). No file is no conversations. Opened without following a
+    link and never blocking on a FIFO, read with its cap."""
+    try:
+        dfd = os.open(CONVERSATIONS_DIR, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return [], None
+    except OSError as e:
+        return [], f"their folder cannot be opened: {e.strerror or 'open failed'}"
+    try:
+        try:
+            fd, st = _open_file(dfd, CONVERSATIONS_NAME)
+        except FileNotFoundError:
+            return [], None
+        except OSError as e:
+            if e.errno in (0, errno.ELOOP):
+                return [], "the file is not a regular file"
+            return [], f"the file cannot be read: {e.strerror or 'read failed'}"
+        try:
+            if st.st_size > CONVERSATIONS_MAX_BYTES:
+                return [], (f"the file is larger than {CONVERSATIONS_MAX_BYTES // (1024 * 1024)} "
+                            "MiB, more than the service ever writes")
+            pieces, size = [], 0
+            while size <= CONVERSATIONS_MAX_BYTES:
+                piece = os.read(fd, PIECE)
+                if not piece:
+                    break
+                pieces.append(piece)
+                size += len(piece)
+            raw = b"".join(pieces)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return [], f"the file cannot be read: {e.strerror or 'read failed'}"
+    finally:
+        os.close(dfd)
+    if len(raw) > CONVERSATIONS_MAX_BYTES:
+        return [], (f"the file is larger than {CONVERSATIONS_MAX_BYTES // (1024 * 1024)} "
+                    "MiB, more than the service ever writes")
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return [], "the file is not valid JSON"
+    convs = _conversations_shape(data)
+    if convs is None:
+        return [], "the file does not have the shape the service writes"
+    return convs, None
 
 
 def remove_search(sid: str) -> list[str]:
@@ -1127,7 +1625,7 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
                "-e", f"RS_SEARCH_EFFORT={rec['effort']}",
                "-e", f"RS_SEARCH_CONTACT={rec['contact']}",
                "-e", f"RS_SEARCH_SEARXNG={'' if searxng_problem else 'on'}",
-               "-e", f"RS_SEARCH_QUESTION={rec['question']}",
+               "-e", f"RS_SEARCH_QUESTION={rec['prompt']}",
                "-v", f"{name}:{AGENT_VOLUME_MOUNT}",
                "-v", f"{CLAUDE_DIST}:/opt/claude:ro",
                AGENT_IMAGE)
@@ -1476,6 +1974,32 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(piece)
                 left -= len(piece)
 
+    def _ask(self) -> None:
+        """POST /admin/ask: {"question", "conversation" (an id or null),
+        "include"} as the host sends it. A refusal is 422 with its text."""
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = -1
+        if not 0 <= length <= ASK_BODY_MAX_BYTES:
+            return self._json(422, {"error": f"the question is longer than "
+                                              f"{QUESTION_MAX_CHARS} characters"})
+        try:
+            body = json.loads(self.rfile.read(length) or b"")
+        except (ValueError, RecursionError):
+            body = None
+        if not (isinstance(body, dict) and set(body) == {"question", "conversation", "include"}
+                and isinstance(body["question"], str) and isinstance(body["include"], bool)
+                and (body["conversation"] is None
+                     or (isinstance(body["conversation"], str)
+                         and ID_RE.match(body["conversation"])))):
+            return self._json(422, {"error": "the question did not arrive as RS sends it"})
+        try:
+            return self._json(200, SEARCHES.ask(body["question"], body["conversation"],
+                                                body["include"]))
+        except ToolRefusal as e:
+            return self._json(422, {"error": str(e)})
+
     def _admin(self, path: str, post: bool) -> None:
         if not self._local():
             return self._json(404, {"error": "not found"})
@@ -1496,6 +2020,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, SEARCHES.active())
         if path == "/admin/test" and post:
             return self._json(200, sign_in_test())
+        if path == "/admin/ask" and post:
+            return self._ask()
+        if path == "/admin/conversations" and not post:
+            return self._json(200, SEARCHES.conversations_list())
+        if path == "/admin/conversations/clear" and post:
+            try:
+                return self._json(200, SEARCHES.conversations_clear())
+            except ToolRefusal as e:
+                return self._json(422, {"error": str(e)})
+        if path.startswith("/admin/conversation/") and not post:
+            cid = path[len("/admin/conversation/"):]
+            if not ID_RE.match(cid):
+                return self._json(404, {"error": NO_SUCH_CONVERSATION})
+            try:
+                return self._json(200, SEARCHES.conversation(cid))
+            except ToolRefusal as e:
+                return self._json(404 if str(e) == NO_SUCH_CONVERSATION else 422,
+                                  {"error": str(e)})
         for prefix, is_post, act in (("/admin/view/", False, SEARCHES.view),
                                      ("/admin/report/", False, SEARCHES.report),
                                      ("/admin/stop/", True, SEARCHES.stop)):
@@ -1510,6 +2052,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve() -> None:
     os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    SEARCHES.load_conversations()
     remove_leftovers()
     state, _labels = container_state(SEARXNG_CONTAINER)
     if state != "absent":
@@ -1555,28 +2098,42 @@ def drop(name: str) -> int:
 
 
 # The exit code of `admin` when the service answered with a refusal (its JSON
-# error on stdout): no such search for view / report / stop.
+# error on stdout): no such search for view / report / stop, no such
+# conversation, or an ask or a clear refused (its text in `error`).
 ADMIN_REFUSED_EXIT = 3
-_ADMIN_GET = ("status", "list", "view", "report")
-_ADMIN_WITH_ID = ("view", "report", "stop")
+# Each admin request: its route and whether it is a GET. `ask` sends its
+# stdin as the body.
+_ADMIN_ROUTES = {"status": ("status", True), "ensure": ("ensure", False),
+                 "clear": ("clear", False), "list": ("list", True), "test": ("test", False),
+                 "view": ("view", True), "report": ("report", True), "stop": ("stop", False),
+                 "ask": ("ask", False), "conversations": ("conversations", True),
+                 "conversations-clear": ("conversations/clear", False),
+                 "conversation": ("conversation", True)}
+_ADMIN_WITH_ID = ("view", "report", "stop", "conversation")
 
 
 def admin(what: str, sid: str | None = None) -> int:
-    known = ("status", "ensure", "clear", "list", "test") + _ADMIN_WITH_ID
-    if what not in known or (what in _ADMIN_WITH_ID) != (sid is not None) \
+    if what not in _ADMIN_ROUTES or (what in _ADMIN_WITH_ID) != (sid is not None) \
             or (sid is not None and not ID_RE.match(sid)):
         sys.stderr.write("unknown admin request\n")
         return 2
-    get = what in _ADMIN_GET
-    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/admin/{what}"
+    route, get = _ADMIN_ROUTES[what]
+    body = b""
+    if what == "ask":
+        body = sys.stdin.buffer.read(ASK_BODY_MAX_BYTES + 1)
+        if len(body) > ASK_BODY_MAX_BYTES:
+            sys.stderr.write("too large\n")
+            return 2
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/admin/{route}"
                                  + (f"/{sid}" if sid else ""),
                                  method="GET" if get else "POST",
-                                 data=None if get else b"")
+                                 data=None if get else body,
+                                 headers={} if get else {"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=ADMIN_CALL_S) as resp:
             sys.stdout.write(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
-        if e.code != 404:
+        if e.code not in (404, 422):
             sys.stderr.write(f"the search service refused the request (HTTP {e.code})\n")
             return 1
         sys.stdout.write(e.read().decode("utf-8", "replace"))
@@ -1598,7 +2155,8 @@ def main(argv: list) -> int:
     if len(argv) in (2, 3) and argv[0] == "admin":
         return admin(*argv[1:])
     sys.stderr.write("usage: service.py serve | put NAME | drop NAME | admin "
-                     "status|ensure|clear|list|test | admin view|report|stop ID\n")
+                     "status|ensure|clear|list|test|conversations|conversations-clear | "
+                     "admin ask (the body on stdin) | admin view|report|stop|conversation ID\n")
     return 2
 
 

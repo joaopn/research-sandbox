@@ -8,7 +8,9 @@ installation, turned on by the operator (Services → Search):
     (rs-sandbox-dind) plus the service program (container/search/). Its inner
     Docker keeps its images on the named volume ``rs-search-docker``, so the
     search images are staged into it once (at Turn on, and again only when
-    the host's image changes) and survive a restart and a re-create;
+    the host's image changes) and survive a restart and a re-create; the
+    operator's Quick Ask conversations live on ``rs-search-conversations``,
+    kept the same way;
   - on ``rs-search-net``, its own ``--internal`` network with RS's router on
     it: the route out is injected after every start and the router holds a
     locked project's rules for its range (TCP 80/443, DNS to the configured
@@ -59,6 +61,14 @@ AGENT_IMAGE = "rs-search-agent:latest"
 # The service's inner Docker store (images, search volumes): kept at Turn off,
 # so turning the service on again does not stage the images again.
 DOCKER_VOLUME = "rs-search-docker"
+# The operator's conversations (the Search page's Quick Ask), one file the
+# service alone writes, on a volume of their own mounted at this path in the
+# service container (container/search/service.py CONVERSATIONS_DIR — MIRROR).
+# Made by RS with OWNER_LABEL before the container that mounts it, and kept at
+# Turn off like DOCKER_VOLUME, so the conversations outlive a restart and a
+# re-create of the service.
+CONVERSATIONS_VOLUME = "rs-search-conversations"
+SERVICE_CONVERSATIONS_DIR = "/var/lib/rs-search-conversations"
 EGRESS_NETWORK = "rs-search-net"
 FRONT_NETWORK = "rs-search-front"
 # Every network and the container carry this label; a thing of one of these
@@ -237,6 +247,11 @@ def egress_network_create_argv(base: list[str]) -> list[str]:
     return base[:3] + ["--internal"] + owner_labels() + base[3:]
 
 
+def conversations_volume_create_argv() -> list[str]:
+    """The conversations' volume, by name and labelled as RS's."""
+    return ["docker", "volume", "create"] + owner_labels() + [CONVERSATIONS_VOLUME]
+
+
 def front_network_create_argv() -> list[str]:
     """The gateway's way in. `--internal` (nothing leaves by it), by name."""
     return ["docker", "network", "create", "--internal"] + owner_labels() + [FRONT_NETWORK]
@@ -265,6 +280,7 @@ def service_run_argv(*, dind_mode: str, dns: list[str], pins: dict[str, str],
     else:
         argv += ["--privileged"]
     argv += ["-v", f"{DOCKER_VOLUME}:/var/lib/docker",
+             "-v", f"{CONVERSATIONS_VOLUME}:{SERVICE_CONVERSATIONS_DIR}",
              "--tmpfs", "/workspace",
              "--tmpfs", f"{SERVICE_RUN_DIR}:mode=0700",
              "-v", f"{agent_dist_dir}:{SERVICE_AGENT_DIST}:ro",
@@ -321,7 +337,7 @@ def default_settings() -> dict[str, Any]:
     return {"version": SETTINGS_VERSION,
             "searcher": {"name": DEFAULT_SEARCHER_NAME, "model": DEFAULT_MODEL,
                          "effort": DEFAULT_EFFORT, "at_once": DEFAULT_AT_ONCE},
-            "contact": "", "recent": DEFAULT_RECENT}
+            "contact": "", "recent": DEFAULT_RECENT, "sidebar": False}
 
 
 def searcher_name_problem(name: Any) -> str | None:
@@ -345,6 +361,12 @@ def recent_problem(value: Any) -> str | None:
     return None
 
 
+def sidebar_problem(value: Any) -> str | None:
+    if not isinstance(value, bool):
+        return "showing Search in the sidebar is either on or off"
+    return None
+
+
 def contact_problem(value: Any) -> str | None:
     if not isinstance(value, str):
         return "the contact address must be text"
@@ -357,9 +379,11 @@ def contact_problem(value: Any) -> str | None:
 def settings_problem(data: Any, model_ok) -> str | None:
     """Why `data` is not a valid settings record, or None. `model_ok(model,
     effort)` is the catalog's check (rscore passes it in: this module does
-    not import the model catalog). A record without `recent` is valid: it was
-    saved before that setting existed (read_settings fills the default)."""
-    if not isinstance(data, dict) or set(data) - {"recent"} != {"version", "searcher", "contact"}:
+    not import the model catalog). A record without `recent` or `sidebar` is
+    valid: it was saved before that setting existed (read_settings fills the
+    default)."""
+    if not isinstance(data, dict) \
+            or set(data) - {"recent", "sidebar"} != {"version", "searcher", "contact"}:
         return "it does not have the expected shape"
     if data["version"] != SETTINGS_VERSION or isinstance(data["version"], bool):
         return "it was written by another version of RS"
@@ -368,7 +392,8 @@ def settings_problem(data: Any, model_ok) -> str | None:
         return "its searcher does not have the expected shape"
     for problem in (searcher_name_problem(s["name"]), at_once_problem(s["at_once"]),
                     contact_problem(data["contact"]),
-                    recent_problem(data["recent"]) if "recent" in data else None):
+                    recent_problem(data["recent"]) if "recent" in data else None,
+                    sidebar_problem(data["sidebar"]) if "sidebar" in data else None):
         if problem:
             return problem
     if not isinstance(s["model"], str) or not isinstance(s["effort"], str):
@@ -399,6 +424,7 @@ def read_settings(model_ok, path: Path | None = None) -> dict[str, Any]:
     if problem:
         raise SearchError(SETTINGS_DAMAGED.format(why=problem))
     data.setdefault("recent", DEFAULT_RECENT)       # saved before the setting existed
+    data.setdefault("sidebar", False)               # likewise
     return data
 
 

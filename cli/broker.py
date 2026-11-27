@@ -702,6 +702,36 @@ def _verb_search_test(_args: dict, _progress=None) -> dict:
     return rscore.search_test(rscore._mcp_deadline())
 
 
+def _verb_search_ask(args: dict, _progress=None) -> dict:
+    """The operator's question (Quick Ask): a search in the same queue as the
+    agents' (fields `question`, `conversation`, `include`)."""
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    safe = {k: v for k, v in args.items() if k in SEARCH_ASK_WEBUI_FIELDS}
+    req = rscore.SearchAskRequest.from_kwargs(**safe)
+    return rscore.search_ask(req, deadline)
+
+
+def _verb_search_conversations(_args: dict, _progress=None) -> dict:
+    """The kept conversations, the one asked in last first."""
+    return rscore.search_conversations(rscore._mcp_deadline())
+
+
+def _verb_search_conversation(args: dict, _progress=None) -> dict:
+    """One kept conversation with its asks (field `id`)."""
+    deadline = rscore._mcp_deadline()
+    safe = {k: v for k, v in args.items() if k in SEARCH_ID_WEBUI_FIELDS}
+    req = rscore.SearchConversationRequest.from_kwargs(**safe)
+    return rscore.search_conversation(req, deadline)
+
+
+def _verb_search_conversations_clear(_args: dict, _progress=None) -> dict:
+    """Clear conversations (a damaged file too)."""
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    return rscore.search_conversations_clear(deadline)
+
+
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
@@ -1544,9 +1574,13 @@ MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
 # The one searcher and the contact address, saved whole.
 SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact",
-                                          "recent"})
-# One search in the service (view, report, stop), by its id.
+                                          "recent", "sidebar"})
+# One search in the service (view, report, stop), or one kept conversation,
+# by its id.
 SEARCH_ID_WEBUI_FIELDS = frozenset({"id"})
+# The operator's question from the Search page: the text, the conversation it
+# continues (or null for a new one), and whether to include that conversation.
+SEARCH_ASK_WEBUI_FIELDS = frozenset({"question", "conversation", "include"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # Put one version pin back to the shipped value (the Host → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
@@ -1825,6 +1859,10 @@ VERBS = {
     "search_report": _verb_search_report,
     "search_stop": _verb_search_stop,
     "search_test": _verb_search_test,
+    "search_ask": _verb_search_ask,
+    "search_conversations": _verb_search_conversations,
+    "search_conversation": _verb_search_conversation,
+    "search_conversations_clear": _verb_search_conversations_clear,
     "mcp_server_add": _verb_mcp_server_add,
     "mcp_server_draft": _verb_mcp_server_draft,
     "mcp_server_edit": _verb_mcp_server_edit,

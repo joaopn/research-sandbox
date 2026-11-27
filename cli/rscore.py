@@ -23310,6 +23310,22 @@ def _search_networks_up() -> bool:
     return fresh
 
 
+def _search_conversations_volume_up() -> None:
+    """The conversations' volume made (labelled as RS's) before the service
+    container that mounts it, or checked to be RS's own; one of that name RS
+    did not make is refused, never used."""
+    r = _search_docker(["docker", "volume", "inspect", "-f", "{{json .Labels}}",
+                        search.CONVERSATIONS_VOLUME], None)
+    if r.returncode == 0:
+        if _mcp_run_labels(r.stdout.strip()).get(search.OWNER_LABEL) != search.OWNER_VALUE:
+            raise _search_foreign("volume", search.CONVERSATIONS_VOLUME)
+        return
+    r = _search_docker(search.conversations_volume_create_argv(), None)
+    if r.returncode != 0:
+        raise _search_failed(f"the search service's volume {search.CONVERSATIONS_VOLUME} "
+                             "could not be created", r)
+
+
 def _search_inject_route() -> None:
     """The service's default route via the router (after every start: its
     networks are `--internal`, so it has none of its own)."""
@@ -23449,6 +23465,7 @@ def _search_up(progress) -> None:
 
     progress.step("start", "starting the search service")
     fresh_network = _search_networks_up()
+    _search_conversations_volume_up()
     want_id = _search_image_content(search.SERVICE_IMAGE)
     state, labels = _search_container(None)
     if state != "absent" and labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
@@ -23550,8 +23567,8 @@ def search_off(*, blocking: bool = True, deadline: float | None = None) -> dict:
     """Turn the search service off: its gateway entry (only when it is RS's —
     which also unwires it everywhere), the container (every running search
     ends with it) and both networks go; the inner Docker's volume (the staged
-    images), the settings and the token stay, so turning it on again finds
-    them. Bounded by `deadline` on the broker; idempotent, so a refusal
+    images), the conversations' volume, the settings and the token stay, so
+    turning it on again finds them. Bounded by `deadline` on the broker; idempotent, so a refusal
     half-way is finished by running it again."""
     try:
         mcp_server_remove(McpServerNameRequest(name=search.MCP_SERVER_NAME),
@@ -23681,17 +23698,19 @@ class SearchSettingsRequest:
     at_once: int
     contact: str
     recent: int
+    sidebar: bool
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "SearchSettingsRequest":
-        missing = [k for k in ("name", "model", "effort", "at_once", "contact", "recent")
-                   if k not in kw]
+        missing = [k for k in ("name", "model", "effort", "at_once", "contact", "recent",
+                               "sidebar") if k not in kw]
         if missing:
             raise ValidationError(f"the searcher needs {', '.join(missing)}")
         for problem in (search.searcher_name_problem(kw["name"]),
                         search.at_once_problem(kw["at_once"]),
                         search.contact_problem(kw["contact"]),
-                        search.recent_problem(kw["recent"])):
+                        search.recent_problem(kw["recent"]),
+                        search.sidebar_problem(kw["sidebar"])):
             if problem:
                 raise ValidationError(problem)
         model, effort = kw["model"], kw["effort"]
@@ -23701,7 +23720,8 @@ class SearchSettingsRequest:
         if problem:
             raise ValidationError(problem)
         return cls(name=kw["name"], model=model, effort=effort, at_once=kw["at_once"],
-                   contact=kw["contact"].strip(), recent=kw["recent"])
+                   contact=kw["contact"].strip(), recent=kw["recent"],
+                   sidebar=kw["sidebar"])
 
 
 def search_token_set(req: SearchTokenRequest, *, blocking: bool = True,
@@ -23766,7 +23786,7 @@ def search_settings_set(req: SearchSettingsRequest, *, blocking: bool = True,
     data = {"version": search.SETTINGS_VERSION,
             "searcher": {"name": req.name, "model": req.model, "effort": req.effort,
                          "at_once": req.at_once},
-            "contact": req.contact, "recent": req.recent}
+            "contact": req.contact, "recent": req.recent, "sidebar": req.sidebar}
     try:
         with _search_lock(blocking):
             try:
@@ -23854,20 +23874,28 @@ class SearchIdRequest:
         return cls(id=sid)
 
 
-def _search_ask(args: list[str], deadline: float) -> tuple[str, Any]:
-    """One admin request to the running service: ("ok", its JSON), or
-    ("refused", None) when it answered that there is no such search. Refuses
-    (ValidationError) when the service is not running or does not answer."""
+def _search_ask(args: list[str], deadline: float,
+                body: str | None = None) -> tuple[str, Any]:
+    """One admin request to the running service (`body` on its stdin): ("ok",
+    its JSON), or ("refused", the refusal's JSON or None) when it answered
+    that there is no such search or conversation, or refused the request.
+    Refuses (ValidationError) when the service is not running or does not
+    answer."""
     try:
         state, labels = _search_container(deadline)
         if state != "running" or labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
             raise search.SearchError(SEARCH_OFF)
-        r = _search_docker(["docker", "exec", search.SERVICE_CONTAINER, *_SEARCH_PY,
-                            "admin", *args], deadline)
+        r = _search_docker(["docker", "exec", *(["-i"] if body is not None else []),
+                            search.SERVICE_CONTAINER, *_SEARCH_PY, "admin", *args],
+                           deadline, input=body)
     except search.SearchError as e:
         raise ValidationError(str(e)) from None
     if r.returncode == _SEARCH_ADMIN_REFUSED_EXIT:
-        return "refused", None
+        try:
+            refusal = json.loads(r.stdout)
+        except (ValueError, RecursionError):
+            refusal = None
+        return "refused", refusal
     if r.returncode != 0:
         raise ValidationError(SEARCH_NO_ANSWER)
     try:
@@ -24109,6 +24137,161 @@ def search_test(deadline: float | None = None) -> dict:
     if not isinstance(t.get("ok"), bool):
         raise ValidationError(SEARCH_BAD_ANSWER)
     return {"ok": t["ok"], "text": _search_reply_str(t.get("text"), _SEARCH_REASON_MAX)}
+
+
+# --- the operator's own questions (the Search page's Quick Ask) ----------------
+# An ask is a search in the service's one queue under the project no caller
+# can be (service.py OPERATOR_PROJECT), kept with its answer in a conversation
+# on the service's own volume. The service says why it refuses an ask or a
+# read (a damaged conversations file, an unknown conversation, a conversation
+# too long to include): that text is passed on, as text, cut at a reason's cap.
+
+SEARCH_NO_CONVERSATION = "no conversation with that id is kept"   # service.py NO_SUCH_CONVERSATION
+SEARCH_EMPTY_QUESTION = "the question is empty"
+
+
+@dataclass(frozen=True)
+class SearchAskRequest:
+    # What the operator typed, the conversation it continues (None: a new
+    # one) and whether the searcher is asked the conversation's earlier
+    # questions and answers too.
+    question: str
+    conversation: str | None
+    include: bool
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "SearchAskRequest":
+        question = kw.get("question")
+        if not isinstance(question, str) or not question.strip():
+            raise ValidationError(SEARCH_EMPTY_QUESTION)
+        if len(question.strip()) > _SEARCH_QUESTION_MAX:
+            raise ValidationError(f"the question is longer than {_SEARCH_QUESTION_MAX} "
+                                  "characters")
+        cid = kw.get("conversation")
+        if cid is not None and (not isinstance(cid, str) or not _SEARCH_ID_RE.match(cid)):
+            raise ValidationError("that is not the id of a conversation (16 characters, "
+                                  "digits and a-f)")
+        include = kw.get("include")
+        if not isinstance(include, bool):
+            raise ValidationError("including the conversation is either on or off")
+        return cls(question=question.strip(), conversation=cid, include=include)
+
+
+@dataclass(frozen=True)
+class SearchConversationRequest:
+    # One kept conversation, by the id the service minted.
+    id: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "SearchConversationRequest":
+        cid = kw.get("id")
+        if not isinstance(cid, str) or not _SEARCH_ID_RE.match(cid):
+            raise ValidationError("that is not the id of a conversation (16 characters, "
+                                  "digits and a-f)")
+        return cls(id=cid)
+
+
+def _search_refusal(refusal: Any, fallback: str) -> ValidationError:
+    """The service's refusal text (cut at a reason's cap), or `fallback`."""
+    text = refusal.get("error") if isinstance(refusal, dict) else None
+    return ValidationError(text[:_SEARCH_REASON_MAX] if isinstance(text, str) and text.strip()
+                           else fallback)
+
+
+def search_ask(req: SearchAskRequest, deadline: float | None = None) -> dict:
+    """Ask the searcher a question from the Search page: it waits in the same
+    queue as the agents' searches and runs like one. {"conversation", "ask",
+    "state": "queued"}."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    body = json.dumps({"question": req.question, "conversation": req.conversation,
+                       "include": req.include}, ensure_ascii=False)
+    how, out = _search_ask(["ask"], deadline, body=body)
+    if how == "refused":
+        raise _search_refusal(out, SEARCH_NO_ANSWER)
+    a = _search_reply_dict(out)
+    if a.get("state") != "queued" or (req.conversation is not None
+                                      and a.get("conversation") != req.conversation):
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    return {"conversation": _search_reply_id(a.get("conversation")),
+            "ask": _search_reply_id(a.get("ask")), "state": "queued"}
+
+
+def search_conversations(deadline: float | None = None) -> dict:
+    """The kept conversations, the one asked in last first: each with its
+    title (its first question, cut), when it was last asked in, how many asks
+    it holds and the state of its last. `error` instead (and no
+    conversations) while the service's file cannot be read as RS wrote it."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    _how, out = _search_ask(["conversations"], deadline)
+    reply = _search_reply_dict(out)
+    items, error = reply.get("conversations"), reply.get("error")
+    if not isinstance(items, list) or (error is not None and items):
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    convs = []
+    for raw in items:
+        c = _search_reply_dict(raw)
+        convs.append({"id": _search_reply_id(c.get("id")),
+                      "title": _search_reply_str(c.get("title"), _SEARCH_LIST_QUESTION_MAX),
+                      "updated_at": _search_reply_ts(c.get("updated_at")),
+                      "asks": _search_reply_int(c.get("asks")),
+                      "last_state": _search_reply_choice(c.get("last_state"), _SEARCH_STATES)})
+    return {"conversations": convs, "kept": _search_reply_int(reply.get("kept")),
+            "error": None if error is None else _search_reply_str(error, _SEARCH_REASON_MAX)}
+
+
+def _search_ask_row(raw: Any) -> dict:
+    """One ask of a conversation, checked again: a report's parts as
+    search_report gives them, its work as search_view does."""
+    a = _search_reply_dict(raw)
+    state = _search_reply_choice(a.get("state"), _SEARCH_STATES)
+    ahead, reason, summary = a.get("ahead"), a.get("reason"), a.get("summary")
+    work = a.get("work")
+    if not isinstance(work, list) or (state == "queued") != (ahead is not None):
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    work = [_search_work_entry(e) for e in work]
+    return {"id": _search_reply_id(a.get("id")),
+            "question": _search_reply_str(a.get("question"), _SEARCH_QUESTION_MAX),
+            "state": state,
+            "waited_s": _search_reply_int(a.get("waited_s")),
+            "ran_s": _search_reply_int(a.get("ran_s")),
+            "tokens": _search_reply_int(a.get("tokens")),
+            "ahead": None if ahead is None else _search_reply_int(ahead),
+            "reason": None if reason is None else _search_reply_str(reason, _SEARCH_REASON_MAX),
+            # No report: no summary, no sources, no tiers. A report's parts
+            # exactly as search_report normalises them.
+            "summary": None if summary is None else _search_report_text(summary),
+            "sources": [] if summary is None else _search_report_items(a.get("sources"),
+                                                                       _SEARCH_SOURCE_FIELDS),
+            "tiers": [] if summary is None else _search_report_items(a.get("tiers"),
+                                                                     _SEARCH_TIER_FIELDS),
+            "work": work[-_SEARCH_WORK_MAX:]}
+
+
+def search_conversation(req: SearchConversationRequest, deadline: float | None = None) -> dict:
+    """One kept conversation, its asks oldest first: each with the question
+    as the operator typed it, its state, times and tokens, its place in the
+    queue while it waits, why it ended, its report (summary, sources, tiers)
+    and its work (live while it runs, as it ended afterwards)."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    how, out = _search_ask(["conversation", req.id], deadline)
+    if how == "refused":
+        raise _search_refusal(out, SEARCH_NO_CONVERSATION)
+    c = _search_reply_dict(out)
+    if c.get("id") != req.id or not isinstance(c.get("asks"), list):
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    return {"id": req.id,
+            "title": _search_reply_str(c.get("title"), _SEARCH_LIST_QUESTION_MAX),
+            "asks": [_search_ask_row(a) for a in c["asks"]]}
+
+
+def search_conversations_clear(deadline: float | None = None) -> dict:
+    """Clear conversations: the service's file goes, by its name (a damaged
+    one too, so asking works again). {"cleared": how many went}."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    how, out = _search_ask(["conversations-clear"], deadline)
+    if how == "refused":
+        raise _search_refusal(out, SEARCH_NO_ANSWER)
+    return {"cleared": _search_reply_int(_search_reply_dict(out).get("cleared"))}
 
 
 def _supervisor_mcp_reload(container_name: str) -> None:
