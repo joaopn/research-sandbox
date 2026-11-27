@@ -1,0 +1,80 @@
+# rs-search-browser — the browser tier of one search: Playwright's tool server
+# over HTTP with its headless Chromium, one container per search on the
+# search's own network (container/search/service.py starts it beside the
+# search agent, names it after the search and removes it by name).
+#
+# Hardened by the service as the agent is (no capability, no privilege gain,
+# uid 1000), so Chromium runs without its own sandbox (--no-sandbox: its
+# sandbox needs the user namespaces and capabilities the container does not
+# have); the container is the boundary. Chromium is launched by the tool
+# server at the first page, over a pipe (no browser port on the network).
+# Downloads and every file the tool server writes go to /output, the search
+# volume's files folder.
+#
+# Pins come from versions.env (passed as build args by the host, like the
+# runner's): NODE_VERSION (the node seed's pin) and
+# SEARCH_PLAYWRIGHT_MCP_VERSION (the search's own Playwright tool server, kept
+# apart from the boxes' PLAYWRIGHT_MCP_VERSION because the stealth image's
+# pip Playwright must match it). The base is pinned by tag.
+FROM python:3.12.16-slim-bookworm
+
+ARG NODE_VERSION=24.18.0
+ARG SEARCH_PLAYWRIGHT_MCP_VERSION=0.0.76
+
+# Node from the official nodejs.org tarball, fetched with the base's Python
+# (the slim base has no curl), as rs-mcp-runner does.
+RUN python3 - <<'PYEOF'
+import os, platform, urllib.request
+ver = os.environ["NODE_VERSION"]
+arch = {"x86_64": "x64", "aarch64": "arm64"}[platform.machine()]
+urllib.request.urlretrieve(f"https://nodejs.org/dist/v{ver}/node-v{ver}-linux-{arch}.tar.gz",
+                           "/tmp/node.tar.gz")
+PYEOF
+RUN mkdir -p /opt/node \
+ && tar -xzf /tmp/node.tar.gz -C /opt/node --strip-components=1 --no-same-owner \
+ && rm /tmp/node.tar.gz
+ENV PATH=/opt/node/bin:$PATH
+
+# The tool server, and the Chromium its bundled Playwright drives (with the
+# system libraries Playwright lists for it), installed at build — nothing is
+# fetched when a search starts. dumb-init reaps the browser's processes.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends dumb-init \
+ && npm install -g --no-audit --no-fund --no-update-notifier \
+        "@playwright/mcp@${SEARCH_PLAYWRIGHT_MCP_VERSION}" \
+ && mkdir -p "$PLAYWRIGHT_BROWSERS_PATH" \
+ && cd "$(npm root -g)/@playwright/mcp" \
+ && PATH="$PWD/node_modules/.bin:$PATH" playwright install --with-deps chromium \
+ && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH" \
+ && npm cache clean --force \
+ && rm -rf /var/lib/apt/lists/*
+
+# The sidecar's user (uid 1000, what the service runs it as) and the output
+# folder's mount point.
+RUN useradd -m -u 1000 -s /bin/sh browser \
+ && mkdir -p /output \
+ && chown browser:browser /output
+
+COPY container/search/browser-config.json /opt/rs-search-browser/config.json
+RUN chmod 644 /opt/rs-search-browser/config.json
+
+USER browser
+WORKDIR /home/browser
+# The tool server's port (service.py SIDECAR_PORT — MIRROR). Every client
+# session gets a browser context of its own; the profile lives in memory.
+# --allowed-hosts '*': the server otherwise answers only to the name it is
+# bound to, and the agent reaches it by the container's name.
+# Nothing but downloads lands in /output (the caller's files): with
+# --snapshot-mode=none a page action returns no snapshot (it would be written
+# as a page-<time>.yml file there, which the agent in another container cannot
+# read; browser_snapshot returns the page inline), and the config's console
+# level "none" (no level matches it) keeps the tool server from writing the
+# page's console as console-<time>.log files there (browser_console_messages
+# still returns it inline). Measured on 0.0.76.
+EXPOSE 8931
+ENTRYPOINT ["dumb-init", "--", "playwright-mcp", "--headless", "--browser=chromium", \
+            "--no-sandbox", "--isolated", "--image-responses=omit", \
+            "--snapshot-mode=none", "--config=/opt/rs-search-browser/config.json", \
+            "--output-dir=/output", \
+            "--port=8931", "--host=0.0.0.0", "--allowed-hosts=*"]

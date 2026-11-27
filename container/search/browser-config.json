@@ -1,0 +1,2 @@
+{"browser": {"launchOptions": {"args": ["--disable-dev-shm-usage"]}},
+ "console": {"level": "none"}}

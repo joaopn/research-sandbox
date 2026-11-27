@@ -1,0 +1,128 @@
+# rs-search-stealth — the stealth browser tier of one search: camoufox (a
+# Firefox built to look like a person's browser) driven through Playwright's
+# tool server over HTTP, one container per search on the search's own network
+# (container/search/service.py starts it beside the search agent, names it
+# after the search and removes it by name).
+#
+# One container, two servers (stealth-start.py, under dumb-init):
+#   - Playwright's tool server on its port (service.py SIDECAR_PORT —
+#     MIRROR), connected to the browser through `remoteEndpoint`;
+#   - camoufox's browser server, on 127.0.0.1 only (the raw browser control
+#     port gives full browser control and bypasses the agent's deny list, so
+#     nothing on the network reaches it), started at the tool server's first
+#     connection to it (a search that never needs the stealth browser never
+#     starts it).
+# Hardened by the service as the agent is (no capability, no privilege gain,
+# uid 1000); the container is the boundary.
+#
+# Pins come from versions.env (build args passed by the host):
+#   NODE_VERSION                   the node seed's pin (the tool server's Node)
+#   SEARCH_PLAYWRIGHT_MCP_VERSION  the tool server, the browser tier's too
+#   SEARCH_PLAYWRIGHT_PY_VERSION   pip Playwright: the version the tool server
+#                                  bundles (camoufox's browser server refuses
+#                                  a client of another Playwright version,
+#                                  "428 Precondition Required"), checked below
+#   CAMOUFOX_VERSION               the camoufox package
+#   CAMOUFOX_BROWSER_VERSION       the camoufox browser build its fetch step
+#                                  downloads (`camoufox fetch official/<it>`)
+#   CAMOUFOX_BROWSER_SHA256        that download's sha256 (camoufox checks the
+#                                  download against its release index's
+#                                  checksum; the build checks that checksum
+#                                  is this one)
+# The base is pinned by tag.
+FROM python:3.12.16-slim-bookworm
+
+ARG NODE_VERSION=24.18.0
+ARG SEARCH_PLAYWRIGHT_MCP_VERSION=0.0.76
+ARG SEARCH_PLAYWRIGHT_PY_VERSION=1.61.0
+ARG CAMOUFOX_VERSION=0.5.9
+ARG CAMOUFOX_BROWSER_VERSION=158.0.1-beta.41
+ARG CAMOUFOX_BROWSER_SHA256=3f2eb1d0451fa58e45e43e55f5e6181565069791ae60c0574f0ceb1f01341c33
+
+# Node from the official nodejs.org tarball (as in Dockerfile.browser).
+RUN python3 - <<'PYEOF'
+import os, platform, urllib.request
+ver = os.environ["NODE_VERSION"]
+arch = {"x86_64": "x64", "aarch64": "arm64"}[platform.machine()]
+urllib.request.urlretrieve(f"https://nodejs.org/dist/v{ver}/node-v{ver}-linux-{arch}.tar.gz",
+                           "/tmp/node.tar.gz")
+PYEOF
+RUN mkdir -p /opt/node \
+ && tar -xzf /tmp/node.tar.gz -C /opt/node --strip-components=1 --no-same-owner \
+ && rm /tmp/node.tar.gz
+ENV PATH=/opt/node/bin:$PATH
+
+# The tool server (no browser of its own: it drives camoufox remotely).
+RUN npm install -g --no-audit --no-fund --no-update-notifier \
+        "@playwright/mcp@${SEARCH_PLAYWRIGHT_MCP_VERSION}" \
+ && npm cache clean --force
+
+# camoufox and the pip Playwright at their pins, then the check that the two
+# Playwright versions agree (major.minor: what Playwright's own handshake
+# compares, "server version: v1.62, client version: v1.61").
+RUN pip install --no-cache-dir "camoufox==${CAMOUFOX_VERSION}" \
+        "playwright==${SEARCH_PLAYWRIGHT_PY_VERSION}"
+RUN python3 - <<'PYEOF'
+import importlib.metadata, json, os, subprocess, sys
+root = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, check=True).stdout.strip()
+mcp_dir = os.path.join(root, "@playwright", "mcp")
+node = subprocess.run(["node", "-p", "require(require.resolve('playwright-core/package.json', "
+                       f"{{paths: [{json.dumps(mcp_dir)}]}})).version"],
+                      capture_output=True, text=True, check=True).stdout.strip()
+pip = importlib.metadata.version("playwright")
+mm = lambda v: ".".join(v.split("-")[0].split(".")[:2])
+if mm(node) != mm(pip):
+    sys.exit(f"rs-search-stealth: the two Playwright versions differ: the tool server "
+             f"(@playwright/mcp {os.environ['SEARCH_PLAYWRIGHT_MCP_VERSION']}) bundles Playwright "
+             f"{node}, the pip Playwright (SEARCH_PLAYWRIGHT_PY_VERSION) is {pip}; camoufox's "
+             f"browser server refuses a client of another version, so the pins in versions.env "
+             f"have to name the same Playwright major.minor")
+print(f"Playwright versions agree: tool server {node}, pip {pip}")
+PYEOF
+
+# Firefox's GTK and X libraries (the list Playwright keeps for Firefox),
+# dumb-init (it reaps the browser's processes), and camoufox's browser at its
+# pin, into a cache folder every user reads. The fetch is checked: the build
+# fails when the installed browser is not the pinned one.
+ENV XDG_CACHE_HOME=/opt/camoufox-cache
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends dumb-init \
+ && playwright install-deps firefox \
+ && rm -rf /var/lib/apt/lists/*
+RUN camoufox fetch "official/${CAMOUFOX_BROWSER_VERSION}" \
+ && camoufox list installed | grep -F "${CAMOUFOX_BROWSER_VERSION}" \
+ && chmod -R a+rX "$XDG_CACHE_HOME"
+# The one folder camoufox writes when it starts a browser (the fontconfig
+# file of the fingerprint it picks) is the sidecar user's; the rest stays
+# root's, read-only.
+RUN python3 - <<'PYEOF'
+import glob, json, os, sys
+want = os.environ["CAMOUFOX_BROWSER_SHA256"]
+found = [json.load(open(p)).get("sha256") for p in
+         glob.glob(os.path.join(os.environ["XDG_CACHE_HOME"], "camoufox", "browsers", "official",
+                                os.environ["CAMOUFOX_BROWSER_VERSION"] + "-*", "version.json"))]
+if found != [want]:
+    sys.exit(f"rs-search-stealth: the camoufox browser {os.environ['CAMOUFOX_BROWSER_VERSION']} "
+             f"was downloaded with the checksum {found}, not the pinned CAMOUFOX_BROWSER_SHA256 "
+             f"{want}; the release or its index changed, so the pin in versions.env has to be "
+             f"checked and moved deliberately")
+print("camoufox browser checksum matches the pin")
+PYEOF
+RUN mkdir -p "$XDG_CACHE_HOME/camoufox/fontconfig" \
+ && chown 1000:1000 "$XDG_CACHE_HOME/camoufox/fontconfig"
+
+# The sidecar's user (uid 1000, what the service runs it as) and the output
+# folder's mount point.
+RUN useradd -m -u 1000 -s /bin/sh browser \
+ && mkdir -p /output \
+ && chown browser:browser /output
+
+COPY container/search/stealth-start.py /opt/rs-search-stealth/start.py
+COPY container/search/stealth-config.json /opt/rs-search-stealth/config.json
+RUN chmod 755 /opt/rs-search-stealth/start.py \
+ && chmod 644 /opt/rs-search-stealth/config.json
+
+USER browser
+WORKDIR /home/browser
+EXPOSE 8931
+ENTRYPOINT ["dumb-init", "--", "python3", "/opt/rs-search-stealth/start.py"]

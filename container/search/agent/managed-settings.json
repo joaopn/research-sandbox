@@ -1,1 +1,1 @@
-{"permissions": {"deny": ["WebSearch", "WebFetch", "Bash", "Write", "Edit", "NotebookEdit", "Task"]}}
+{"permissions": {"deny": ["WebSearch", "WebFetch", "Bash", "Write", "Edit", "NotebookEdit", "Task", "mcp__browser__browser_install", "mcp__browser__browser_file_upload", "mcp__browser__browser_drop", "mcp__browser__browser_run_code_unsafe", "mcp__stealth__browser_install", "mcp__stealth__browser_file_upload", "mcp__stealth__browser_drop", "mcp__stealth__browser_run_code_unsafe"]}}

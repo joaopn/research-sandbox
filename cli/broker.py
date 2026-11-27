@@ -1583,7 +1583,7 @@ MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
 # The one searcher and the contact address, saved whole.
 SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact",
-                                          "recent", "sidebar"})
+                                          "recent", "sidebar", "tiers"})
 # One search in the service (view, report, stop), or one kept conversation,
 # by its id.
 SEARCH_ID_WEBUI_FIELDS = frozenset({"id"})

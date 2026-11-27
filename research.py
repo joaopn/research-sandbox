@@ -1654,7 +1654,7 @@ def cmd_search_settings(args: argparse.Namespace) -> None:
                  effort=sr["effort"] if args.effort is None else args.effort,
                  at_once=sr["at_once"] if args.at_once is None else args.at_once,
                  contact=base["contact"] if args.contact is None else args.contact,
-                 recent=base["recent"], sidebar=base["sidebar"])
+                 recent=base["recent"], sidebar=base["sidebar"], tiers=sr["tiers"])
     out = _call(rscore.search_settings_set, req)
     print(json.dumps(out["settings"], indent=2, sort_keys=True))
 

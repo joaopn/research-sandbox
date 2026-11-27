@@ -58,6 +58,20 @@ SERVICE_IMAGE = "rs-search:latest"
 # The search agent's image (container/search/Dockerfile.agent), built on the
 # host beside the service image and staged into the service's inner Docker.
 AGENT_IMAGE = "rs-search-agent:latest"
+# The two browser tiers' sidecar images (container/search/Dockerfile.browser,
+# Dockerfile.stealth), built and staged the same way: a search whose searcher
+# has a tier on runs one container of that image beside its agent.
+BROWSER_IMAGE = "rs-search-browser:latest"
+STEALTH_IMAGE = "rs-search-stealth:latest"
+# Every search image the host builds from this tree, with its Dockerfile (in
+# container/search/); the service image is first (the others are staged into
+# it).
+SEARCH_DOCKERFILES = (("Dockerfile.service", SERVICE_IMAGE),
+                      ("Dockerfile.agent", AGENT_IMAGE),
+                      ("Dockerfile.browser", BROWSER_IMAGE),
+                      ("Dockerfile.stealth", STEALTH_IMAGE))
+# The built images staged into the service's inner Docker under the same names.
+STAGED_BUILT_IMAGES = (AGENT_IMAGE, BROWSER_IMAGE, STEALTH_IMAGE)
 # The service's inner Docker store (images, search volumes): kept at Turn off,
 # so turning the service on again does not stage the images again.
 DOCKER_VOLUME = "rs-search-docker"
@@ -119,6 +133,23 @@ SEARXNG_DIGEST_KEY = "SEARXNG_DIGEST"
 # becomes an image tag and a container label.
 _SEARXNG_VERSION_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}-[0-9a-f]{7,40}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+# --- the browser sidecars' pins ------------------------------------------------------
+# Build args of Dockerfile.browser and Dockerfile.stealth (the keys are their
+# ARG names). Each value goes into a package specifier or a download name, so
+# it is exactly a version: digits and dots, and for camoufox's browser build
+# its release suffix (158.0.1-beta.41) and its download's sha256.
+_DOTTED_RE = re.compile(r"^\d+(\.\d+){1,3}$")
+_CAMOUFOX_BROWSER_RE = re.compile(r"^\d+(\.\d+){1,3}-[a-z]+\.\d+$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+SIDECAR_PIN_KEYS = (
+    ("NODE_VERSION", _DOTTED_RE, "not a Node version"),
+    ("SEARCH_PLAYWRIGHT_MCP_VERSION", _DOTTED_RE, "not a Playwright tool server version"),
+    ("SEARCH_PLAYWRIGHT_PY_VERSION", _DOTTED_RE, "not a Playwright version"),
+    ("CAMOUFOX_VERSION", _DOTTED_RE, "not a camoufox version"),
+    ("CAMOUFOX_BROWSER_VERSION", _CAMOUFOX_BROWSER_RE, "not a camoufox browser version"),
+    ("CAMOUFOX_BROWSER_SHA256", _SHA256_HEX_RE, "not a sha256 checksum"),
+)
 _PIN_BAD = ("the search service's version setting ({key}) is {what}; under "
             "Host → Software, Use repo version on its row puts the value this "
             "installation ships back")
@@ -197,6 +228,12 @@ RECENT_MAX = 100
 # generic address (a reserved documentation domain: no person behind it).
 GENERIC_CONTACT = "user@example.org"
 _CONTACT_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
+# The browser tiers a searcher may use, each on or off: the headless browser
+# (Playwright's tool server with Chromium) and the stealth browser (camoufox).
+# Both on by default: the maintainer called Playwright and camoufox fair game,
+# and the searcher tries them only after the plain tier failed. A settings
+# file saved before the setting existed reads as both on.
+TIER_NAMES = ("browser", "stealth")
 
 
 class SearchError(Exception):
@@ -207,19 +244,32 @@ class SearchError(Exception):
 # --- pins ----------------------------------------------------------------------
 
 def pins_from(versions: dict[str, str]) -> dict[str, str]:
-    """{searxng_version, searxng_digest} from the effective version pins, each
-    checked. SearchError naming the key on a missing or malformed one."""
+    """{searxng_version, searxng_digest} and, under their own key names, the
+    browser sidecars' build pins (SIDECAR_PIN_KEYS), from the effective
+    version pins, each checked. SearchError naming the key on a missing or
+    malformed one."""
     out = {}
     for key, field_name, rx, what in (
             (SEARXNG_VERSION_KEY, "searxng_version", _SEARXNG_VERSION_RE,
              "not a SearXNG version"),
-            (SEARXNG_DIGEST_KEY, "searxng_digest", _DIGEST_RE, "not an image digest")):
+            (SEARXNG_DIGEST_KEY, "searxng_digest", _DIGEST_RE, "not an image digest"),
+            *((k, k, rx_, w) for k, rx_, w in SIDECAR_PIN_KEYS)):
         value = versions.get(key, "")
         if not value:
             raise SearchError(_PIN_BAD.format(key=key, what="missing"))
         if not rx.match(value):
             raise SearchError(_PIN_BAD.format(key=key, what=what))
         out[field_name] = value
+    return out
+
+
+def build_args(pins: dict[str, str]) -> list[str]:
+    """The checked sidecar pins as `docker build --build-arg` arguments (the
+    other search Dockerfiles declare none of them, so passing them to every
+    search build changes nothing there)."""
+    out: list[str] = []
+    for key, _rx, _what in SIDECAR_PIN_KEYS:
+        out += ["--build-arg", f"{key}={pins[key]}"]
     return out
 
 
@@ -286,6 +336,8 @@ def service_run_argv(*, dind_mode: str, dns: list[str], pins: dict[str, str],
              "-v", f"{agent_dist_dir}:{SERVICE_AGENT_DIST}:ro",
              "-e", "DOCKER_DIND=true",
              "-e", f"RS_SEARCH_AGENT_IMAGE={AGENT_IMAGE}",
+             "-e", f"RS_SEARCH_BROWSER_IMAGE={BROWSER_IMAGE}",
+             "-e", f"RS_SEARCH_STEALTH_IMAGE={STEALTH_IMAGE}",
              "-e", f"RS_SEARCH_SEARXNG_IMAGE={inner_searxng_image(pins)}",
              f"--pids-limit={pids_limit}"]
     for s in dns:
@@ -333,11 +385,24 @@ def apply_gateway_entry(data: dict[str, Any]) -> None:
 
 # --- settings (pure) -----------------------------------------------------------------
 
+def default_tiers() -> dict[str, bool]:
+    return {t: True for t in TIER_NAMES}
+
+
 def default_settings() -> dict[str, Any]:
     return {"version": SETTINGS_VERSION,
             "searcher": {"name": DEFAULT_SEARCHER_NAME, "model": DEFAULT_MODEL,
-                         "effort": DEFAULT_EFFORT, "at_once": DEFAULT_AT_ONCE},
+                         "effort": DEFAULT_EFFORT, "at_once": DEFAULT_AT_ONCE,
+                         "tiers": default_tiers()},
             "contact": "", "recent": DEFAULT_RECENT, "sidebar": False}
+
+
+def tiers_problem(value: Any) -> str | None:
+    if not isinstance(value, dict) or set(value) != set(TIER_NAMES) \
+            or not all(isinstance(value[t], bool) for t in TIER_NAMES):
+        return ("the searcher's browser tiers are two switches, browser and "
+                "stealth, each on or off, and nothing else")
+    return None
 
 
 def searcher_name_problem(name: Any) -> str | None:
@@ -379,18 +444,19 @@ def contact_problem(value: Any) -> str | None:
 def settings_problem(data: Any, model_ok) -> str | None:
     """Why `data` is not a valid settings record, or None. `model_ok(model,
     effort)` is the catalog's check (rscore passes it in: this module does
-    not import the model catalog). A record without `recent` or `sidebar` is
-    valid: it was saved before that setting existed (read_settings fills the
-    default)."""
+    not import the model catalog). A record without `recent` or `sidebar`, or
+    a searcher without `tiers`, is valid: it was saved before that setting
+    existed (read_settings fills the default)."""
     if not isinstance(data, dict) \
             or set(data) - {"recent", "sidebar"} != {"version", "searcher", "contact"}:
         return "it does not have the expected shape"
     if data["version"] != SETTINGS_VERSION or isinstance(data["version"], bool):
         return "it was written by another version of RS"
     s = data["searcher"]
-    if not isinstance(s, dict) or set(s) != {"name", "model", "effort", "at_once"}:
+    if not isinstance(s, dict) or set(s) - {"tiers"} != {"name", "model", "effort", "at_once"}:
         return "its searcher does not have the expected shape"
     for problem in (searcher_name_problem(s["name"]), at_once_problem(s["at_once"]),
+                    tiers_problem(s["tiers"]) if "tiers" in s else None,
                     contact_problem(data["contact"]),
                     recent_problem(data["recent"]) if "recent" in data else None,
                     sidebar_problem(data["sidebar"]) if "sidebar" in data else None):
@@ -425,11 +491,13 @@ def read_settings(model_ok, path: Path | None = None) -> dict[str, Any]:
         raise SearchError(SETTINGS_DAMAGED.format(why=problem))
     data.setdefault("recent", DEFAULT_RECENT)       # saved before the setting existed
     data.setdefault("sidebar", False)               # likewise
+    data["searcher"].setdefault("tiers", default_tiers())     # likewise
     return data
 
 
 def service_settings(data: dict[str, Any]) -> dict[str, Any]:
-    """What the service is handed: the settings with the contact filled."""
+    """What the service is handed: the settings with the contact filled (the
+    searcher carries its `tiers`, filled by read_settings)."""
     return {"version": SETTINGS_VERSION, "searcher": dict(data["searcher"]),
             "contact": data["contact"] or GENERIC_CONTACT, "recent": data["recent"]}
 

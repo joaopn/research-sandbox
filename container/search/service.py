@@ -13,12 +13,14 @@ once the inner Docker answers), and does two things:
     Searches are keyed on the caller's PROJECT: another project's search is
     "not found", whatever its id;
   - each search, in the inner Docker: a private network, one search-agent
-    container and a named volume for its files, all three named after the
-    search id and removed BY NAME once the caller collected the result or the
-    operator cleared it. At start, whatever an earlier run left is found by
-    label and removed by name. SearXNG (the plain tier's web search) runs
-    beside them and is connected to each search's network, never the
-    searches to each other.
+    container, a browser sidecar per browser tier that is on, and a named
+    volume for its files, all named after the search id and removed BY NAME
+    once the caller collected the result or the operator cleared it. At
+    start, whatever an earlier run left is found by label and removed by
+    name. SearXNG (the plain tier's web search) runs beside them and is
+    connected to a second, internal network of each search that only the
+    search's agent joins (never to the search's own network, where its
+    sidecars are), never the searches to each other.
 
 `service.py put NAME` / `drop NAME` (the host, over `docker exec -i`) write or
 remove one of the files the host hands over (settings, token) in RUN_DIR;
@@ -70,6 +72,11 @@ SEARXNG_DIR = os.path.join(STATE_DIR, "searxng")
 
 AGENT_IMAGE = os.environ.get("RS_SEARCH_AGENT_IMAGE", "")
 SEARXNG_IMAGE = os.environ.get("RS_SEARCH_SEARXNG_IMAGE", "")
+# The browser tiers (search.TIER_NAMES — MIRROR) and the image of each one's
+# sidecar (search.BROWSER_IMAGE / STEALTH_IMAGE, handed over by the host).
+TIER_NAMES = ("browser", "stealth")
+SIDECAR_IMAGES = {"browser": os.environ.get("RS_SEARCH_BROWSER_IMAGE", ""),
+                  "stealth": os.environ.get("RS_SEARCH_STEALTH_IMAGE", "")}
 
 # Every inner thing of one search is named SEARCH_PREFIX + its id and carries
 # ID_LABEL; leftovers are found by the label and removed by the name.
@@ -81,6 +88,29 @@ SEARXNG_CONTAINER = "rs-search-searxng"
 SEARXNG_NETWORK = "rs-search-sx"
 SEARXNG_ALIAS = "searxng"                     # agent/tools.py SEARXNG_URL's host
 SEARXNG_LABEL = "research.search.searxng"
+# A search's second network, internal (no route out), named after the search
+# with this suffix and labelled like its other things: only the search's
+# agent and SearXNG are on it. SearXNG is on every search's such network, so
+# it is kept off the search's own network, where the browser sidecars'
+# tool servers listen: nothing outside a search reaches its browsers.
+SEARXNG_NET_SUFFIX = "-sx"
+# A search's browser sidecar is named SEARCH_PREFIX + its id + "-" + its tier
+# (sidecar_name), carries ID_LABEL like the search's other things, and
+# TIER_LABEL naming its tier.
+TIER_LABEL = "research.search.tier"
+# The uid:gid the agent and the sidecars run as (each image's own user).
+RUN_AS = "1000:1000"
+AGENT_UID = 1000
+# The sidecars' tool server: its port and path (Dockerfile.browser's
+# ENTRYPOINT, stealth-start.py TOOL_PORT — MIRRORS), and where each mounts the
+# search volume's files folder as its output folder (Dockerfile.browser /
+# stealth-start.py OUTPUT_DIR — MIRROR).
+SIDECAR_PORT = 8931
+SIDECAR_PATH = "/mcp"
+SIDECAR_OUTPUT = "/output"
+# The plain tier's tool server, as the agent's tool list names it (the
+# server's file is in the agent image).
+PLAIN_SERVER = {"type": "stdio", "command": "python3", "args": ["/opt/rs-search-agent/tools.py"]}
 # Where a search's volume is mounted in its agent container, and the two
 # folders the agent's tool server writes (agent/tools.py — MIRROR).
 AGENT_VOLUME_MOUNT = "/search"
@@ -149,6 +179,55 @@ ADMIN_CALL_S = 30
 # and DOI whole and the start of a long address.
 TRACE_NAME_MAX_CHARS = 40
 TRACE_TARGET_MAX_CHARS = 300
+
+# --- the browser sidecars -----------------------------------------------------------
+
+# How long a search waits for its sidecars' tool servers to answer before its
+# agent starts. Measured: Playwright's tool server answers about a second
+# after its container starts (Chromium starts later, at the first page; the
+# stealth sidecar starts camoufox's browser at its first connection, so its
+# tool server comes up as fast). Thirty times that leaves room for a host
+# starting several searches at once (each start is a Node process loading the
+# tool server); past it the sidecar is taken as not coming, its tier is
+# reported unavailable and the search runs without it. Much shorter fails a
+# healthy sidecar on a loaded host; much longer makes every search whose
+# sidecar is broken wait that long before it starts.
+SIDECAR_READY_S = 30
+# Between two checks of a sidecar that has not answered yet: a check is one
+# local HTTP request and one docker inspect (milliseconds); a quarter second
+# adds at most that to a search's start.
+SIDECAR_POLL_S = 0.25
+# One readiness request's own bound: a tool server that is up answers its
+# initialize in milliseconds; one that accepted the connection but does not
+# answer is retried at the next poll until SIDECAR_READY_S.
+SIDECAR_PROBE_S = 2
+# How much of a readiness answer is read (the initialize reply is about a
+# KiB; the sidecar will render hostile pages later, so nothing it sends is
+# read unbounded).
+SIDECAR_PROBE_MAX_BYTES = 64 * 1024
+# The browser tiers' tool calls a search keeps one by one (for the work view
+# and the outcome's failures; every call is counted either way). A call is at
+# least one model turn, which takes seconds (about two for the shortest), so
+# SEARCH_MAX_S holds under 2000 of them; past this a search's further calls
+# are counted but not kept. One kept call is at most about a KiB (the trace's
+# caps), so a search keeps at most about 2 MiB of them.
+BROWSER_CALLS_MAX = 2000
+# The first line of an error the browser tier's tool returned, as a work
+# entry's detail (the trace's cap for a detail).
+BROWSER_DETAIL_MAX_CHARS = TRACE_TARGET_MAX_CHARS
+# A tool_result in the agent's stream that is longer than STREAM_LINE_MAX_BYTES
+# is skipped unread; its calls' ids are taken from its first piece (the
+# result's id comes before its content). A tool's error message is a few
+# hundred bytes, so a result of that length is a page's content: its calls
+# are recorded as ok.
+_TOOL_USE_ID_RE = re.compile(rb'"tool_use_id"\s*:\s*"([A-Za-z0-9_-]{1,100})"')
+NO_RESULT = "the search ended before the call returned"
+# Why a file in the files folder is not offered (FILE_NAME_RE refuses its
+# name; the browser saves a download under the page's own name, made safe
+# for a path but not always this rule's: an accented letter, a leading dash).
+DROPPED_WHY = ("its name is not one the service offers for download (letters, digits, "
+               "dots, dashes and underscores, starting with a letter or a digit), so "
+               "it is not listed; it is removed with the search")
 
 # --- the agent's live output and the operator's view ------------------------------
 
@@ -306,6 +385,12 @@ def read_settings() -> dict | None:
         r = data.get("recent")
         if isinstance(r, bool) or not isinstance(r, int) or not 0 <= r <= RECENT_MAX:
             data["recent"] = DEFAULT_RECENT     # missing (an older host) or bad
+        t = s.get("tiers")
+        if t is None:
+            s["tiers"] = {n: True for n in TIER_NAMES}      # an older host: both on
+        elif not (isinstance(t, dict) and set(t) == set(TIER_NAMES)
+                  and all(isinstance(t[n], bool) for n in TIER_NAMES)):
+            return None
         return data
     except (OSError, ValueError, RecursionError, KeyError, TypeError):
         return None
@@ -501,11 +586,55 @@ def usage_tokens(usage) -> int:
                                                 "cache_read_input_tokens"))
 
 
+def _browser_call(name, args) -> tuple[str, str, str] | None:
+    """(tier, tool, target) of a tool_use of a browser tier, or None. The
+    target is the call's URL argument when it has one, else a short text of
+    its arguments."""
+    if not isinstance(name, str):
+        return None
+    for tier in TIER_NAMES:
+        prefix = f"mcp__{tier}__"
+        if name.startswith(prefix):
+            args = args if isinstance(args, dict) else {}
+            url = args.get("url")
+            if isinstance(url, str):
+                target = url
+            else:
+                try:
+                    target = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+                except (ValueError, TypeError, RecursionError):
+                    target = ""
+            return (tier, name[len(prefix):][:TRACE_NAME_MAX_CHARS],
+                    target[:TRACE_TARGET_MAX_CHARS])
+    return None
+
+
+def _result_first_line(content) -> str:
+    """The first non-empty line of a tool_result's content (text or text
+    blocks), past the "### Error" heading Playwright's tool server puts
+    first."""
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and isinstance(b.get("text"), str))
+    if not isinstance(content, str):
+        return ""
+    for line in content.splitlines():
+        if line.strip() and not line.startswith("### Error"):
+            return line.strip()[:BROWSER_DETAIL_MAX_CHARS]
+    return ""
+
+
 class AgentStream:
     """What the operator sees of one search agent while it runs: the token
     count (the latest usage per message id, summed; the `result` event's
     totals once it arrives) and its text blocks, each with the time it was
-    read (bounded: the newest VIEW_TAIL_ENTRIES, all the view shows)."""
+    read (bounded: the newest VIEW_TAIL_ENTRIES, all the view shows).
+
+    It also records the browser tiers' tool calls, which no RS code of the
+    plain tier's kind traces: each `tool_use` of a `browser`/`stealth` server
+    in an assistant event, completed by its `tool_result`'s error flag in a
+    later user event, as a work entry of the trace's shape (kept up to
+    BROWSER_CALLS_MAX; every call counted per tier, tool and outcome)."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -513,6 +642,83 @@ class AgentStream:
         self.final: int | None = None
         self.texts: collections.deque = collections.deque(maxlen=VIEW_TAIL_ENTRIES)
         self.dropped = 0
+        self.pending: dict[str, tuple[str, str, str]] = {}
+        self.seen: set = set()
+        self.calls: list[dict] = []
+        self.calls_dropped = 0
+        self.counts: dict = {}
+
+    def _complete(self, uid: str, error: bool, detail: str, now: float) -> None:
+        """Under the lock: a pending call's result arrived (or never will)."""
+        tier, tool, target = self.pending.pop(uid)
+        outcome = "error" if error else "ok"
+        t = self.counts.setdefault(tier, {}).setdefault(tool, {})
+        t[outcome] = t.get(outcome, 0) + 1
+        if len(self.calls) >= BROWSER_CALLS_MAX:
+            self.calls_dropped += 1
+            return
+        self.calls.append({"ts": now, "kind": "tool", "tool": tool, "tier": tier,
+                           "target": target, "outcome": outcome,
+                           "detail": detail if error else ""})
+
+    def work_calls(self) -> tuple[list[dict], bool]:
+        with self.lock:
+            return [dict(c) for c in self.calls[-VIEW_TAIL_ENTRIES:]], (
+                self.calls_dropped > 0 or len(self.calls) > VIEW_TAIL_ENTRIES)
+
+    def end_calls(self) -> None:
+        """At the search's end: a call whose result never came failed."""
+        now = time.time()
+        with self.lock:
+            for uid in list(self.pending):
+                self._complete(uid, True, NO_RESULT, now)
+
+    def tried_into(self, tried: dict) -> None:
+        """Add the browser tiers' calls to the outcome's `tried` (the trace
+        summary's shape: per tier and tool the outcomes, and the failures)."""
+        with self.lock:
+            for tier, tools in self.counts.items():
+                for tool, outcomes in tools.items():
+                    t = tried["tiers"].setdefault(tier, {}).setdefault(tool, {})
+                    for k, n in outcomes.items():
+                        t[k] = t.get(k, 0) + n
+            tried["failures"] += [{k: c[k] for k in ("tier", "tool", "target", "outcome",
+                                                     "detail")}
+                                  for c in self.calls if c["outcome"] != "ok"]
+
+    def feed_oversized(self, head: bytes) -> None:
+        """A line past STREAM_LINE_MAX_BYTES, skipped: the calls whose ids its
+        first piece names returned a result that long, so they succeeded."""
+        now = time.time()
+        with self.lock:
+            for m in _TOOL_USE_ID_RE.finditer(head):
+                uid = m.group(1).decode()
+                if uid in self.pending:
+                    self._complete(uid, False, "", now)
+
+    def _feed_results(self, msg: dict, now: float) -> None:
+        """Under the lock: the tool_result blocks of a user event."""
+        content = msg.get("content")
+        for b in content if isinstance(content, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_result" \
+                    and b.get("tool_use_id") in self.pending:
+                error = b.get("is_error") is True
+                self._complete(b["tool_use_id"], error,
+                               _result_first_line(b.get("content")) if error else "", now)
+
+    def _feed_uses(self, msg: dict) -> None:
+        """Under the lock: the browser tiers' tool_use blocks of an assistant
+        event (each id once; pending ones bounded like the kept calls)."""
+        content = msg.get("content")
+        for b in content if isinstance(content, list) else []:
+            if not (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and isinstance(b.get("id"), str) and b["id"] not in self.seen):
+                continue
+            call = _browser_call(b.get("name"), b.get("input"))
+            if call is None or len(self.pending) >= BROWSER_CALLS_MAX:
+                continue
+            self.seen.add(b["id"])
+            self.pending[b["id"]] = call
 
     def tokens(self) -> int:
         with self.lock:
@@ -534,6 +740,10 @@ class AgentStream:
             with self.lock:
                 self.final = usage_tokens(ev.get("usage"))
             return
+        if ev.get("type") == "user" and isinstance(ev.get("message"), dict):
+            with self.lock:
+                self._feed_results(ev["message"], now)
+            return
         if ev.get("type") != "assistant" or not isinstance(ev.get("message"), dict):
             return
         msg = ev["message"]
@@ -541,6 +751,7 @@ class AgentStream:
                  if isinstance(b, dict) and b.get("type") == "text"
                  and isinstance(b.get("text"), str) and b["text"].strip()]
         with self.lock:
+            self._feed_uses(msg)
             if isinstance(msg.get("id"), str) and isinstance(msg.get("usage"), dict):
                 self.per_message[msg["id"]] = usage_tokens(msg["usage"])
             for t in texts:
@@ -575,6 +786,7 @@ def follow(name: str, stream: AgentStream) -> tuple[threading.Thread, subprocess
                     continue
                 if not whole and len(piece) >= STREAM_LINE_MAX_BYTES:
                     skipping = True             # the start of a line past the cap
+                    stream.feed_oversized(piece)
                     continue
                 stream.feed(piece)
         finally:
@@ -684,7 +896,7 @@ class Searches:
             "id": sid, "project": project, "consumer": consumer,
             "question": question, "prompt": prompt, "conversation": conversation,
             "searcher": s["name"], "model": s["model"], "effort": s["effort"],
-            "contact": settings["contact"],
+            "tiers": dict(s["tiers"]), "contact": settings["contact"],
             "state": "queued", "submitted_at": time.time(),
             "started_at": None, "finished_at": None, "outcome": None,
             "stream": AgentStream(), "stop": False}
@@ -1163,7 +1375,9 @@ class Searches:
         VIEW_TAIL_ENTRIES, a text cut to its end. No reads of the volume, so
         it may run under the lock."""
         texts, dropped = rec["stream"].work_texts()
-        work = sorted(tools + texts, key=lambda e: e["ts"])
+        calls, calls_dropped = rec["stream"].work_calls()
+        dropped = dropped or calls_dropped
+        work = sorted(tools + calls + texts, key=lambda e: e["ts"])
         out = {"id": rec["id"], "state": rec["state"], "question": rec["question"],
                "searcher": rec["searcher"], "tokens": rec["stream"].tokens(),
                **self._times(rec),
@@ -1422,20 +1636,31 @@ def _read_conversations() -> tuple[list, str | None]:
     return convs, None
 
 
+def sidecar_name(sid: str, tier: str) -> str:
+    return f"{SEARCH_PREFIX}{sid}-{tier}"
+
+
+def searxng_net_name(sid: str) -> str:
+    return f"{SEARCH_PREFIX}{sid}{SEARXNG_NET_SUFFIX}"
+
+
 def remove_search(sid: str) -> list[str]:
-    """Remove one search's container, network and volume, each by its name.
-    Idempotent; returns what could not be removed."""
+    """Remove one search's containers (its agent and its browser sidecars),
+    networks (its own and the one it shares with SearXNG) and volume, each by
+    its name. Idempotent; returns what could not be removed."""
     name = SEARCH_PREFIX + sid
     problems = []
-    if container_state(name)[0] != "absent":
-        r = docker("rm", "-f", name)
-        if r.returncode != 0:
-            problems.append(f"container {name}: {first_line(r)}")
-    if docker("network", "inspect", name).returncode == 0:
-        docker("network", "disconnect", "-f", name, SEARXNG_CONTAINER)
-        r = docker("network", "rm", name)
-        if r.returncode != 0:
-            problems.append(f"network {name}: {first_line(r)}")
+    for cname in (name, *(sidecar_name(sid, t) for t in TIER_NAMES)):
+        if container_state(cname)[0] != "absent":
+            r = docker("rm", "-f", cname)
+            if r.returncode != 0:
+                problems.append(f"container {cname}: {first_line(r)}")
+    for net in (name, searxng_net_name(sid)):
+        if docker("network", "inspect", net).returncode == 0:
+            docker("network", "disconnect", "-f", net, SEARXNG_CONTAINER)
+            r = docker("network", "rm", net)
+            if r.returncode != 0:
+                problems.append(f"network {net}: {first_line(r)}")
     if docker("volume", "inspect", name).returncode == 0:
         r = docker("volume", "rm", name)
         if r.returncode != 0:
@@ -1454,6 +1679,11 @@ def remove_leftovers() -> None:
         r = docker(*args)
         for n in r.stdout.decode("utf-8", "replace").split():
             sid = n[len(SEARCH_PREFIX):] if n.startswith(SEARCH_PREFIX) else ""
+            # a browser sidecar (<id>-<tier>) or the SearXNG network (<id>-sx)
+            for suffix in (*(f"-{t}" for t in TIER_NAMES), SEARXNG_NET_SUFFIX):
+                if sid.endswith(suffix):
+                    sid = sid[:-len(suffix)]
+                    break
             if ID_RE.match(sid):
                 found.add(sid)
             else:
@@ -1500,10 +1730,11 @@ def _agent_end(name: str) -> dict:
 
 
 def _trace_summary(raw: bytes | None) -> dict:
-    """What was tried, from the tool server's trace (one line per tool call,
+    """What was tried, from the plain tier's trace (one line per tool call,
     written by RS's code, not by the model): per tier and tool the calls and
-    their outcomes, the failures with their targets, and every engine SearXNG
-    reported unresponsive with its reasons."""
+    their outcomes, the failures with their tiers and targets, and every
+    engine SearXNG reported unresponsive with its reasons. The browser tiers'
+    calls are added from the agent's stream (AgentStream.tried_into)."""
     tiers: dict = {}
     failures: list = []
     unresponsive: dict = {}
@@ -1520,7 +1751,7 @@ def _trace_summary(raw: bytes | None) -> dict:
         t = tiers.setdefault(tier, {}).setdefault(tool, {})
         t[outcome] = t.get(outcome, 0) + 1
         if outcome not in ("ok", "empty"):
-            failures.append({"tool": tool,
+            failures.append({"tier": tier, "tool": tool,
                              "target": str(ev.get("target", ""))[:TRACE_TARGET_MAX_CHARS],
                              "outcome": outcome,
                              "detail": str(ev.get("detail", ""))[:TRACE_TARGET_MAX_CHARS]})
@@ -1559,6 +1790,165 @@ def _trace_work(raw: bytes | None) -> list[dict]:
     return out
 
 
+def prepare_volume(name: str) -> str | None:
+    """Make the fresh volume's two folders (FILES_DIR, OUT_DIR), owned by the
+    agent's user, before any container mounts it: a sidecar mounts the files
+    folder alone, so it has to exist, and docker copies nothing into a volume
+    that is not empty (its root stays the service's). Nothing but the service
+    has touched the volume yet. None, or why it could not be done."""
+    root = volume_root(name)
+    if root is None:
+        return "its folder could not be found"
+    try:
+        rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        return e.strerror or "open failed"
+    try:
+        for folder in (FILES_DIR, OUT_DIR):
+            os.mkdir(folder, 0o755, dir_fd=rfd)
+            os.chown(folder, AGENT_UID, AGENT_UID, dir_fd=rfd, follow_symlinks=False)
+    except OSError as e:
+        return e.strerror or "mkdir failed"
+    finally:
+        os.close(rfd)
+    return None
+
+
+def _sidecar_answers(address: str) -> bool:
+    """Whether a sidecar's tool server answers an MCP initialize (a request
+    from the service to the sidecar: its answer comes back on the
+    connection the service opened; the service's guard still drops every
+    connection the other way). The answer is read bounded and not used."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": PROTOCOL_VERSIONS[0], "capabilities": {},
+        "clientInfo": {"name": "rs-search", "version": "1"}}}).encode()
+    req = urllib.request.Request(f"http://{address}:{SIDECAR_PORT}{SIDECAR_PATH}", data=body,
+                                 method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json, text/event-stream"})
+    try:
+        with urllib.request.urlopen(req, timeout=SIDECAR_PROBE_S) as resp:
+            resp.read(SIDECAR_PROBE_MAX_BYTES)
+            session = resp.headers.get("Mcp-Session-Id")
+            ok = resp.status == 200
+    except (OSError, ValueError):
+        return False
+    if ok and session and re.fullmatch(r"[\x21-\x7e]{1,200}", session):
+        # End the probe's session (best effort: a session holds no browser
+        # until a tool is called).
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"http://{address}:{SIDECAR_PORT}{SIDECAR_PATH}", method="DELETE",
+                headers={"Mcp-Session-Id": session}), timeout=SIDECAR_PROBE_S).close()
+        except (OSError, ValueError):
+            pass
+    return ok
+
+
+def start_sidecars(rec: dict, name: str, labels: list[str]) -> tuple[dict, dict]:
+    """Start the sidecar of every browser tier the searcher has on, on the
+    search's network, hardened as the agent (no capability, no privilege
+    gain, its own user; the browsers run without their own sandbox, so the
+    container is the boundary), the volume's files folder as its output
+    folder; then wait (together, up to SIDECAR_READY_S) until each one's tool
+    server answers. Returns ({tier: the agent's URL of its tool server},
+    {tier: why it is unavailable}); a sidecar that does not come up is
+    removed and its tier left out."""
+    up: dict = {}
+    unavailable: dict = {}
+    waiting: dict = {}
+    for tier in TIER_NAMES:
+        if not rec["tiers"].get(tier):
+            continue
+        cname = sidecar_name(rec["id"], tier)
+        image = SIDECAR_IMAGES[tier]
+        if not image_present(image):
+            unavailable[tier] = (f"the {tier} sidecar's image is not staged in the search "
+                                 "service; the operator turns the service on again")
+            continue
+        r = docker("run", "-d", "--name", cname, *labels, "--label", f"{TIER_LABEL}={tier}",
+                   "--network", name, "--restart", "no",
+                   "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                   "--user", RUN_AS,
+                   "--mount", f"type=volume,src={name},dst={SIDECAR_OUTPUT},"
+                              f"volume-subpath={FILES_DIR}",
+                   image)
+        if r.returncode != 0:
+            unavailable[tier] = f"the {tier} sidecar could not be started ({first_line(r)})"
+            docker("rm", "-f", cname)
+            continue
+        waiting[tier] = cname
+    deadline = time.monotonic() + SIDECAR_READY_S
+    addresses: dict = {}
+    while waiting:
+        for tier, cname in list(waiting.items()):
+            if container_state(cname)[0] != "running":
+                unavailable[tier] = f"the {tier} sidecar stopped as it started"
+                del waiting[tier]
+                continue
+            if tier not in addresses:
+                ip = docker("container", "inspect", "-f",
+                            "{{(index .NetworkSettings.Networks \"" + name + "\").IPAddress}}",
+                            cname).stdout.decode("utf-8", "replace").strip()
+                if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+                    addresses[tier] = ip
+            if tier in addresses and _sidecar_answers(addresses[tier]):
+                up[tier] = f"http://{cname}:{SIDECAR_PORT}{SIDECAR_PATH}"
+                del waiting[tier]
+        if not waiting:
+            break
+        if time.monotonic() >= deadline:
+            for tier in waiting:
+                unavailable[tier] = (f"the {tier} sidecar's tool server did not answer within "
+                                     f"{SIDECAR_READY_S} seconds")
+            break
+        time.sleep(SIDECAR_POLL_S)
+    for tier in unavailable:
+        if container_state(sidecar_name(rec["id"], tier))[0] != "absent":
+            docker("rm", "-f", sidecar_name(rec["id"], tier))
+    for tier, why in unavailable.items():
+        log(f"search {rec['id']}: {why}")
+    return up, unavailable
+
+
+def agent_tools(up: dict) -> str:
+    """The agent's tool list for this search (Claude Code's --mcp-config
+    JSON): the plain tier always, and each browser tier whose sidecar is up,
+    over HTTP at the sidecar's name on the search's network."""
+    servers: dict = {"plain": PLAIN_SERVER}
+    for tier in TIER_NAMES:
+        if tier in up:
+            servers[tier] = {"type": "http", "url": up[tier]}
+    return json.dumps({"mcpServers": servers}, separators=(",", ":"))
+
+
+def list_dropped_files(root: str) -> list[dict]:
+    """The files in the volume's files folder whose names FILE_NAME_RE
+    refuses (a browser download keeps the page's own name), each with why it
+    is not listed. The name is shown as text (cut, its undecodable bytes
+    replaced); the file is never opened."""
+    out = []
+    try:
+        rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return out
+    try:
+        dfd = _open_dir(rfd, FILES_DIR)
+    except OSError:
+        os.close(rfd)
+        return out
+    try:
+        for name in sorted(os.listdir(dfd)):
+            if FILE_NAME_RE.match(name):
+                continue
+            shown = name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+            out.append({"name": shown[:TRACE_TARGET_MAX_CHARS], "why": DROPPED_WHY})
+    finally:
+        os.close(dfd)
+        os.close(rfd)
+    return out
+
+
 def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
     """Create the search's network, volume and container, follow and wait for
     the agent, and read back its report. `stopped()` says whether the operator
@@ -1577,27 +1967,45 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
                                     "operator pulls it under Host → Software"}
     searxng_problem = ensure_searxng()
     labels = ["--label", f"{ID_LABEL}={sid}", "--label", f"{PROJECT_LABEL}={rec['project']}"]
+    sx = searxng_net_name(sid)
     for args, what in ((["volume", "create", *labels, name], "volume"),
-                       (["network", "create", *labels, name], "network")):
+                       (["network", "create", *labels, name], "network"),
+                       (["network", "create", "--internal", *labels, sx], "SearXNG network")):
         r = docker(*args)
         if r.returncode != 0:
             return "failed", {"reason": f"the search's {what} could not be created "
                                         f"({first_line(r)})"}
+    problem = prepare_volume(name)
+    if problem:
+        return "failed", {"reason": f"the search's volume could not be prepared ({problem})"}
     if searxng_problem is None:
-        r = docker("network", "connect", "--alias", SEARXNG_ALIAS, name, SEARXNG_CONTAINER)
+        r = docker("network", "connect", "--alias", SEARXNG_ALIAS, sx, SEARXNG_CONTAINER)
         if r.returncode != 0:
             searxng_problem = f"SearXNG could not join the search's network ({first_line(r)})"
-    # No capability at all, no privilege gain, the agent's own user; its
-    # network reaches the internet and SearXNG only (the service's guard drops
-    # everything from an inner network toward the service and toward any
-    # private address). The token reaches it through an env file read by the
-    # docker client here, never on this command line.
     if stopped():
         return "failed", {"reason": STOPPED_NO_REPORT}
-    r = docker("run", "-d", "--name", name, *labels,
+    # The browser tiers' sidecars, before the agent (its tool servers have
+    # to answer when its session starts).
+    up, unavailable = start_sidecars(rec, name, labels)
+
+    def drop_sidecars() -> None:
+        for tier in up:
+            docker("rm", "-f", sidecar_name(sid, tier))
+    # No capability at all, no privilege gain, the agent's own user; its
+    # networks reach the internet and its own sidecars (the search's network,
+    # its default route) and SearXNG (the internal one, which has no route
+    # out), nothing else (the service's guard drops everything from an inner
+    # network toward the service and toward any private address). Created,
+    # joined to the SearXNG network, then started, so SearXNG answers from its
+    # first call. The token reaches it through an env file read by the docker
+    # client here, never on this command line.
+    if stopped():
+        drop_sidecars()
+        return "failed", {"reason": STOPPED_NO_REPORT}
+    r = docker("create", "--name", name, *labels,
                "--network", name, "--restart", "no",
                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-               "--user", "1000:1000",
+               "--user", RUN_AS,
                "--env-file", TOKEN_PATH,
                "-e", f"RS_SEARCH_ID={sid}",
                "-e", f"RS_SEARCH_MODEL={rec['model']}",
@@ -1605,10 +2013,18 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
                "-e", f"RS_SEARCH_CONTACT={rec['contact']}",
                "-e", f"RS_SEARCH_SEARXNG={'' if searxng_problem else 'on'}",
                "-e", f"RS_SEARCH_QUESTION={rec['prompt']}",
+               "-e", f"RS_SEARCH_MCP_CONFIG={agent_tools(up)}",
+               "-e", f"RS_SEARCH_TIERS={' '.join(t for t in TIER_NAMES if t in up)}",
                "-v", f"{name}:{AGENT_VOLUME_MOUNT}",
                "-v", f"{CLAUDE_DIST}:/opt/claude:ro",
                AGENT_IMAGE)
+    if r.returncode == 0:
+        r = docker("network", "connect", sx, name)
+        if r.returncode == 0:
+            r = docker("start", name)
     if r.returncode != 0:
+        drop_sidecars()
+        docker("rm", "-f", name)
         return "failed", {"reason": f"the search agent could not be started ({first_line(r)})"}
     follower = follow(name, rec["stream"])
     started()
@@ -1622,6 +2038,10 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
         docker("wait", name)
     was_stopped = stopped()
     end_follow(follower)
+    rec["stream"].end_calls()
+    # The sidecars go as soon as the agent has ended (the collect removes
+    # them too, by name, when this fails).
+    drop_sidecars()
     exit_code = None
     try:
         exit_code = int(w.stdout.decode().strip())
@@ -1636,6 +2056,9 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
                            if root else None)
     if searxng_problem:
         tried["searxng"] = searxng_problem
+    rec["stream"].tried_into(tried)
+    if unavailable:
+        tried["unavailable"] = unavailable
     report = None
     if report_raw is not None:
         try:
@@ -1643,6 +2066,9 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
         except (ValueError, RecursionError):
             report = None
     outcome: dict = {"tried": tried, "agent": agent}
+    dropped = list_dropped_files(root) if root else []
+    if dropped:
+        outcome["dropped_files"] = dropped
     if isinstance(report, dict):
         outcome["summary"] = report.get("summary", "")
         outcome["sources"] = report.get("sources", [])
@@ -1988,7 +2414,8 @@ class Handler(BaseHTTPRequestHandler):
                 "searches": SEARCHES.counts(),
                 "searxng": st,
                 "images": {"agent": image_present(AGENT_IMAGE),
-                           "searxng": image_present(SEARXNG_IMAGE)},
+                           "searxng": image_present(SEARXNG_IMAGE),
+                           **{t: image_present(SIDECAR_IMAGES[t]) for t in TIER_NAMES}},
                 "settings": read_settings() is not None,
                 "token": token_present()})
         if path == "/admin/ensure" and post:

@@ -23234,22 +23234,23 @@ def _search_image_content(ref: str, deadline: float | None = None) -> str:
     return mcp_run.runner_identity(r.stdout or "")[1] if r.returncode == 0 else ""
 
 
-def _search_build_images() -> None:
-    """Build the service and the search agent's images from this tree
-    (cached: seconds when nothing changed). Unbounded: the build lane, the
+def _search_build_images(pins: dict) -> None:
+    """Build the service, the search agent's and the two browser sidecars'
+    images from this tree, the sidecars with their checked pins as build args
+    (cached: seconds when nothing changed; the first sidecar build fetches
+    Chromium and camoufox's browser, minutes). Unbounded: the build lane, the
     host command and `research start`."""
     if not _search_image_id(SANDBOX_DIND_IMAGE):
         raise search.SearchError(
             "the project images are not built on this computer, and the search "
             "service is built on one of them: Rebuild all on Host → Software, "
             "then turn the search service on")
-    for dockerfile, image in (("Dockerfile.service", search.SERVICE_IMAGE),
-                              ("Dockerfile.agent", search.AGENT_IMAGE)):
+    for dockerfile, image in search.SEARCH_DOCKERFILES:
         print(f"building {image} ...", flush=True)
         try:
             r = run(["docker", "build", "-f",
                      str(SCRIPT_DIR / "container" / "search" / dockerfile),
-                     "-t", image, str(SCRIPT_DIR)])
+                     *search.build_args(pins), "-t", image, str(SCRIPT_DIR)])
         except OSError:
             raise search.SearchError(_MCP_HOST_DOWN) from None
         if r.returncode != 0:
@@ -23382,7 +23383,7 @@ def _search_stage(pins: dict) -> None:
     """Bring each search image into the service's inner Docker when the host's
     image is not there yet (by its content identity, recorded as a tag), then
     point the name the service runs at it and drop the earlier stagings."""
-    for host_ref, inner_ref in ((search.AGENT_IMAGE, search.AGENT_IMAGE),
+    for host_ref, inner_ref in (*((i, i) for i in search.STAGED_BUILT_IMAGES),
                                 (search.searxng_image(pins), search.inner_searxng_image(pins))):
         content = _search_image_content(host_ref)
         if not content.startswith("sha256:"):
@@ -23459,7 +23460,7 @@ def _search_up(progress) -> None:
                                  f"is on ({e.strerror or 'write failed'})") from None
 
     progress.step("build", "building the search service's images")
-    _search_build_images()
+    _search_build_images(pins)
     progress.step("pull", "fetching SearXNG")
     _search_pull_searxng(pins)
 
@@ -23640,8 +23641,8 @@ def search_status(deadline: float | None = None) -> dict:
             out["answering"] = admin is not None
             if admin is not None:
                 images = admin.get("images") if isinstance(admin.get("images"), dict) else {}
-                out["images"] = {"agent": images.get("agent") is True,
-                                 "searxng": images.get("searxng") is True}
+                out["images"] = {k: images.get(k) is True
+                                 for k in ("agent", "searxng", "browser", "stealth")}
                 out["searxng"] = str(admin.get("searxng"))[:20]
                 counts = admin.get("searches") if isinstance(admin.get("searches"), dict) else {}
                 out["searches"] = {k: counts.get(k) for k in ("queued", "running", "ended")
@@ -23699,18 +23700,21 @@ class SearchSettingsRequest:
     contact: str
     recent: int
     sidebar: bool
+    # {"browser": bool, "stealth": bool} (search.TIER_NAMES), a fresh copy.
+    tiers: dict
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "SearchSettingsRequest":
         missing = [k for k in ("name", "model", "effort", "at_once", "contact", "recent",
-                               "sidebar") if k not in kw]
+                               "sidebar", "tiers") if k not in kw]
         if missing:
             raise ValidationError(f"the searcher needs {', '.join(missing)}")
         for problem in (search.searcher_name_problem(kw["name"]),
                         search.at_once_problem(kw["at_once"]),
                         search.contact_problem(kw["contact"]),
                         search.recent_problem(kw["recent"]),
-                        search.sidebar_problem(kw["sidebar"])):
+                        search.sidebar_problem(kw["sidebar"]),
+                        search.tiers_problem(kw["tiers"])):
             if problem:
                 raise ValidationError(problem)
         model, effort = kw["model"], kw["effort"]
@@ -23721,7 +23725,8 @@ class SearchSettingsRequest:
             raise ValidationError(problem)
         return cls(name=kw["name"], model=model, effort=effort, at_once=kw["at_once"],
                    contact=kw["contact"].strip(), recent=kw["recent"],
-                   sidebar=kw["sidebar"])
+                   sidebar=kw["sidebar"],
+                   tiers={t: kw["tiers"][t] for t in search.TIER_NAMES})
 
 
 def search_token_set(req: SearchTokenRequest, *, blocking: bool = True,
@@ -23785,7 +23790,7 @@ def search_settings_set(req: SearchSettingsRequest, *, blocking: bool = True,
     deadline = _mcp_deadline() if deadline is None and not blocking else deadline
     data = {"version": search.SETTINGS_VERSION,
             "searcher": {"name": req.name, "model": req.model, "effort": req.effort,
-                         "at_once": req.at_once},
+                         "at_once": req.at_once, "tiers": dict(req.tiers)},
             "contact": req.contact, "recent": req.recent, "sidebar": req.sidebar}
     try:
         with _search_lock(blocking):

@@ -6,7 +6,15 @@
 # What is baked: the plain tier's tool server (agent/tools.py, stdlib), the
 # search agent's instructions and launcher, and the managed settings that
 # switch Claude's own web tools off. The agent starts with no built-in tool
-# at all (--tools ""): every tool it has comes from the tool server.
+# at all (--tools ""): every tool it has comes from the tool servers the
+# service lists per search (the plain tier always, the browser sidecars of
+# the tiers that are on and came up), handed over in its environment.
+# The managed deny list also keeps off the browser tools that act outside a
+# page (for both sidecars, `browser` and `stealth`): browser_install (fetches
+# a browser binary into the sidecar), browser_file_upload and browser_drop
+# (hand the sidecar's own files to a page), browser_run_code_unsafe (runs
+# code in the tool server's process, not in the page). Everything else is
+# the agent's to use inside its disposable browser.
 #
 # Built on the host beside rs-search and staged into the service's inner
 # Docker (docker save | docker load) when the host's image id changes.

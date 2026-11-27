@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """The plain tier: the search agent's tool server (MCP over stdio).
 
-One process per search, started by the search agent's Claude Code from
-/opt/rs-search-agent/mcp.json. Tools: the scholarly APIs (OpenAlex, Crossref,
-arXiv, Unpaywall), a web search through the service's SearXNG, a page fetch
+One process per search, started by the search agent's Claude Code from the
+tool list the service generates per search. Tools: the scholarly APIs
+(OpenAlex, Crossref, arXiv, Unpaywall), a web search through the service's
+SearXNG, a page fetch
 that saves what it fetched into the search's volume, and `finish`, which
 writes the agent's report there.
 
