@@ -2692,6 +2692,22 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-side-acts { display: flex; flex-wrap: wrap; gap: 6px; flex-shrink: 0; }
 .searchsvc-side-acts > .btn { padding: 5px 10px; font-size: 12px; }
 .searchsvc-side .searchsvc-flash { margin: 6px 4px; }
+/* New and Clear at the top of Quick Ask's list: small, plain buttons whose
+   colour is only a thin badge-like border (green for New, red for Clear). */
+.searchsvc-pill {
+    background: transparent;
+    color: var(--fg-base);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 2px 10px;
+    font-size: 12px;
+    line-height: 1.4;
+    cursor: pointer;
+}
+.searchsvc-pill:hover:not(:disabled) { background: var(--bg-input); }
+.searchsvc-pill:disabled { opacity: 0.5; cursor: default; }
+.searchsvc-pill-new { border-color: var(--fg-accent); }
+.searchsvc-pill-clear { border-color: var(--error-fg); }
 .searchsvc-side-err { margin: 4px; flex-shrink: 0; }
 .searchsvc-side-err:empty { display: none; }
 .searchsvc-side-items {

@@ -9862,8 +9862,10 @@ function searchAskPane(view, settings, flash) {
     problem.hidden = true;
     const listNote = el("div", { class: "searchsvc-flash" }, ["Reading the conversations…"]);
     const items = el("div", { class: "searchsvc-side-items" }, []);
-    const newBtn = el("button", { class: "btn" }, ["New conversation"]);
-    const clearBtn = el("button", { class: "btn btn-danger" }, ["Clear conversations"]);
+    const newBtn = el("button", { class: "searchsvc-pill searchsvc-pill-new",
+                                  title: "New conversation" }, ["New"]);
+    const clearBtn = el("button", { class: "searchsvc-pill searchsvc-pill-clear",
+                                    title: "Clear conversations" }, ["Clear"]);
     // A refused delete's text.
     const sideErr = el("div", { class: "mgmt-reviewer-err searchsvc-side-err" }, []);
     const side = el("div", { class: "searchsvc-side" }, [
