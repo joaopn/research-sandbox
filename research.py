@@ -525,6 +525,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         surveyor_model=args.surveyor_model, surveyor_effort=args.surveyor_effort,
         pi_referee_model=args.pi_referee_model, pi_referee_thinking=args.pi_referee_thinking,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
+        planner_model=args.planner_model, planner_effort=args.planner_effort,
+        work_model=args.work_model, work_effort=args.work_effort,
+        pi_planner_model=args.pi_planner_model, pi_planner_thinking=args.pi_planner_thinking,
+        pi_work_model=args.pi_work_model, pi_work_thinking=args.pi_work_thinking,
         subagents_switch=args.subagents_switch, checks_switch=args.checks_switch,
         planner_switch=args.planner_switch,
         status_bar=args.status_bar,
@@ -991,6 +995,10 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         surveyor_model=args.surveyor_model, surveyor_effort=args.surveyor_effort,
         pi_referee_model=args.pi_referee_model, pi_referee_thinking=args.pi_referee_thinking,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
+        planner_model=args.planner_model, planner_effort=args.planner_effort,
+        work_model=args.work_model, work_effort=args.work_effort,
+        pi_planner_model=args.pi_planner_model, pi_planner_thinking=args.pi_planner_thinking,
+        pi_work_model=args.pi_work_model, pi_work_thinking=args.pi_work_thinking,
         subagents_switch=args.subagents_switch, checks_switch=args.checks_switch,
         planner_switch=args.planner_switch,
         agents=agents,
@@ -3342,6 +3350,35 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--pi-analyst-thinking", dest="pi_analyst_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="thinking level of pi's analyst helper (unset = pi's default)")
+    # The session roles of a researcher-subagents project with its planner
+    # on: the planning session and a work session (their skills /rs-plan and
+    # /rs-work and their shortcuts claude-plan, claude-work, pi-plan, pi-work).
+    c.add_argument("--planner-model", default="", metavar="MODEL",
+                   help="Claude's model of the planning session, in a researcher-subagents "
+                        "project (unset = the installation default)")
+    c.add_argument("--planner-effort", default="", metavar="LEVEL",
+                   help="Claude's effort level of the planning session (unset = the installation default)")
+    c.add_argument("--work-model", default="", metavar="MODEL",
+                   help="Claude's model of a work session, in a researcher-subagents "
+                        "project (unset = the installation default)")
+    c.add_argument("--work-effort", default="", metavar="LEVEL",
+                   help="Claude's effort level of a work session (unset = the installation default)")
+    c.add_argument("--pi-planner-model", dest="pi_planner_model", default="",
+                   metavar="PROVIDER/MODEL",
+                   help="pi's model of the planning session, in a researcher-subagents "
+                        "project (unset = pi's Agent model). "
+                        "Needs pi among the agents.")
+    c.add_argument("--pi-planner-thinking", dest="pi_planner_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="pi's thinking level of the planning session (unset = pi's Agent model)")
+    c.add_argument("--pi-work-model", dest="pi_work_model", default="",
+                   metavar="PROVIDER/MODEL",
+                   help="pi's model of a work session, in a researcher-subagents "
+                        "project (unset = pi's Agent model). "
+                        "Needs pi among the agents.")
+    c.add_argument("--pi-work-thinking", dest="pi_work_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="pi's thinking level of a work session (unset = pi's Agent model)")
     c.add_argument("--subagents", dest="subagents_switch", default="",
                    choices=("",) + rscore.RESEARCH_SWITCHES["subagents"], metavar="on|off",
                    help="a researcher-subagents project's new sessions hand analyses to "
@@ -3487,6 +3524,35 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--pi-analyst-thinking", dest="pi_analyst_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="thinking level of pi's analyst helper (unset = leave unchanged)")
+    # The session roles of a researcher-subagents project with its planner
+    # on: the planning session and a work session (their skills /rs-plan and
+    # /rs-work and their shortcuts claude-plan, claude-work, pi-plan, pi-work).
+    u.add_argument("--planner-model", default="", metavar="MODEL",
+                   help="Claude's model of the planning session, in a researcher-subagents "
+                        "project (unset = leave unchanged)")
+    u.add_argument("--planner-effort", default="", metavar="LEVEL",
+                   help="Claude's effort level of the planning session (unset = leave unchanged)")
+    u.add_argument("--work-model", default="", metavar="MODEL",
+                   help="Claude's model of a work session, in a researcher-subagents "
+                        "project (unset = leave unchanged)")
+    u.add_argument("--work-effort", default="", metavar="LEVEL",
+                   help="Claude's effort level of a work session (unset = leave unchanged)")
+    u.add_argument("--pi-planner-model", dest="pi_planner_model", default="",
+                   metavar="PROVIDER/MODEL",
+                   help="pi's model of the planning session, in a researcher-subagents "
+                        "project (unset = leave unchanged; --reset pi_planner_model = pi's Agent model). "
+                        "Needs pi among the agents.")
+    u.add_argument("--pi-planner-thinking", dest="pi_planner_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="pi's thinking level of the planning session (unset = leave unchanged)")
+    u.add_argument("--pi-work-model", dest="pi_work_model", default="",
+                   metavar="PROVIDER/MODEL",
+                   help="pi's model of a work session, in a researcher-subagents "
+                        "project (unset = leave unchanged; --reset pi_work_model = pi's Agent model). "
+                        "Needs pi among the agents.")
+    u.add_argument("--pi-work-thinking", dest="pi_work_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="pi's thinking level of a work session (unset = leave unchanged)")
     u.add_argument("--subagents", dest="subagents_switch", default="",
                    choices=("",) + rscore.RESEARCH_SWITCHES["subagents"], metavar="on|off",
                    help="what a researcher-subagents project's new sessions start with: "

@@ -4527,7 +4527,7 @@ async function renderPortsInto(view) {
 
 // Host → Defaults: the installation-wide choices a project picks up when it is
 // created or next starts — the researcher-subagents models (referee, analyst,
-// surveyor) and the task limit. Every row is built synchronously before any
+// surveyor, planning session, work session) and the task limit. Every row is built synchronously before any
 // fetch, so the order never depends on fetch timing; each fills through its
 // own read, and a failed read is a quiet badge in its row (Refresh retries).
 function renderDefaultsInto(view) {
@@ -4543,6 +4543,8 @@ function renderDefaultsInto(view) {
     const refereeRow = rowFor();
     const analystRow = rowFor();
     const surveyorRow = rowFor();
+    const plannerRow = rowFor();
+    const workRow = rowFor();
     view.appendChild(el("div", { class: "mgmt-infra" }, [
         el("h3", { class: "mgmt-infra-title" }, ["Researcher-subagents models"]),
         el("div", { class: "mgmt-infra-sub" }, ["Referee"]),
@@ -4563,10 +4565,24 @@ function renderDefaultsInto(view) {
             "The surveyor answers one question from the web for the agent of a " +
             "researcher-subagents project. The default for new projects of that type; " +
             "change an existing one in its ⚙ Agents box."]),
+        el("div", { class: "mgmt-infra-sub" }, ["Planning session"]),
+        plannerRow,
+        el("div", { class: "hint" }, [
+            "The planning session splits the work of a researcher-subagents project with its " +
+            "planner on into work packages, with you (claude-plan, /rs-plan). The default for " +
+            "new projects of that type; change an existing one in its ⚙ Agents box."]),
+        el("div", { class: "mgmt-infra-sub" }, ["Work session"]),
+        workRow,
+        el("div", { class: "hint" }, [
+            "A work session works in one work package of such a project, with you " +
+            "(claude-work, /rs-work). The default for new projects of that type; change an " +
+            "existing one in its ⚙ Agents box."]),
     ]));
     appendDefaultModelRow(view, refereeRow, "referee", "Referee model");   // async, own fetch path
     appendDefaultModelRow(view, analystRow, "analyst", "Analyst model");
     appendDefaultModelRow(view, surveyorRow, "surveyor", "Surveyor model");
+    appendDefaultModelRow(view, plannerRow, "planner", "Planning session model");
+    appendDefaultModelRow(view, workRow, "work", "Work session model");
     appendSettingsSection(view);
 }
 
@@ -12673,6 +12689,10 @@ const SUBAGENT_PICKER_SPECS = [
     ["analyst", "Analyst", "Carries out one analysis for the agent, in parallel with others."],
     ["surveyor", "Surveyor", "Answers one question from the web for the agent."],
     ["referee", "Referee", "Checks a finding before you accept it."],
+    // Its two session roles with the planner on (/rs-plan, /rs-work and their
+    // claude-plan, claude-work shortcuts).
+    ["planner", "Planning session", "Splits the work into work packages with you (planner on)."],
+    ["work", "Work session", "Works in one work package (planner on)."],
 ];
 
 // The egress the create dialog starts on: the workflow's `default_egress` from the
@@ -13293,6 +13313,35 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         el("option", { value: "" }, ["pi's default"]),
         ...PI_THINKING_LEVELS.map((lv) => el("option", { value: lv }, [lv])),
     ]);
+    // pi's two session roles with the planner on (the pi-plan and pi-work
+    // shortcuts): each its own model and thinking level, empty = the Agent
+    // model above, which pi starts on anyway.
+    const piRoleRows = [["planner", "Planning session",
+                         "Splits the work into work packages with you (planner on)."],
+                        ["work", "Work session", "Works in one work package (planner on)."]]
+        .map(([role, title, what]) => {
+            const modelI = el("input", {
+                type: "text", autocomplete: "off", spellcheck: "false",
+                placeholder: "provider/model (empty: the Agent model)",
+            });
+            const thinkingS = el("select", {}, [
+                el("option", { value: "" }, ["pi's default"]),
+                ...PI_THINKING_LEVELS.map((lv) => el("option", { value: lv }, [lv])),
+            ]);
+            const node = el("div", { class: "field" }, [
+                el("label", {}, [title]),
+                el("div", { class: "model-row agent-pi-row" }, [
+                    el("div", { class: "model-cell agent-pi-model" }, [
+                        el("span", { class: "model-cap" }, ["model"]), modelI,
+                    ]),
+                    el("div", { class: "model-cell" }, [
+                        el("span", { class: "model-cap" }, ["thinking"]), thinkingS,
+                    ]),
+                ]),
+                el("div", { class: "hint" }, [what + " Empty: the Agent model above."]),
+            ]);
+            return { role, modelI, thinkingS, node };
+        });
     if (isSubagents) {
         piPanel.appendChild(el("div", { class: "field" }, [
             el("label", {}, ["Referee"]),
@@ -13324,6 +13373,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 "Empty: pi's default model and thinking level.",
             ]),
         ]));
+        piRoleRows.forEach((r) => piPanel.appendChild(r.node));
     }
     const claudePanel = el("div", { class: "agent-tab-panel" },
         modelFields.length ? modelFields : [el("div", { class: "hint" }, [
@@ -13468,6 +13518,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 const am = piAnalystModelI.value.trim();
                 if (am) out.pi_analyst_model = am;
                 if (piAnalystThinkingS.value) out.pi_analyst_thinking = piAnalystThinkingS.value;
+                piRoleRows.forEach((r) => {
+                    const m = r.modelI.value.trim();
+                    if (m) out["pi_" + r.role + "_model"] = m;
+                    if (r.thinkingS.value) out["pi_" + r.role + "_thinking"] = r.thinkingS.value;
+                });
             }
         }
         // The working mode: sent only when it is not None, the Doer/Checker
@@ -13866,8 +13921,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 // worker_*/role_* only where a worker layer exists (from_kwargs
                 // rejects them elsewhere, and the pickers are filtered to match);
                 // analyst_*/surveyor_*/referee_* on a researcher-subagents
-                // workflow only, likewise; pi_model/pi_thinking while pi is on,
-                // and pi_referee_*/pi_analyst_* there too on that workflow. Every key is in
+                // workflow only, likewise (planner_*/work_* too); pi_model/pi_thinking
+                // while pi is on, and pi_referee_*/pi_analyst_*/pi_planner_*/pi_work_*
+                // there too on that workflow. Every key is in
                 // CREATE_WEBUI_FIELDS.
                 ...agentModelPayload(),
             };
@@ -17192,11 +17248,19 @@ function agentsBoxContent(name, d, cat, staged) {
     const pairText = (p, none) => (p && p.model)
         ? p.model + (p.effort ? ", " + p.effort : "") : none;
     const helperPickers = referee && cat
-        ? [["analyst", "Analyst", "Carries out one analysis, in parallel with others."],
-           ["surveyor", "Surveyor", "Answers one question from the web."]].map(([ct, title, what]) =>
+        ? [["analyst", "Analyst", "Carries out one analysis, in parallel with others.",
+            "The next one launched uses a change."],
+           ["surveyor", "Surveyor", "Answers one question from the web.",
+            "The next one launched uses a change."],
+           // The session roles with the planner on: a change rewrites their
+           // skill and shortcut; "" = none named (the session's own model).
+           ["planner", "Planning session", "Splits the work into work packages with you.",
+            "The next /rs-plan or claude-plan uses a change."],
+           ["work", "Work session", "Works in one work package.",
+            "The next /rs-work or claude-work uses a change."]].map(([ct, title, what, next]) =>
             [ct, modelPicker(cat, ct, title,
                 what + " Now: " + pairText(d[ct], "the agent's own model") +
-                ". The next one launched uses a change.", { unchanged: true })])
+                ". " + next, { unchanged: true })])
         : [];
     const claudeNotes = [];
     if (claudeInit.unrecognised) {
@@ -17306,6 +17370,36 @@ function agentsBoxContent(name, d, cat, staged) {
             "Carries out one analysis, in parallel with others. Empty: pi's default model " +
             "and thinking level. The next one launched uses a change."]),
     ]) : null;
+    // pi's session roles (the same project, planner on): each its own model
+    // and thinking level, empty = the Agent model above. A change rewrites the
+    // pi-plan / pi-work shortcut, nothing restarts.
+    const piRoles = referee ? [["planner", "Planning session",
+                                "Splits the work into work packages with you.", "pi-plan"],
+                               ["work", "Work session", "Works in one work package.", "pi-work"]]
+        .map(([role, title, what, cmd]) => {
+            const init = d["pi_" + role] || { model: "", thinking: "" };
+            const modelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+                                         placeholder: "provider/model (empty: the Agent model)" });
+            modelI.value = init.model || "";
+            const thinkS = el("select", {}, [
+                el("option", { value: "" }, ["pi's default"]),
+                ...HARNESS_PI_THINKING.map((lv) => el("option", { value: lv }, [lv])),
+            ]);
+            thinkS.value = HARNESS_PI_THINKING.includes(init.thinking) ? init.thinking : "";
+            const node = el("div", { class: "field" }, [
+                el("label", {}, [title]),
+                el("div", { class: "model-row agent-pi-row" }, [
+                    el("div", { class: "model-cell agent-pi-model" }, [
+                        el("span", { class: "model-cap" }, ["model"]), modelI]),
+                    el("div", { class: "model-cell" }, [
+                        el("span", { class: "model-cap" }, ["thinking"]), thinkS]),
+                ]),
+                el("div", { class: "hint" }, [
+                    what + " Empty: the Agent model above. The next " + cmd + " uses a change."]),
+            ]);
+            return { role, title, init, node, model: () => modelI.value.trim(),
+                     thinking: () => thinkS.value };
+        }) : [];
     const piPanel = el("div", { class: "agent-tab-panel" }, [
         el("div", { class: "field" }, [
             el("label", {}, ["Agent"]),
@@ -17324,6 +17418,7 @@ function agentsBoxContent(name, d, cat, staged) {
         ]),
         piRefereeNode,
         piAnalystNode,
+        ...piRoles.map((r) => r.node),
         piRows.node,
     ]);
     const panels = { claude: claudePanel, pi: piPanel };
@@ -17368,6 +17463,7 @@ function agentsBoxContent(name, d, cat, staged) {
         piAnalyst: piAnalystNode ? { model: () => piAnalystModelI.value.trim(),
                                      thinking: () => piAnalystThinkS.value,
                                      init: piAnalystInit } : null,
+        piRoles,
         claude: { model: () => claudeModelI.value.trim(), effort: () => claudeEffortS.value,
                   init: claudeInit },
         pi: { model: () => piModelI.value.trim(), thinking: () => piThinkS.value,
@@ -17807,6 +17903,17 @@ function boxAgentsWhat(b, cur) {
 // cost a restart on an older container), pi's when touched (pi may run a
 // default picked inside it), an emptied row as an explicit reset. Returns a
 // line for the box when there is nothing to send.
+// What the ⚙ Agents box's confirmation says of a Claude helper or session
+// role's model change (each is written into its definition, skill or
+// shortcut by the kit's installer; nothing restarts).
+const AGENTS_BOX_HELPER_LINES = {
+    analyst: "Analyst's model: the next one launched uses it; nothing is restarted.",
+    surveyor: "Surveyor's model: the next one launched uses it; nothing is restarted.",
+    planner: "Planning session's model: the next /rs-plan or claude-plan uses it; nothing is " +
+             "restarted.",
+    work: "Work session's model: the next /rs-work or claude-work uses it; nothing is restarted.",
+};
+
 function agentsBoxApply(name, d, f) {
     const payload = {};
     const reset = [];
@@ -17909,8 +18016,7 @@ function agentsBoxApply(name, d, f) {
             if (v.model) payload[ct + "_model"] = v.model;
             if (v.effort) payload[ct + "_effort"] = v.effort;
             if (v.model || v.effort) {
-                lines.push((ct === "analyst" ? "Analyst" : "Surveyor") + "'s model: the next one " +
-                           "launched uses it; nothing is restarted.");
+                lines.push(AGENTS_BOX_HELPER_LINES[ct] || (ct + "'s model: updated."));
             }
         });
     }
@@ -17934,13 +18040,26 @@ function agentsBoxApply(name, d, f) {
                        `${at || "pi's default"}; the next one launched uses it, nothing is restarted.`);
         }
     }
+    if (f.piRoles && f.on.has("pi")) {
+        f.piRoles.forEach((r) => {
+            const m = r.model(), t = r.thinking();
+            const wasM = r.init.model || "", wasT = r.init.thinking || "";
+            if (m !== wasM || t !== wasT) {
+                setOrReset("pi_" + r.role + "_model", m, wasM, null);
+                setOrReset("pi_" + r.role + "_thinking", t, wasT, null);
+                lines.push(`pi's ${r.title}: ${m || "the Agent model"}, thinking ` +
+                           `${t || "pi's default"}; the next ${r.role === "planner" ? "pi-plan" : "pi-work"} ` +
+                           "uses it, nothing is restarted.");
+            }
+        });
+    }
     if (reset.length) payload.reset = reset;
     if (!lines.length) return "Nothing to change.";
     // The referee's and the helpers' models reach a running session too (its
     // next helper or referee reads the new definition): only a change made of
     // those alone gets the hint that says so, every other change keeps the
     // restart hint.
-    const LIVE_FIELDS = /^(referee|analyst|surveyor|pi_analyst|pi_referee)_/;
+    const LIVE_FIELDS = /^(referee|analyst|surveyor|planner|work|pi_analyst|pi_referee|pi_planner|pi_work)_/;
     const liveOnly = Object.keys(payload).every((k) => LIVE_FIELDS.test(k) ||
         (k === "reset" && payload.reset.every((r) => LIVE_FIELDS.test(r))));
     const validate = () => {
@@ -17958,6 +18077,13 @@ function agentsBoxApply(name, d, f) {
         if (payload.pi_analyst_model && !HARNESS_PI_MODEL_PATTERN.test(payload.pi_analyst_model)) {
             return "Write pi's Analyst model as provider/model, e.g. " +
                    "openrouter/anthropic/claude-opus-latest.";
+        }
+        for (const r of (f.piRoles || [])) {
+            const m = payload["pi_" + r.role + "_model"];
+            if (m && !HARNESS_PI_MODEL_PATTERN.test(m)) {
+                return `Write pi's ${r.title} model as provider/model, e.g. ` +
+                       "openrouter/anthropic/claude-opus-latest.";
+            }
         }
         if (f.sw && harnessModeRoles(f.sw.value()).length && f.on.has("pi")) {
             const bad = f.piRows.invalid();
@@ -17981,8 +18107,8 @@ function agentsBoxApply(name, d, f) {
             el("ul", {}, lines.map((t) => el("li", {}, [t]))),
             el("div", { class: "hint" }, [
                 liveOnly
-                    ? "The next helper or referee launched uses the new model, in a session " +
-                      "running now too; nothing is restarted."
+                    ? "The next helper or referee launched, role skill invoked or shortcut typed " +
+                      "uses the new model, in a session running now too; nothing is restarted."
                     : d.running
                     ? "Each agent's next session uses its new settings; a session running now " +
                       "keeps them until it is restarted (switch the working mode in a running " +

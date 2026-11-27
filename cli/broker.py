@@ -1077,6 +1077,12 @@ CREATE_WEBUI_FIELDS = frozenset({
     "referee_model", "referee_effort", "analyst_model", "analyst_effort",
     "surveyor_model", "surveyor_effort", "pi_referee_model", "pi_referee_thinking",
     "pi_analyst_model", "pi_analyst_thinking",
+    # Its session roles with the planner on (the Planning session and Work
+    # session rows): IN-BOX like the helper pairs — catalog tokens and pi
+    # provider/model ids frozen into the record, which the kit's installer
+    # writes into the role's skill and shortcuts inside the container.
+    "planner_model", "planner_effort", "work_model", "work_effort",
+    "pi_planner_model", "pi_planner_thinking", "pi_work_model", "pi_work_thinking",
     # Its switches (subagents on/off, checks off/staged/all, planner off/on):
     # IN-BOX — words written into the project's record, which rs-memory and
     # RS's instruction writer read; from_kwargs holds them to their value
@@ -1132,6 +1138,11 @@ UPDATE_WEBUI_FIELDS = frozenset({
     # update() on any other project. No container is restarted.
     "analyst_model", "analyst_effort", "surveyor_model", "surveyor_effort",
     "pi_analyst_model", "pi_analyst_thinking",
+    # Its session roles' pairs (the same box, the same project type), the
+    # same way: written into the record, the kit's installer re-run inside
+    # the container. No container is restarted.
+    "planner_model", "planner_effort", "work_model", "work_effort",
+    "pi_planner_model", "pi_planner_thinking", "pi_work_model", "pi_work_thinking",
     # Its switches (the same project type): IN-BOX — words written into the
     # project's record, then RS's instructions written again in the running
     # container; value lists in from_kwargs, the project type, "on their own"

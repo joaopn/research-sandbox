@@ -67,9 +67,12 @@ OVERRIDE_PATH = OVERRIDE_DIR / "model-defaults.json"
 # box; its default here is what the next such project starts with. `analyst`
 # and `surveyor` are the same kind of type for the helper roles Claude launches
 # in those projects (the kit's installer writes the recorded pair into each
-# helper's definition).
+# helper's definition). `planner` and `work` are the same kind of type for the
+# two roles a session of such a project takes with its planner on, the
+# planning session and a work session on one package (the installer writes
+# the pair into the role's skill and its claude-plan / claude-work shortcut).
 TYPES = ("supervisor", "worker", "role", "box", "reviewer", "referee",
-         "analyst", "surveyor")
+         "analyst", "surveyor", "planner", "work")
 
 ALIAS_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 

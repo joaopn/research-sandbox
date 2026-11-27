@@ -10,5 +10,9 @@
   "_analyst": "The analyst helper a researcher-subagents project's agent launches for one analysis, in parallel (Claude's analyst subagent). Sonnet at high effort is the setting the research flow's analysis workers use, measured adequate and about 15 times cheaper than max on the same analysis. Frozen into those projects' record at create; set here from Host → Defaults → Analyst, and per project in its ⚙ Agents box (pi's analyst is set there only, in pi's own provider/model form).",
   "analyst": { "model": "sonnet", "effort": "high" },
   "_surveyor": "The surveyor helper a researcher-subagents project's agent launches for one web survey question (Claude's surveyor subagent). Sonnet at high effort, as the analyst. Frozen into those projects' record at create; set here from Host → Defaults → Surveyor, and per project in its ⚙ Agents box.",
-  "surveyor": { "model": "sonnet", "effort": "high" }
+  "surveyor": { "model": "sonnet", "effort": "high" },
+  "_planner": "The planning session of a researcher-subagents project with its planner on (the /rs-plan skill and the claude-plan shortcut, Claude): it defines the task with the user and splits it into work packages. It is a session the user talks to, so it starts on the agent's own default, Opus at high effort. Frozen into those projects' record at create; set here from Host → Defaults → Planning session, and per project in its ⚙ Agents box (pi's planning session is set there only, falling back to pi's Agent model).",
+  "planner": { "model": "opus", "effort": "high" },
+  "_work": "A work session on one work package of such a project (the /rs-work skill and the claude-work shortcut, Claude): it does the package's research with the user and runs its analysts. A session the user talks to, like the planning session: Opus at high effort. Frozen into those projects' record at create; set here from Host → Defaults → Work session, and per project in its ⚙ Agents box.",
+  "work": { "model": "opus", "effort": "high" }
 }
