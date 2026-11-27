@@ -8704,6 +8704,20 @@ const SEARCH_CONTACT_HINT =
     "never reaches the agents that call the search service. When it is empty, " +
     "the generic user@example.org is sent, which works but is shared by every " +
     "installation and reaches nobody.";
+// The searcher's browser tiers, in the order a search tries them after the
+// plain tier: the key the settings use, the switch's name, its one line.
+const SEARCH_TIER_SWITCHES = [
+    ["browser", "Browser",
+     "a headless Chromium for pages that need rendering or refuse a plain fetch"],
+    ["stealth", "Stealth browser",
+     "camoufox, a browser that looks like a person's, for pages that block the browser"],
+];
+// Shown on the browser tiers' question mark (a mouseover title).
+const SEARCH_TIERS_HINT =
+    "A search tries the plain tier first (scholarly databases, a page fetch, a " +
+    "web search), then the browser, then the stealth browser. A tier switched " +
+    "off is never used. Each running search starts its own browsers for the " +
+    "tiers that are on, and they take memory while it runs.";
 // The gateway entry's state, when it is not the normal "listed".
 const SEARCH_ENTRY_TEXT = {
     absent: "it is not on the MCP server list (Turn on lists it)",
@@ -9120,9 +9134,16 @@ function searchCell(caption, control, help) {
     return el("div", { class: "model-cell" }, [cap, control]);
 }
 
-// Searcher: the one searcher's name, model and effort, searches at once, and
-// the contact address, saved together (the broker replaces the whole file,
-// so the saved sidebar switch goes with them).
+// The searcher's browser tiers as the two booleans Save sends: a tier the
+// reply does not name (a settings file saved before the switches) is on.
+function searchTiers(s) {
+    const t = (s && s.tiers) || {};
+    return { browser: t.browser !== false, stealth: t.stealth !== false };
+}
+
+// Searcher: the one searcher's name, model and effort, searches at once, the
+// contact address and the browser tiers, saved together (the broker replaces
+// the whole file, so the saved sidebar switch goes with them).
 function searchSearcherSection(view, cfg, cfgErr, flash) {
     const landing = view.__rsRender || renderSearchInto;
     const wrap = el("div", { class: "mgmt-infra" }, [
@@ -9156,6 +9177,22 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         placeholder: cfg.generic_contact ? "empty: " + cfg.generic_contact : "",
     });
     contact.value = cur.contact || "";
+    // The browser tiers: a line of their own in the form, a switch and its
+    // explanation each (a plain label, no .field wrapper to bleed into it).
+    const tiers = searchTiers(s);
+    const tierBoxes = {};
+    const tierCell = searchCell("browser tiers", el("div", { class: "searchsvc-tier-list" },
+        SEARCH_TIER_SWITCHES.map(([key, label, note]) => {
+            const box = el("input", { type: "checkbox" });
+            box.checked = tiers[key];
+            tierBoxes[key] = box;
+            return el("div", { class: "searchsvc-tier" }, [
+                el("label", { class: "mgmt-check searchsvc-switch" }, [
+                    box, el("span", {}, [label])]),
+                el("span", { class: "mgmt-settings-note" }, [note]),
+            ]);
+        })), SEARCH_TIERS_HINT);
+    tierCell.classList.add("searchsvc-tiers");
     // A damaged settings file: the broker's text (the form shows the defaults,
     // and Save replaces the file).
     const errEl = el("span", { class: "mgmt-reviewer-err" }, [cfg.error || ""]);
@@ -9182,6 +9219,7 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         const { status, body } = await mcpPost("/broker/search/settings", {
             name: name.value.trim(), model: v.model, effort: v.effort,
             at_once: n, contact: contact.value.trim(), recent: kept,
+            tiers: { browser: tierBoxes.browser.checked, stealth: tierBoxes.stealth.checked },
             // The switch below saves at once, so the saved value is its state.
             sidebar: cur.sidebar === true,
         });
@@ -9203,6 +9241,7 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         searchCell("searches at once", atOnce),
         searchCell("recent searches kept", recent),
         searchCell("contact address", contact, SEARCH_CONTACT_HINT),
+        tierCell,
         save,
         errEl,
     ]));
@@ -9239,7 +9278,8 @@ function searchLayoutSection(view, cfg, flash) {
         errEl.textContent = "";
         const { status, body } = await mcpPost("/broker/search/settings", {
             name: s.name, model: s.model, effort: s.effort, at_once: s.at_once,
-            contact: cur.contact || "", recent: cur.recent, sidebar: want,
+            contact: cur.contact || "", recent: cur.recent, tiers: searchTiers(s),
+            sidebar: want,
         });
         busy = false;
         box.disabled = false;

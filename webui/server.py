@@ -1000,7 +1000,7 @@ async def broker_aldine_session_handler(request: web.Request) -> web.Response:
 # lockstep. The token is a secret: it travels in this request's body to the
 # broker and nowhere else (no log line, no reply carries it).
 _SEARCH_SETTINGS_FIELDS = ("name", "model", "effort", "at_once", "contact", "recent",
-                           "sidebar")
+                           "tiers", "sidebar")
 # The operator's own ask (Services → Search → Quick Search): the question, the
 # conversation it belongs to (null = a new one) and whether the conversation's
 # earlier questions and answers go with it.
@@ -1031,9 +1031,9 @@ async def broker_search_settings_handler(request: web.Request) -> web.Response:
 
 async def broker_search_settings_set_handler(request: web.Request) -> web.Response:
     """POST /broker/search/settings {name, model, effort, at_once, contact,
-    recent, sidebar} — save the searcher, the contact address, how many ended
-    searches the page lists and whether the sidebar shows Search (all seven;
-    saving replaces the file). An absent
+    recent, tiers, sidebar} — save the searcher (with its browser tiers), the
+    contact address, how many ended searches the page lists and whether the
+    sidebar shows Search (all eight; saving replaces the file). An absent
     key is sent as absent, so the broker refuses it cleanly."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")

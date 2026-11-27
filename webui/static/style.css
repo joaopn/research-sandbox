@@ -2657,6 +2657,13 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-runs .searchsvc-operator { color: var(--fg-accent); }
 /* Settings → Layout: the sidebar switch. */
 .searchsvc-switch-row { flex-wrap: wrap; }
+/* Settings → Searcher: the browser tiers, a line of their own in the form
+   (the full basis wraps the row before them and puts Save under them), one
+   switch and its explanation per line. No .field wrapper, so the checkbox and
+   its label keep .mgmt-check's look. */
+.searchsvc-tiers { flex-basis: 100%; }
+.searchsvc-tier-list { display: flex; flex-direction: column; gap: 4px; }
+.searchsvc-tier { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
 /* Quick Search: the conversations on the side, the conversation and its
    composer. Self-scoped classes only (the textarea carries .searchsvc-input,
    no bare textarea rule). */

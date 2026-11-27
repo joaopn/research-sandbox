@@ -11,9 +11,9 @@ It is off until the operator turns it on, in the Search tab of the Services page
 
 - **Quick Search** asks the searcher a question directly, in a chat with its own list of conversations (below).
 - **Activity** lists the waiting and running searches with their work so far and a Stop button, and the recent ones with their reports (below).
-- **Settings** turns the service on and off, clears the ended searches nobody collected, signs the service in (a long-lived token, below) with **Test**, sets the one searcher (its name, model and effort, and how many searches run at once), an optional contact address and how many ended searches Activity's Recent searches list keeps, and holds the switch **Show Search in the sidebar** (below).
+- **Settings** turns the service on and off, clears the ended searches nobody collected, signs the service in (a long-lived token, below) with **Test**, sets the one searcher (its name, model and effort, how many searches run at once, and whether it may use the browser tiers, below), an optional contact address and how many ended searches Activity's Recent searches list keeps, and holds the switch **Show Search in the sidebar** (below).
 
-Turn on builds the service's images, starts its container and stages the search images into it (minutes the first time), and lists it on the [MCP gateway](MCP-servers.md) as the server `search`. `research search on | off | status | token | token-clear | settings | clear` does the same from the host.
+Turn on builds the service's images, starts its container and stages the search images into it (minutes the first time; the two browser images add about 4.8 GB), and lists it on the [MCP gateway](MCP-servers.md) as the server `search`. `research search on | off | status | token | token-clear | settings | clear` does the same from the host.
 
 An agent gets the service when the operator ticks `search` for it on Services → MCP, like any MCP server. It then has three tools: submit a question (the answer is a search id, at once), check a search (waiting, running and what it is doing, or ended with its files), and collect the result. Files are downloaded through the gateway, from the server's own address plus `/files/<search id>/<name>`, with the agent's usual token. Collecting ends the search and removes everything it left, unless the agent asks to keep it.
 
@@ -26,7 +26,7 @@ flowchart LR
   page["Services → Search"] --> broker["Broker (host)"]
   broker -->|"sign-in, searcher, on and off, the operator's asks"| service
   subgraph inner["The service's own Docker"]
-    service --> search1["One search: private network, search agent, volume"]
+    service --> search1["One search: private network, search agent, its browsers, volume"]
     search1 --> searxng["SearXNG"]
   end
   search1 --> router["Router, locked rules"]
@@ -38,15 +38,15 @@ flowchart LR
 |---|---|---|
 | The operator | Services → Search (Quick Search, Activity, Settings), or the sidebar's Search | The webui's Management sign-in |
 | An agent, a box or a research project's workers | The MCP server `search`, ticked for them on Services → MCP | A wiring like any other MCP server |
-| A search agent | The internet through the router, and SearXNG on its own network | Nothing else: it cannot reach the service, another search or a private address |
+| A search agent | The internet through the router, and SearXNG and its own browsers on its own network | Nothing else: it cannot reach the service, another search or a private address |
 
 The service is one container of the inner-Docker image projects use. It sits on two networks of its own: one shared only with the MCP gateway, which is how callers reach it, and one whose only way out is RS's router under a locked project's rules (web ports and DNS). It is never on the shared network that holds Gitea and the registry: the service has no login of its own and believes the caller the gateway names.
 
 ## One search
 
-Each search gets, inside the service's own Docker, a private network, one search-agent container and a volume for its files, all three named after the search. Nothing one search saw reaches another: searches cannot reach each other, the service or a private address, and each starts clean. A search agent starts in under a second, so nothing is kept warm. Everything a search started is removed by name once the caller has collected it, or when the operator clears it; when the service starts, it removes whatever an earlier run left behind.
+Each search gets, inside the service's own Docker, a private network, one search-agent container, one container per browser tier switched on (below) and a volume for its files, all named after the search. Nothing one search saw reaches another: searches cannot reach each other, the service or a private address, and each starts clean. A search agent starts in under a second, so nothing is kept warm. Everything a search started is removed by name once the caller has collected it, or when the operator clears it; when the service starts, it removes whatever an earlier run left behind.
 
-The search agent is Claude Code, with its own web tools off. Its tools all come from the service, so a later pi search agent gets the same ones. Its instructions say that page content is data, never instructions, and that its report names every way of searching it tried and what each one hit. A search that runs past an hour is stopped and collected as failed, with what it saved.
+The search agent is Claude Code, with its own web tools off. Its tools all come from the service and from the search's own browsers, so a later pi search agent gets the same ones. Its instructions say that page content is data, never instructions, and that its report names every way of searching it tried and what each one hit. A search that runs past an hour is stopped and collected as failed, with what it saved.
 
 ## The plain tier
 
@@ -57,6 +57,24 @@ A search tries the cheapest way first. This first tier has three parts:
 - **A web search through SearXNG**, run inside the service with JSON output. Its engines are duckduckgo, google cse, bing, openalex, crossref and pubmed: measured from one shared address, these answered reliably. Google, Google Scholar, qwant, brave, arXiv through SearXNG and Semantic Scholar were blocked, suspended or degraded from the first queries, so they are left out (arXiv is reached through its own API instead). The engines SearXNG reports as not answering go into the report, as a sign that a harder way is needed.
 
 What the search agent tried is also recorded by the tool server itself, one line per call, independently of what the model writes; the caller gets both.
+
+## The browser tiers
+
+A page that needs a browser to render, or a publisher that refuses a plain download, does not end the search at the first wall. After the plain tier, a search can try two more, in this order:
+
+| Tier | What it is | When the search agent uses it |
+|---|---|---|
+| plain | The scholarly APIs, the page fetch and SearXNG (above) | Always first |
+| browser | A headless Chromium, driven through Playwright's tool server | A page that needs rendering, or that refused the plain fetch |
+| stealth | camoufox, a Firefox built to look like a person's browser, driven the same way | A page that blocked the browser (a challenge page, a 403) |
+
+The searcher's settings have one switch per browser tier, **Browser** and **Stealth browser**, both on by default. A tier switched off does not exist for the search agent: its tools are not offered, and nothing of it starts. So the operator can keep a searcher to the plain tier, or let it stop at the browser. The report's "what was tried" names every tier the search tried and what each one hit, and the work view shows the browser tiers' calls beside the plain tier's, each line with its tier (`browser` or `stealth`); the service records those calls from the search agent's own output, since the browsers' tool server keeps no trace of its own.
+
+Each search gets its own browsers. For each tier switched on, the service starts one container beside the search agent on the search's private network, named after the search and removed with it. Two searches never share a browser, and one search cannot reach another's. The containers start with the search, before its agent, so its tools answer from its first step; the browser inside each starts only when the search opens its first page, so a search that never needs one pays only for the idle containers. The containers run with no added privileges as an ordinary user, and the browsers in them run without their own sandbox: the container is the boundary.
+
+A file a browser downloads (a publisher's PDF, say) arrives as a file of the search, like one the page fetch saved: the caller downloads it and the report lists it. A download whose file name the service does not accept is not listed; the outcome says a download was dropped and why, rather than renaming it.
+
+The cost: Turn on builds and stages two more images, about 4.8 GB, so the first Turn on takes longer, and every running search holds the memory of its browser containers (measured: about 90–100 MB each while idle, and after the first page about 200 MB for Chromium and 600 MB for camoufox) while it runs, whether or not it opens a page. Some sites stay blocked at every tier: measured on 21 literature sites, a page came through for 6 with the browser and 12 with the stealth browser.
 
 ## Callers and their searches
 
@@ -82,7 +100,7 @@ The conversations are kept on the search service's own disk, so they survive a r
 
 While the service is running, the Search tab's Activity sub-tab has a table of the searches that are waiting or running, one row each: who asked (the project and its agent, box or workers, or "operator" for a question from Quick Search), the question (shortened; the whole of it on hover), the searcher, the state, the time and the tokens. The time is how long the search has run, or how long it has waited while it waits for its turn; it counts up every second. The tokens are the input, output and cache tokens the search agent has used so far. Activity reads the table when it opens and re-reads it every few seconds while it is on screen; it stops when you leave it, and nothing reads while it is closed.
 
-Clicking a row opens the search's work, read-only: its whole question, its state, time and tokens, then the last few things it did, oldest first: enough to see how it goes and what broke, not a record of the whole search. A tool call is one line (when, the tier and the tool, what it was aimed at, and what came of it); what the search agent wrote between calls shows as a paragraph, up to its last 2,000 characters. The box follows the search while it runs; once the search has ended it shows why and stops. The work carries text from the pages the search read, so the page shows all of it as plain text and never as part of the page itself. When there was earlier work, the box says only the latest is shown.
+Clicking a row opens the search's work, read-only: its whole question, its state, time and tokens, then the last few things it did, oldest first: enough to see how it goes and what broke, not a record of the whole search. A tool call is one line (when, the tier and the tool, what it was aimed at, and what came of it; a browser tier's call names `browser` or `stealth` as its tier); what the search agent wrote between calls shows as a paragraph, up to its last 2,000 characters. The box follows the search while it runs; once the search has ended it shows why and stops. The work carries text from the pages the search read, so the page shows all of it as plain text and never as part of the page itself. When there was earlier work, the box says only the latest is shown.
 
 **Stop** ends a waiting or running search at once. The agent that asked sees, at its next check, that the operator stopped it; the search's files go when that agent collects it, or when you clear ended searches.
 
@@ -97,20 +115,22 @@ Under the table, **Recent searches** lists the searches that have ended, newest 
 | Turn on again | Finds them; agents need `search` ticked again |
 | `research start` | Brings a turned-on service back on this installation's code and pins; never starts one that was not turned on |
 | `research stop` | Stops it with the rest of the shared services |
-| A change of the sign-in or the searcher | Saved on the host and handed to a running service at once; a stopped one gets it when it starts |
+| A change of the sign-in or the searcher | Saved on the host and handed to a running service at once; a stopped one gets it when it starts. A change of the browser tiers applies to the searches that start after it |
 
 ## Search in the sidebar
 
 Settings → **Show Search in the sidebar** adds a **Search** entry to the group at the bottom of the sidebar, directly above Services, with the same kind of line icon. Opening it shows Quick Search, Activity and Settings as the main strip's tabs, the way Services and Host show theirs; Services → Search stays where it is, and both share the last tab used. The entry carries no count, so nothing reads in the background for it. The switch saves at once and is kept on the host with the searcher, so every browser that signs in shows the same sidebar; a browser learns it when it signs in to the broker, so another browser's change shows at its next load.
 
-Browser tiers (an ordinary automated browser, then one built to look like a person's), a searcher that goes out through a VPN, and tips on getting past a site's walls are planned to follow; they are not built yet.
+A searcher that goes out through a VPN, and tips on getting past a site's walls, are planned to follow; they are not built yet.
 
 ## Design decisions
 
 - **A search framework RS builds and maintains.** Searching is RS's own service, not an agent's built-in web tool, so RS can improve it over time and offer the same thing to every agent, Claude Code and pi alike.
 - **The search escalates inside itself, cheapest first.** If a scholarly API or a plain fetch answers the question, nothing heavier runs. The caller sees one search tool; which way of searching worked is in the report.
+- **Three tiers, plain, browser and stealth, each switchable but the first.** The browser and the stealth browser are tried only after the plain tier, and only when it is not enough; the operator can switch either off per searcher, which removes it from the search agent's tools. Both are on by default: the maintainer called Playwright and camoufox fair game. The cost: camoufox makes the search look like a person to sites that forbid automated access, which the switch leaves to the operator.
+- **Each search's browsers are containers on its own network, started with it.** A search's network holds only its agent, its browsers and SearXNG, so one search cannot reach another's browser (a browser's control port is open to anything on its network). The containers start before the agent, rather than at the first browser call, because starting them on demand would need a path from every search into the service, which the service blocks on purpose (searches read hostile pages). The cost: the idle containers' memory per running search, and up to a second more at a search's start.
 - **One shared service with its own inner Docker.** Everything a search starts lives inside the service's container, not in the host's Docker, and the staged images survive a restart. The cost: on hosts without sysbox that inner Docker is privileged, so a search agent that broke out of its container would meet no extra layer before the host.
-- **Disposable searches.** A private network, a container and a volume per search, removed by name when collected. A page that fools a search agent finds no project data and no notes to poison for later searches. The cost: a search's files are gone once it is collected, so the caller downloads them first.
+- **Disposable searches.** A private network, its containers (the agent and its browsers) and a volume per search, removed by name when collected. A page that fools a search agent finds no project data and no notes to poison for later searches. The cost: a search's files are gone once it is collected, so the caller downloads them first.
 - **SearXNG for the plain web search, with measured engines.** It runs inside the service, needs no key, and reports which engines did not answer. The cost: every search leaves from the host's one address, where engines throttle a caller that asks too often.
 - **The gateway names the caller, for RS's own service only.** The service trusts the header because only the gateway can set it; any other server never sees who called. A project collects only its own searches.
 - **Quick Search is one search per message, in the agents' queue.** The operator's questions use the same searcher, sign-in and queue as the agents', under a reserved name no project can have, so nothing about a search changes with who asked. Follow-ups see earlier answers only when the operator ticks the box; the cost is a question that grows with the conversation, until its length limit stops it.
