@@ -25,7 +25,11 @@ Everything lives under /workspace/memory/ (RS_MEMORY_DIR overrides it):
                                 referee run (snapshot/, verdict.md); never
                                 deleted, the audit trail
   sessions/<id>.json            a session's own switches (`switch`), in a
-                                researcher-subagents project
+                                researcher-subagents project, and (planner
+                                on) what the session holds; always in the
+                                top memory
+  planning.json                 (planner on) which session holds the
+                                project's top, the planning session
   jobs/job-<n>.md               a long run the agent left going (its pid, its
                                 command line, its log); marked done, never
                                 deleted
@@ -82,6 +86,13 @@ Verbs:
                                 folder holding its writeup.md (reads only)
   job add --pid N --log PATH --name TEXT [--expect-end TEXT]
   job list [--all]  /  job done ID
+  plan [--agent claude|pi]      (planner on) take the project's top: this
+                                session plans
+  take PACKAGE [--agent claude|pi]  (planner on) take a package: this
+                                session works in it
+  release                       give back what this session holds
+  package add NAME --charter FILE  /  package charter NAME --charter FILE
+  package done NAME  /  package close NAME  /  package list [--json]
 
 Nothing rs-memory starts outlives the call that started it. `close` runs
 the consolidation (a headless agent on a brief, which merges its delta with
@@ -117,6 +128,49 @@ entry names what it lacked (`unchecked`), its pages say "not checked", as do
 the pages of a finding staged with the checks off (`checks: off`) until a
 check runs on it. The checks' verbs work whatever the switch. "all" differs
 from "staged" only in the instructions. `open` says which switches hold.
+
+The record's object may also hold "planner": "off"|"on" (absent = off), a
+project setting only: no session switches it. With the planner off, every
+session works in the top memory, RS_MEMORY_DIR (default /workspace/memory),
+as above. With it on, the work is split into work packages, each a folder
+<workspace>/packages/<name>/ (a name like a project's: letters, digits, '-'
+and '_', a letter or digit first) laid out like the workspace's top: its
+front page README.md, staging/, results/, logbook/, analyses/ and its own
+memory/, plus charter.md (its questions, its data, what is out of its scope;
+written by `package add` and `package charter` from a draft with the
+sections "## Questions", "## Data" and "## Out of scope") and package.json,
+its status: {"name", "state": "open"|"done"|"closed", "created", "changed",
+"holder": null | {"session", "pid", "start", "since"}}. A session holds the
+top (`plan`: the planning session, one at a time), one package (`take`), or
+nothing; what it holds is in its file under the top memory's sessions/, and
+the holder in package.json or the top memory's planning.json. Taking records
+the session's id, its agent's process id and that process's start time
+(/proc/<pid>/stat), so a reused pid never reads as the holder; a take is
+refused while the recorded holder's process is alive with that start time,
+and a holder whose process has ended reads as free. The agent's process is
+CLAUDE_PID under Claude Code; under pi it is the first process above this
+command whose environment does not carry the same PI_SESSION_ID (pi's bash
+tool sets it for the commands it runs; pi itself does not have it). A
+session that holds a package works in that package's memory; the planning
+session, and every session's reads while it holds nothing, in the top; a
+session that holds nothing is refused every verb that writes. The record,
+the referee's model and a re-run's folder are the workspace's in a package
+too. RS_MEMORY_DIR naming a package's memory is refused: a package's memory
+is reached by taking the package. Taking a memory first consolidates its
+last session when that one ended without `close` (as `open` does without
+the planner); `open` of a session that holds nothing lists the packages and
+consolidates nothing; `close` and `close --hook` act on the memory the
+session holds, then give it back. Only the planning session adds a package,
+changes a charter (journalled in the package as an entry naming the
+sections that changed, so its session sees it at its next `open`) or
+closes a package; the package's own session or the planning session marks
+it done. A done or closed package can no longer be taken; a closed one takes
+no writes. The top's front page lists the packages, each linked to its own.
+Lock order: a writer holding a package's lock may take the top's; one
+holding the top's never takes a package's.
+
+`package list --json` prints one object for RS and the browser; its shape
+is PACKAGES_JSON_DOC, which `rs-memory package list --help` prints.
 
 A project whose record says "companion": true keeps a companion's memory:
 front.md's parts are "Standing preferences" (P-<n>, kept by the consolidation
@@ -212,9 +266,51 @@ SWITCH_DEFAULTS = {"subagents": "on", "checks": "staged"}
 # a file name only once its characters are checked.
 SESSIONS_DIR = "sessions"
 SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# The planner, a third switch in the record's object, a project setting only
+# (no session switches it): "on" splits the work into work packages. Absent
+# reads as "off". MIRROR of rscore.RESEARCH_SWITCHES["planner"].
+PLANNER = "planner"
+RECORD_SWITCHES = {**SWITCHES, PLANNER: ("off", "on")}
+# What a session holds, in its file under the top memory's sessions/: the
+# key, and its two shapes ("top", {"package": NAME}).
+HOLDS_KEY = "holds"
+HOLDS_TOP = "top"
+HOLDS_PACKAGE = "package"
+# Work packages: <workspace>/packages/<name>/, each with its status file and
+# its charter; the planning session's hold on the top, in the top memory.
+PACKAGES_DIR = "packages"
+PACKAGE_STATUS = "package.json"
+CHARTER_FILE = "charter.md"
+PLANNING_FILE = "planning.json"
+PACKAGE_STATES = ("open", "done", "closed")
+PACKAGE_KEYS = ("name", "state", "created", "changed", "holder")
+HOLDER_KEYS = ("session", "pid", "start", "since")
+# A package's name follows a project's (rscore._PROJECT_NAME_RE): it becomes
+# a folder name, and the browser shows it.
+PACKAGE_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+# A charter draft's sections, each needed once and not empty; text above the
+# first is free (a title, a sentence).
+CHARTER_SECTIONS = ("Questions", "Data", "Out of scope")
+# The first line of a charter rs-memory wrote: a charter.md without it is
+# not rs-memory's and is never overwritten.
+CHARTER_MARK = "<!-- rs-memory: a work package's charter, changed only by rs-memory package charter -->"
+# A package's status file and the planning file are a few hundred bytes; a
+# read stops past this, so a file grown by hand (or a link to a device) is
+# refused instead of read whole. A thousand times what rs-memory writes.
+STATUS_MAX_BYTES = 256 * 1024
+# The text files of a package rs-memory reads back (its charter, to name what
+# a change changed; its memory's front.md and its logbook entries' titles, for
+# the project's front page) are a page or a few, some KiB; a read stops past
+# this, and what it was for is left out (or refused, for the charter).
+TEXT_MAX_BYTES = 1024 * 1024
+# Set by rs-memory, for its own runs only (a consolidation, a re-run, a
+# referee, and the agent a consolidation starts), to the package whose memory
+# the run works in; honoured only there.
+PACKAGE_ENV = "RS_MEMORY_PACKAGE"
 # What a fresh process drops from the session's environment, as the
 # consolidation run does: the child is no part of the agent's session.
-SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "PI_SESSION_ID", "PI_SESSION_FILE")
+SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "PI_SESSION_ID", "PI_SESSION_FILE",
+                PACKAGE_ENV)
 VERDICTS = ("supported", "overreaches", "unsupported")
 OBJECTIONS = ("overreaches", "unsupported")
 VERDICT_RE = re.compile(r"\AVERDICT: (supported|overreaches|unsupported)\Z")
@@ -266,7 +362,10 @@ NOTE_KINDS = ("did", "dead-end", "decision", "surprise", "correction")
 # close, or one written while a run works, would otherwise owe a run for it),
 # and a logbook entry's filing (it tells the story of work the journal already
 # holds, so it is nothing new to consolidate, nor anything new to log).
-QUIET_KINDS = ("consolidation", "session-end", "logbook")
+# A work package's own state changes (marked done, closed) are journalled in
+# the package as PACKAGE_KIND: news for its session, no work to consolidate.
+PACKAGE_KIND = "package"
+QUIET_KINDS = ("consolidation", "session-end", "logbook", PACKAGE_KIND)
 NOTHING_NEW = "nothing new since the last consolidation"
 DELTA_KEYS = ("page", "through", "add", "edit", "retire", "claims", "skills")
 DELTA_ITEM_KEYS = {"add": ("part", "text"), "edit": ("id", "text"),
@@ -320,8 +419,42 @@ class Refused(Exception):
 
 
 # --------------------------------------------------------------------- paths
-def mem_dir() -> Path:
+# The memory this call works in when it is not the top: a package's, chosen
+# from what the session holds (choose_memory), or set for a while by a verb
+# that works in another package's memory (working_in).
+_CURRENT: "dict[str, Path | None]" = {"dir": None}
+
+
+def top_mem_dir() -> Path:
+    """The project's top memory, RS_MEMORY_DIR (default /workspace/memory)."""
     return Path(os.environ.get("RS_MEMORY_DIR") or DEFAULT_DIR)
+
+
+def mem_dir() -> Path:
+    """The memory this call works in: the top, or a package's."""
+    return _CURRENT["dir"] or top_mem_dir()
+
+
+class working_in:
+    """Work in another memory folder for a while (a package's, or the top)."""
+
+    def __init__(self, d: Path):
+        self.d = d
+
+    def __enter__(self):
+        self.old = _CURRENT["dir"]
+        _CURRENT["dir"] = None if self.d == top_mem_dir() else self.d
+        return self
+
+    def __exit__(self, *a):
+        _CURRENT["dir"] = self.old
+        return False
+
+
+def current_package() -> "str | None":
+    """The package whose memory this call works in; None at the top."""
+    d = _CURRENT["dir"]
+    return d.parent.name if d is not None else None
 
 
 def runtime_dir() -> Path:
@@ -331,7 +464,11 @@ def runtime_dir() -> Path:
 
 
 def inflight_marker() -> Path:
-    return runtime_dir() / f"rs-memory-consolidating-{os.getuid()}"
+    """The in-flight marker of this memory's consolidation: one per memory,
+    so a run in one package never holds up another's."""
+    pkg = current_package()
+    return runtime_dir() / (f"rs-memory-consolidating-{os.getuid()}"
+                            + (f"-package-{pkg}" if pkg else ""))
 
 
 def now() -> str:
@@ -347,7 +484,15 @@ def under_strict_guard() -> bool:
 
 
 def workspace() -> Path:
-    """The project's workspace: the memory folder lives directly in it."""
+    """The project's workspace: the top memory folder lives directly in it.
+    Its record, the referee's model and a re-run's folder are the
+    workspace's, in a package too."""
+    return top_mem_dir().parent
+
+
+def folder() -> Path:
+    """The researcher's folder of the memory in use, where its pages are:
+    the workspace for the top, packages/<name>/ for a package."""
     return mem_dir().parent
 
 
@@ -418,61 +563,93 @@ def checks_on() -> bool:
     return checks_kit() and session_switches()["checks"][0] != "off"
 
 
-def checked_switches(raw: object, where: str) -> "dict[str, str]":
-    """A switches object as written in the record or a session's file: an
-    object whose keys are switches and whose values are among each switch's
-    values. Anything else is refused, never read as a default."""
+def checked_switches(raw: object, where: str,
+                     known: "dict[str, tuple[str, ...]]" = SWITCHES) -> "dict[str, str]":
+    """A switches object as written in the record (`known`: RECORD_SWITCHES)
+    or a session's file (SWITCHES): an object whose keys are switches and
+    whose values are among each switch's values. Anything else is refused,
+    never read as a default."""
     if not isinstance(raw, dict):
         raise Refused(f"{where} holds the subagents and checks switches as something other "
                       "than an object, so rs-memory cannot tell how this session works; "
                       "tell the PI")
     for k, v in raw.items():
-        if k not in SWITCHES:
+        if k not in known:
             raise Refused(f"{where} holds a switch rs-memory does not know ({single_line(k)!r}; "
-                          f"it knows {', '.join(SWITCHES)}); tell the PI")
-        if v not in SWITCHES[k]:
+                          f"it knows {', '.join(known)}); tell the PI")
+        if v not in known[k]:
             raise Refused(f"{where} sets the {k} switch to {v!r}, which is not one of "
-                          f"{', '.join(SWITCHES[k])}; tell the PI")
+                          f"{', '.join(known[k])}; tell the PI")
     return dict(raw)
 
 
 def record_switches() -> "dict[str, str]":
-    """The switches the project's record sets ({} when it sets none)."""
+    """The switches the project's record sets ({} when it sets none), the
+    planner among them; session_switches reads the session switches only."""
     rec = project_record()
     if SWITCHES_KEY not in rec:
         return {}
-    return checked_switches(rec[SWITCHES_KEY], f"the project's record {record_path()}")
+    return checked_switches(rec[SWITCHES_KEY], f"the project's record {record_path()}",
+                            RECORD_SWITCHES)
 
 
-def session_id() -> "str | None":
-    """The session this command runs in: Claude Code's CLAUDE_CODE_SESSION_ID
-    or pi's PI_SESSION_ID; None outside a session (a terminal, a start hook
-    that is not given the id). Both set: the agent detect_agent names."""
+def planner_on() -> bool:
+    """Whether this project works in packages: a researcher-subagents project
+    whose record sets the planner on."""
+    return checks_kit() and record_switches().get(PLANNER) == "on"
+
+
+def planner_read() -> bool:
+    """planner_on for the pages, which are views: a record whose switches
+    cannot be read writes them as without the planner, as before the
+    planner existed (open and every verb that reads the switches say what is
+    wrong with them)."""
+    try:
+        return planner_on()
+    except Refused:
+        return False
+
+
+def session_source() -> "tuple[str, str] | None":
+    """The session this command runs in and its agent: ("claude", Claude
+    Code's CLAUDE_CODE_SESSION_ID) or ("pi", pi's PI_SESSION_ID); None outside
+    a session (a terminal, a start hook that is not given the id). Both set:
+    the agent detect_agent names."""
     claude = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
     pi = os.environ.get("PI_SESSION_ID") or ""
-    sid = claude or pi
+    src = ("claude", claude) if claude else ("pi", pi)
     if claude and pi:
         agent = detect_agent(quiet=True)
         if agent is None:
             raise Refused("both a Claude session (CLAUDE_CODE_SESSION_ID) and a pi session "
                           "(PI_SESSION_ID) are in this shell's environment, so rs-memory "
                           "cannot tell which session's switches apply")
-        sid = claude if agent == "claude" else pi
-    if not sid:
+        src = ("claude", claude) if agent == "claude" else ("pi", pi)
+    if not src[1]:
         return None
-    if not SESSION_ID_RE.match(sid):
+    if not SESSION_ID_RE.match(src[1]):
         raise Refused("this session's id holds characters rs-memory does not use in a file "
                       "name (only letters, digits, '.', '_' and '-'), so it cannot tell this "
                       "session's switches; tell the PI")
-    return sid
+    return src
+
+
+def session_id() -> "str | None":
+    """The session this command runs in (session_source's id); None outside
+    a session."""
+    src = session_source()
+    return src[1] if src else None
 
 
 def session_file(sid: str) -> Path:
-    return mem_dir() / SESSIONS_DIR / f"{sid}.json"
+    """A session's file: always in the top memory, so its switches survive a
+    package taken, and what it holds is found before its memory is chosen."""
+    return top_mem_dir() / SESSIONS_DIR / f"{sid}.json"
 
 
-def session_record(sid: str) -> "dict[str, str]":
-    """The switches a session recorded for itself ({} when it recorded none)."""
+def session_data(sid: str) -> dict:
+    """A session's file as written: its switches and (planner on) what it
+    holds, both checked ({} when it has none)."""
     p = session_file(sid)
     try:
         text = p.read_text(encoding="utf-8")
@@ -484,7 +661,30 @@ def session_record(sid: str) -> "dict[str, str]":
         raw = json.loads(text)
     except (ValueError, RecursionError):
         raise Refused(f"this session's switches {p} are not JSON; tell the PI")
+    if isinstance(raw, dict) and HOLDS_KEY in raw:
+        raw = dict(raw)
+        holds = raw.pop(HOLDS_KEY)
+        if not (holds == HOLDS_TOP or (isinstance(holds, dict) and list(holds) == [HOLDS_PACKAGE]
+                                       and isinstance(holds[HOLDS_PACKAGE], str)
+                                       and PACKAGE_NAME_RE.match(holds[HOLDS_PACKAGE]))):
+            raise Refused(f"this session's file {p} says it holds something rs-memory does not "
+                          "know; tell the PI")
+        return {**checked_switches(raw, f"this session's switches {p}"), HOLDS_KEY: holds}
     return checked_switches(raw, f"this session's switches {p}")
+
+
+def session_record(sid: str) -> "dict[str, str]":
+    """The switches a session recorded for itself ({} when it recorded none)."""
+    return {k: v for k, v in session_data(sid).items() if k != HOLDS_KEY}
+
+
+def write_session_data(sid: str, data: dict) -> None:
+    """Write a session's file; the caller holds the top memory's lock."""
+    try:
+        write_text(session_file(sid), json.dumps(data, sort_keys=True) + "\n")
+    except OSError as e:
+        raise Refused(f"this session's file could not be written to {session_file(sid)} "
+                      f"({e.strerror or e}); tell the PI")
 
 
 def session_switches() -> "dict[str, tuple[str, str]]":
@@ -578,15 +778,27 @@ def write_text(path: Path, text: str, mode: "int | None" = None) -> None:
 
 
 class Lock:
-    """The memory folder's lock file (flock). `wait=False` raises BlockingIOError
-    when another writer holds it."""
+    """A memory folder's lock file (flock): the memory in use, or the one
+    named (`d`, e.g. the top's from inside a package). `wait=False` raises
+    BlockingIOError when another writer holds it. Taken again in the same
+    process (a package's write refreshing the top's pages while a take holds
+    the top's lock), it is already held: a second flock on another descriptor
+    of the same file would wait for this process itself."""
 
-    def __init__(self, wait: bool = True):
+    _held: "dict[str, int]" = {}
+
+    def __init__(self, wait: bool = True, d: "Path | None" = None):
         self.wait = wait
+        self.d = d
         self.fd = None
 
     def __enter__(self):
-        d = ensure_layout()
+        with working_in(self.d or mem_dir()):
+            d = ensure_layout()
+        self.key = os.path.abspath(str(d))
+        if self.key in Lock._held:
+            Lock._held[self.key] += 1
+            return self
         self.fd = os.open(str(d / ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
         flags = fcntl.LOCK_EX | (0 if self.wait else fcntl.LOCK_NB)
         try:
@@ -594,9 +806,14 @@ class Lock:
         except BaseException:
             os.close(self.fd)
             raise
+        Lock._held[self.key] = 1
         return self
 
     def __exit__(self, *a):
+        Lock._held[self.key] -= 1
+        if Lock._held[self.key]:
+            return False
+        del Lock._held[self.key]
         fcntl.flock(self.fd, fcntl.LOCK_UN)
         os.close(self.fd)
         return False
@@ -636,11 +853,16 @@ def start_tethered(argv: "list[str]", log: Path) -> subprocess.Popen:
     """Start one of this command's own runs tied to its caller: in the
     caller's process group, no input, its output appended to its log, and
     stopped by the kernel when the caller ends. The caller waits for it
-    with wait_tethered."""
+    with wait_tethered. It works in the caller's memory: a package's is
+    named to it in PACKAGE_ENV."""
+    env = dict(os.environ)
+    env.pop(PACKAGE_ENV, None)
+    if current_package():
+        env[PACKAGE_ENV] = current_package()
     fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
     try:
         return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
-                                close_fds=True, preexec_fn=tethered())
+                                close_fds=True, preexec_fn=tethered(), env=env)
     finally:
         os.close(fd)
 
@@ -1028,6 +1250,818 @@ def skill_homes() -> "list[Path]":
     if pi_dir:
         homes.append(Path(pi_dir) / "skills")
     return homes
+
+
+# ------------------------------------------------------------ work packages
+# The shape of `package list --json`, kept stable: RS and the browser read it.
+PACKAGES_JSON_DOC = """\
+`rs-memory package list --json` prints, for RS and the browser, one object (paths are
+relative to the workspace; "alive": whether the holder's process runs):
+  {"version": 1, "planner": "on"|"off",
+   "planning": null | {"session": ID, "alive": BOOL, "since": TIME},
+   "packages": [{"name": NAME, "state": "open"|"done"|"closed",
+                 "holder": null | {"session": ID, "alive": BOOL, "since": TIME},
+                 "charter": "packages/NAME/charter.md",
+                 "page": "packages/NAME/README.md",
+                 "staged": N, "accepted": N}],
+   "problems": [{"name": ENTRY, "problem": TEXT}]}
+"problems" names what under packages/ is not a package rs-memory can read.
+"""
+# With the planner on (the record's research_switches object), the work is
+# split into packages under <workspace>/packages/ (the module docstring says
+# how). What each call does in them follows from what its session holds,
+# chosen once per call before the verb runs (choose_memory).
+SESSION: dict = {"planner": False, "binding": None, "lost": None, "sid": None}
+# The verbs rs-memory runs as its own children: they work in the memory
+# their caller names (PACKAGE_ENV), never by what a session holds.
+INTERNAL_VERBS = ("_run", "_rerun", "_referee")
+
+
+class Unreadable(Exception):
+    """A file that is there and is not one rs-memory can read: why."""
+
+
+def valid_package_name(raw: str) -> str:
+    if not isinstance(raw, str) or not PACKAGE_NAME_RE.match(raw):
+        raise Refused(f"{raw!r} is not a package name: letters, digits, '-' and '_', a letter "
+                      "or digit first (like a project's name), e.g. station-gaps")
+    return raw
+
+
+def packages_root() -> Path:
+    return workspace() / PACKAGES_DIR
+
+
+def package_dir(name: str) -> Path:
+    return packages_root() / name
+
+
+def real_folder(p: Path) -> "bool | None":
+    """None when nothing is at p; True for a folder; False for anything else
+    (a link, a file): links are never followed."""
+    try:
+        return stat.S_ISDIR(os.lstat(p).st_mode)
+    except FileNotFoundError:
+        return None
+
+
+def read_small(path: Path, cap: int) -> bytes:
+    """A plain file's bytes, opened without following a link or waiting on a
+    pipe; FileNotFoundError when nothing is there, Unreadable when it is not
+    a plain file or holds more than `cap` bytes."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        raise Unreadable(f"it cannot be opened as a plain file ({e.strerror or e})")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Unreadable("it is not a plain file")
+        chunks, size = [], 0
+        while size <= cap:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+        if size > cap:
+            raise Unreadable(f"it holds more than {cap} bytes")
+        return b"".join(chunks)
+    except OSError as e:
+        raise Unreadable(f"it cannot be read ({e.strerror or e})")
+    finally:
+        os.close(fd)
+
+
+def package_memory(name: str) -> Path:
+    """A package's memory folder, packages/<name>/memory under the workspace,
+    each level a real folder: anything else is refused, naming it."""
+    name = valid_package_name(name)
+    for p in (packages_root(), package_dir(name), package_dir(name) / "memory"):
+        st = real_folder(p)
+        if st is None:
+            raise Refused(f"there is no package {name}: {p} does not exist "
+                          "(rs-memory package list lists the packages)")
+        if st is False:
+            raise Refused(f"{p} is not a folder (a link or a file is there), so it is no work "
+                          f"package's memory: rs-memory works only in the top memory "
+                          f"{top_mem_dir()} and in {packages_root()}/<name>/memory; tell the PI")
+    return package_dir(name) / "memory"
+
+
+def refuse_package_as_top(top: Path) -> None:
+    """RS_MEMORY_DIR naming a package's memory would make it the top: the
+    record and the other packages would be looked for in the wrong place."""
+    ws = top.parent.parent.parent
+    if (top.name == "memory" and top.parent.parent.name == PACKAGES_DIR
+            and os.path.lexists(ws / ".orchestrator" / "project.json")):
+        raise Refused(f"RS_MEMORY_DIR names {top}, a work package's memory, not the project's "
+                      f"top memory ({ws / 'memory'}): a session works in a package's memory by "
+                      f"taking the package (rs-memory take {top.parent.name}), with RS_MEMORY_DIR "
+                      "left at the top memory")
+
+
+def check_holder(h: object, where: str) -> "dict | None":
+    if h is None:
+        return None
+    if (not isinstance(h, dict) or sorted(h) != sorted(HOLDER_KEYS)
+            or not isinstance(h["session"], str) or not SESSION_ID_RE.match(h["session"])
+            or type(h["pid"]) is not int or h["pid"] <= 0
+            or type(h["start"]) is not int or h["start"] < 0
+            or not isinstance(h["since"], str)):
+        raise Refused(f"{where} names its holder in a shape rs-memory does not write; tell the PI")
+    return h
+
+
+def read_json_small(path: Path, what: str) -> object:
+    """A status file's JSON; FileNotFoundError when absent."""
+    try:
+        raw = read_small(path, STATUS_MAX_BYTES)
+    except Unreadable as e:
+        raise Refused(f"{what}, {path}, cannot be read: {e}; tell the PI")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        raise Refused(f"{what}, {path}, is not JSON; tell the PI")
+
+
+def read_status(name: str) -> dict:
+    """A package's status (package.json), checked."""
+    d = package_dir(name)
+    if real_folder(d) is not True:
+        raise Refused(f"there is no package {name} ({d} is not a folder); rs-memory package "
+                      "list lists the packages")
+    p = d / PACKAGE_STATUS
+    try:
+        data = read_json_small(p, f"the status of package {name}")
+    except FileNotFoundError:
+        raise Refused(f"{d} has no {PACKAGE_STATUS}, so it is no work package rs-memory made; "
+                      "tell the PI")
+    if (not isinstance(data, dict) or sorted(data) != sorted(PACKAGE_KEYS)
+            or data["name"] != name or data["state"] not in PACKAGE_STATES
+            or not isinstance(data["created"], str) or not isinstance(data["changed"], str)):
+        raise Refused(f"the status of package {name}, {p}, is not one rs-memory writes; tell "
+                      "the PI")
+    check_holder(data["holder"], f"the status of package {name}, {p},")
+    return data
+
+
+def write_status(name: str, data: dict) -> None:
+    """The caller holds the package's lock."""
+    write_text(package_dir(name) / PACKAGE_STATUS, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def planning_path() -> Path:
+    return top_mem_dir() / PLANNING_FILE
+
+
+def read_planning() -> "dict | None":
+    """The holder of the project's top (the planning session), or None."""
+    p = planning_path()
+    try:
+        data = read_json_small(p, "the planning session's file")
+    except FileNotFoundError:
+        return None
+    if not isinstance(data, dict) or list(data) != ["holder"]:
+        raise Refused(f"the planning session's file {p} is not one rs-memory writes; tell the PI")
+    return check_holder(data["holder"], f"the planning session's file {p}")
+
+
+def write_planning(holder: "dict | None") -> None:
+    """The caller holds the top memory's lock."""
+    write_text(planning_path(), json.dumps({"holder": holder}, indent=2, sort_keys=True) + "\n")
+
+
+def proc_stat(pid: int) -> "list[str] | None":
+    """/proc/<pid>/stat's fields after the command name (the third field on):
+    the state first, then the parent's pid; None when there is no such
+    process."""
+    if pid <= 0:
+        return None
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return text.rpartition(")")[2].split()
+
+
+def proc_start(pid: int) -> "int | None":
+    """A running process's start time (clock ticks after boot, stat's 22nd
+    field); None when there is no such process or it has ended (a zombie)."""
+    f = proc_stat(pid)
+    try:
+        return None if f is None or f[0] in ("Z", "X") else int(f[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def holder_alive(h: "dict | None") -> bool:
+    """Whether a holder's agent still runs: its pid is there with the start
+    time recorded at the take (a pid reused after a restart is not it)."""
+    return h is not None and proc_start(h["pid"]) == h["start"]
+
+
+def agent_process(src: "tuple[str, str]") -> "tuple[int, int]":
+    """This session's agent process and its start time: CLAUDE_PID under
+    Claude Code; under pi the first process above this command whose
+    environment does not carry this PI_SESSION_ID (pi's bash tool sets it for
+    the commands it runs; pi's own process does not have it)."""
+    agent, sid = src
+    if agent == "claude":
+        try:
+            pid = int(os.environ.get("CLAUDE_PID") or "")
+        except ValueError:
+            raise Refused("CLAUDE_PID is not set in this shell (Claude Code sets it in every "
+                          "command its session runs), so rs-memory cannot tell which process is "
+                          "this session's agent; run it from the agent's session")
+        start = proc_start(pid)
+        if start is None:
+            raise Refused(f"CLAUDE_PID names process {pid}, which is not running, so it cannot "
+                          "hold anything; run it from the agent's session")
+        return pid, start
+    want = f"PI_SESSION_ID={sid}".encode()
+    pid = os.getppid()
+    while pid > 1:
+        try:
+            env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError as e:
+            raise Refused(f"rs-memory cannot read the environment of process {pid}, above it, so "
+                          f"it cannot tell which process is this pi session ({e.strerror or e}); "
+                          "tell the PI")
+        if want not in env:
+            start = proc_start(pid)
+            if start is None:
+                break
+            return pid, start
+        f = proc_stat(pid)
+        try:
+            pid = int(f[1]) if f else 0
+        except (IndexError, ValueError):
+            pid = 0
+    raise Refused("rs-memory found no process above it that is this pi session's own (each "
+                  "carries its PI_SESSION_ID), so it cannot tell which process holds what this "
+                  "session takes; run it from pi's bash tool")
+
+
+def holder_record(src: "tuple[str, str]") -> dict:
+    pid, start = agent_process(src)
+    return {"session": src[1], "pid": pid, "start": start, "since": now()}
+
+
+def binding(sid: str) -> "tuple[tuple[str, str | None] | None, str | None]":
+    """What this session holds now, checked against the holder's record:
+    ("top", None), ("package", NAME) or None; and, when its file names
+    something it no longer holds, a sentence on that."""
+    holds = session_data(sid).get(HOLDS_KEY)
+    if holds is None:
+        return None, None
+    if holds == HOLDS_TOP:
+        h = read_planning()
+        if h is not None and h["session"] == sid:
+            return ("top", None), None
+        return None, ("this session planned, but "
+                      + (f"session {h['session']} took the project's top after this session's "
+                         "agent ended" if h else "it gave the project's top back")
+                      + "; take it again with rs-memory plan")
+    name = holds[HOLDS_PACKAGE]
+    try:
+        h = read_status(name)["holder"]
+    except Refused as e:
+        return None, f"this session held package {name}, whose status cannot be read now: {e}"
+    if h is not None and h["session"] == sid:
+        return ("package", name), None
+    return None, (f"this session held package {name}, but "
+                  + (f"session {h['session']} took it after this session's agent ended"
+                     if h else "it was given back")
+                  + "; take a package again (rs-memory take <package>)")
+
+
+def claims_count(name: str, where: str) -> int:
+    """How many claims a package's staged/ or record/ holds (0 when it cannot
+    be read: the listing never fails on it); links are never followed."""
+    d = package_dir(name) / "memory" / where
+    if real_folder(package_dir(name) / "memory") is not True or real_folder(d) is not True:
+        return 0
+    try:
+        return sum(1 for n in os.listdir(d) if n.endswith(".md") and CLAIM_ID_RE.match(n[:-3]))
+    except OSError:
+        return 0
+
+
+def package_entries() -> "tuple[list[dict], list[tuple[str, str]]]":
+    """Every package under packages/, by name, with its status and claim
+    counts; and what is there that is no package rs-memory can read (name,
+    why). Read only, never following a link."""
+    root = packages_root()
+    st = real_folder(root)
+    if st is None:
+        return [], []
+    if st is False:
+        return [], [(PACKAGES_DIR, f"{root} is not a folder (a link or a file is there)")]
+    try:
+        names = sorted(os.listdir(root))
+    except OSError as e:
+        return [], [(PACKAGES_DIR, f"{root} cannot be read ({e.strerror or e})")]
+    entries, problems = [], []
+    for n in names:
+        if not PACKAGE_NAME_RE.match(n):
+            problems.append((n, f"{root / n} is no package rs-memory made (not a package name)"))
+            continue
+        try:
+            status = read_status(n)
+            package_memory(n)           # its memory a real folder, never a link elsewhere
+        except Refused as e:
+            problems.append((n, str(e)))
+            continue
+        entries.append({"name": n, "status": status, "staged": claims_count(n, "staged"),
+                        "accepted": claims_count(n, "record")})
+    return entries, problems
+
+
+def state_words(status: dict, sid: "str | None" = None) -> str:
+    """A package's state in plain words."""
+    if status["state"] != "open":
+        return status["state"]
+    h = status["holder"]
+    if h is None:
+        return "open, not taken"
+    if not holder_alive(h):
+        return "open, free (the session that held it has ended)"
+    if sid and h["session"] == sid:
+        return "open, held by this session"
+    return f"open, being worked on in a live session ({h['session']}, since {fmt_time(h['since'])})"
+
+
+def planning_words(sid: "str | None" = None) -> str:
+    try:
+        h = read_planning()
+    except Refused as e:
+        return f"Planning (the project's top): cannot be read: {e}"
+    if h is None or not holder_alive(h):
+        return "Planning (the project's top): free"
+    who = "this session" if sid and h["session"] == sid else f"a live session ({h['session']})"
+    return f"Planning (the project's top): held by {who} since {fmt_time(h['since'])}"
+
+
+def packages_text(sid: "str | None" = None) -> str:
+    """The packages, one line each, and the planning session."""
+    entries, problems = package_entries()
+    lines = ["## Packages"]
+    if not entries:
+        lines.append("none yet: the planning session adds them (rs-memory package add)")
+    for e in entries:
+        n = e["name"]
+        lines.append(f"- {n}: {state_words(e['status'], sid)}; charter "
+                     f"{package_dir(n) / CHARTER_FILE}; {e['staged']} staged, "
+                     f"{e['accepted']} accepted")
+    for n, why in problems:
+        lines.append(f"- {n}: not a package rs-memory can read: {why}")
+    lines += ["", planning_words(sid)]
+    return "\n".join(lines)
+
+
+def holder_json(h: "dict | None") -> "dict | None":
+    if h is None:
+        return None
+    return {"session": h["session"], "alive": holder_alive(h), "since": h["since"]}
+
+
+def packages_json() -> dict:
+    """package list --json: the shape the module docstring documents."""
+    entries, problems = package_entries()
+    try:
+        planning = holder_json(read_planning())
+    except Refused as e:
+        planning = None
+        problems.append((PLANNING_FILE, str(e)))
+    return {"version": 1, "planner": record_switches().get(PLANNER, "off"),
+            "planning": planning,
+            "packages": [{"name": e["name"], "state": e["status"]["state"],
+                          "holder": holder_json(e["status"]["holder"]),
+                          "charter": f"{PACKAGES_DIR}/{e['name']}/{CHARTER_FILE}",
+                          "page": f"{PACKAGES_DIR}/{e['name']}/README.md",
+                          "staged": e["staged"], "accepted": e["accepted"]} for e in entries],
+            "problems": [{"name": n, "problem": why} for n, why in problems]}
+
+
+def choose_memory(a) -> None:
+    """Before every verb: the memory this call works in. rs-memory's own runs
+    work in the memory their caller named; a consolidation's or referee's run
+    too. Otherwise, with the planner on, the memory of what the session
+    holds (a package's, or the top); with it off, the top."""
+    if a.fn is cmd_analyst_check:
+        return              # reads only, and any failure there is silence
+    refuse_package_as_top(top_mem_dir())
+    pkg = os.environ.get(PACKAGE_ENV)
+    if under_guard() or a.verb in INTERNAL_VERBS:
+        if pkg:
+            _CURRENT["dir"] = package_memory(pkg)
+        return
+    if pkg is not None:
+        raise Refused(f"{PACKAGE_ENV} is set in this shell: rs-memory sets it only for its own "
+                      "runs, and a session reaches a package's memory by taking the package "
+                      f"(rs-memory take <package>). Run it without {PACKAGE_ENV}")
+    try:
+        on = planner_on()
+    except Refused:
+        return              # the verb meets the same refusal where it reads the record
+    if not on:
+        return
+    SESSION["planner"] = True
+    src = session_source()
+    if src is None:
+        return
+    SESSION["sid"] = src[1]
+    SESSION["binding"], SESSION["lost"] = binding(src[1])
+    if SESSION["binding"] and SESSION["binding"][0] == "package":
+        _CURRENT["dir"] = package_memory(SESSION["binding"][1])
+
+
+def take_first() -> str:
+    lost = f" ({SESSION['lost']})" if SESSION["lost"] else ""
+    return ("this project works in work packages, and this session holds none yet, so it "
+            "writes nothing: take the project's top to plan (rs-memory plan) or a package to "
+            "work in (rs-memory take <package>) first; rs-memory open lists the packages" + lost)
+
+
+def refuse_unheld_write(a) -> None:
+    """With the planner on, a session that holds nothing writes nothing, and
+    the session that holds a closed package writes nothing into it."""
+    if not SESSION["planner"] or under_guard() or a.verb in INTERNAL_VERBS:
+        return
+    writes = (a.fn in WRITE_VERBS
+              or (a.fn is cmd_switch and (a.subagents is not None or a.checks is not None))
+              or (a.fn is cmd_consolidate and a.apply))
+    if not writes:
+        return
+    b = SESSION["binding"]
+    if b is None:
+        raise Refused(take_first())
+    if b[0] == "package" and read_status(b[1])["state"] == "closed":
+        raise Refused(f"package {b[1]} is closed: it takes no more writes. Give it back with "
+                      "rs-memory release, and ask the user what to take next")
+
+
+def require_planner(verb: str) -> None:
+    if not planner_on():
+        raise Refused(f"{verb} is for a project that works in work packages, and this project's "
+                      "planner is off: every session works at the project's top. The PI turns "
+                      "the planner on in the project's settings")
+
+
+def need_session(what: str) -> "tuple[str, str]":
+    src = session_source()
+    if src is None:
+        raise Refused(f"rs-memory cannot tell which session {what}: neither "
+                      "CLAUDE_CODE_SESSION_ID (Claude Code) nor PI_SESSION_ID (pi) is set in "
+                      "this shell. Run it from the agent's session")
+    return src
+
+
+def require_planning(what: str) -> None:
+    b = SESSION["binding"]
+    if b == ("top", None):
+        return
+    now_ = (f"works in package {b[1]}" if b else "does not plan") + (
+        f" ({SESSION['lost']})" if SESSION["lost"] else "")
+    raise Refused(f"only the planning session {what}, and this session {now_}. The planning "
+                  "session is the one that took the project's top with rs-memory plan")
+
+
+def charter_sections(text: str, where: str) -> "dict[str, str]":
+    """A charter's parts: "" for the text above its first section, then each
+    of CHARTER_SECTIONS, checked (each once, not empty, no other section)."""
+    shape = ("A charter has the sections " + ", ".join(f"`## {h}`" for h in CHARTER_SECTIONS)
+             + ", each once and none of them empty (anything above the first is free)")
+    parts: "dict[str, list[str]]" = {"": []}
+    cur, seen = "", []
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            cur = line[3:].strip()
+            if cur not in CHARTER_SECTIONS:
+                raise Refused(f"{where} has a section a charter does not: `## {cur}`. {shape}")
+            if cur in parts:
+                raise Refused(f"{where} has `## {cur}` more than once. {shape}")
+            parts[cur], seen = [], seen + [cur]
+            continue
+        parts[cur].append(line)
+    missing = [h for h in CHARTER_SECTIONS if h not in parts]
+    if missing:
+        raise Refused(f"{where} lacks " + ", ".join(f"`## {h}`" for h in missing) + f". {shape}")
+    empty = [h for h in CHARTER_SECTIONS if not "\n".join(parts[h]).strip()]
+    if empty:
+        raise Refused(f"{where} leaves " + ", ".join(f"`## {h}`" for h in empty)
+                      + f" empty. {shape}")
+    return {k: "\n".join(v).strip() for k, v in parts.items()}
+
+
+def charter_text(draft: str) -> str:
+    return f"{CHARTER_MARK}\n\n{draft.strip()}\n"
+
+
+def read_charter(name: str) -> str:
+    """A package's charter as rs-memory wrote it, its mark line removed."""
+    p = package_dir(name) / CHARTER_FILE
+    try:
+        text = read_small(p, TEXT_MAX_BYTES).decode("utf-8")
+    except FileNotFoundError:
+        raise Refused(f"package {name} has no charter ({p} is not there); tell the PI")
+    except (Unreadable, UnicodeDecodeError) as e:
+        raise Refused(f"the charter of package {name}, {p}, cannot be read ({e}); tell the PI")
+    first, _sep, rest = text.partition("\n")
+    if first != CHARTER_MARK:
+        raise Refused(f"{p} was not written by rs-memory (its first line is not rs-memory's "
+                      "mark), so rs-memory does not change it; tell the PI")
+    return rest
+
+
+# ---------------------------------------------------- work packages: verbs
+def take_lines(what: str, line: "str | None") -> str:
+    return (f"{what}\n\n" + (open_text(line)))
+
+
+def cmd_plan(a) -> None:
+    """Take the project's top: this session plans (one at a time)."""
+    refuse_under_guard("take the project's top")
+    require_planner("rs-memory plan")
+    src = need_session("plans")
+    sid = src[1]
+    holder = holder_record(src)
+    agent = a.agent or detect_agent(quiet=True)
+    with Lock(d=top_mem_dir()):
+        h = read_planning()
+        if h is not None and h["session"] != sid and holder_alive(h):
+            raise Refused(f"another session plans: session {h['session']} holds the project's top "
+                          f"since {fmt_time(h['since'])}, and one session plans at a time. Ask "
+                          "the user to end that one first, or take a package (rs-memory take "
+                          "<package>)")
+        b, _lost = binding(sid)
+        if b is not None and b[0] == "package":
+            raise Refused(f"this session works in package {b[1]}: give it back first with "
+                          "rs-memory release, then plan")
+        write_planning(holder)
+        data = session_data(sid)
+        data[HOLDS_KEY] = HOLDS_TOP
+        write_session_data(sid, data)
+        SESSION["binding"], SESSION["lost"] = ("top", None), None
+        refresh_pages()
+    line = catch_up(agent)
+    print(take_lines(f"This session now plans: it holds the project's top ({top_mem_dir()}). "
+                     "Define the task with the user and write the packages and their charters "
+                     "with rs-memory package add (rs-memory --help lists the package verbs). "
+                     "rs-memory release gives the top back.", line), end="")
+
+
+def cmd_take(a) -> None:
+    """Take a package: this session works in it, and only in it."""
+    refuse_under_guard("take a package")
+    require_planner("rs-memory take")
+    src = need_session("takes the package")
+    sid = src[1]
+    name = valid_package_name(a.package)
+    mem = package_memory(name)
+    holder = holder_record(src)
+    agent = a.agent or detect_agent(quiet=True)
+    with working_in(mem):
+        with Lock():
+            st = read_status(name)
+            if st["state"] != "open":
+                raise Refused(f"package {name} is {st['state']}: it is kept as history and is not "
+                              "taken again. rs-memory open lists the open ones")
+            h = st["holder"]
+            if h is not None and h["session"] != sid and holder_alive(h):
+                raise Refused(f"package {name} is being worked on in another live session "
+                              f"({h['session']}, since {fmt_time(h['since'])}); one session "
+                              "works in a package at a time. Take another package, or ask the "
+                              "user to end that session first")
+            with Lock(d=top_mem_dir()):
+                b, _lost = binding(sid)
+                if b is not None and b != ("package", name):
+                    raise Refused("this session " + ("plans" if b[0] == "top" else
+                                                     f"works in package {b[1]}")
+                                  + ": give that back first with rs-memory release, then take "
+                                  f"{name}")
+                st["holder"], st["changed"] = holder, now()
+                write_status(name, st)
+                data = session_data(sid)
+                data[HOLDS_KEY] = {HOLDS_PACKAGE: name}
+                write_session_data(sid, data)
+                SESSION["binding"], SESSION["lost"] = ("package", name), None
+            refresh_pages()
+        line = catch_up(agent)
+        text = take_lines(f"This session now works in package {name}. Work only inside its "
+                          f"charter, {package_dir(name) / CHARTER_FILE}; bring an idea outside it "
+                          "to the user as a suggestion. rs-memory release gives the package back.",
+                          line)
+    print(text, end="")
+
+
+def release_hold(sid: str, holds: object) -> str:
+    """Give back what a session's file says it holds: the holder record when
+    it still names this session, and the session's own note of it. Returns
+    a line on it."""
+    if holds == HOLDS_TOP:
+        with Lock(d=top_mem_dir()):
+            h = read_planning()
+            if h is not None and h["session"] == sid:
+                write_planning(None)
+            data = session_data(sid)
+            data.pop(HOLDS_KEY, None)
+            write_session_data(sid, data)
+        return "This session gave the project's top back: it no longer plans."
+    name = holds[HOLDS_PACKAGE]
+    try:
+        mem = package_memory(name)
+    except Refused:
+        mem = None
+    if mem is not None:
+        with working_in(mem):
+            with Lock():
+                try:
+                    st = read_status(name)
+                except Refused:
+                    st = None
+                if st is not None and st["holder"] and st["holder"]["session"] == sid:
+                    st["holder"], st["changed"] = None, now()
+                    write_status(name, st)
+                with Lock(d=top_mem_dir()):
+                    data = session_data(sid)
+                    data.pop(HOLDS_KEY, None)
+                    write_session_data(sid, data)
+                refresh_pages()
+    else:
+        with Lock(d=top_mem_dir()):
+            data = session_data(sid)
+            data.pop(HOLDS_KEY, None)
+            write_session_data(sid, data)
+    return f"This session gave package {name} back."
+
+
+def cmd_release(a) -> None:
+    refuse_under_guard("give back what a session holds")
+    sid = need_session("gives back what it holds")[1]
+    holds = session_data(sid).get(HOLDS_KEY)
+    if holds is None:
+        print("This session holds nothing.")
+        return
+    print(release_hold(sid, holds))
+
+
+def charter_draft(path: str) -> "tuple[str, dict[str, str]]":
+    text = read_draft(path)
+    return text, charter_sections(text, f"the charter draft {path}")
+
+
+def cmd_package_add(a) -> None:
+    refuse_under_guard("add packages")
+    require_planner("rs-memory package add")
+    require_planning("adds a package")
+    name = valid_package_name(a.name)
+    draft, _sections = charter_draft(a.charter)
+    root = packages_root()
+    st = real_folder(root)
+    if st is False:
+        raise Refused(f"{root} is there and is not a folder (a file or a link), so no package can "
+                      "be added in it; rs-memory moves nothing. Tell the PI")
+    if st is None:
+        os.mkdir(root)
+    d = package_dir(name)
+    try:
+        os.mkdir(d)
+    except FileExistsError:
+        raise Refused(f"package {name} exists already ({d} is there); rs-memory package list "
+                      "lists the packages, and rs-memory package charter changes a charter")
+    os.mkdir(d / "memory")
+    os.mkdir(d / TASKS_DIR)
+    write_text(d / CHARTER_FILE, charter_text(draft))
+    stamp = now()
+    with working_in(d / "memory"):
+        with Lock():
+            write_status(name, {"name": name, "state": "open", "created": stamp,
+                                "changed": stamp, "holder": None})
+            refresh_pages()
+    print(f"Package {name} added, open: {d} (its charter {d / CHARTER_FILE}, its front page "
+          f"{d / FRONT_PAGE}). A session works in it after rs-memory take {name}.")
+
+
+def cmd_package_charter(a) -> None:
+    refuse_under_guard("change charters")
+    require_planner("rs-memory package charter")
+    require_planning("changes a charter")
+    name = valid_package_name(a.name)
+    draft, new = charter_draft(a.charter)
+    with working_in(package_memory(name)):
+        with Lock():
+            st = read_status(name)
+            if st["state"] == "closed":
+                raise Refused(f"package {name} is closed: its charter is kept as it was")
+            old = charter_sections(read_charter(name), f"the charter of package {name}")
+            changed = [("its title and introduction" if k == "" else k)
+                       for k in ("",) + CHARTER_SECTIONS if old.get(k) != new.get(k)]
+            if not changed:
+                raise Refused(f"the charter draft {a.charter} says what package {name}'s charter "
+                              "says already; nothing changed")
+            write_text(package_dir(name) / CHARTER_FILE, charter_text(draft))
+            st["changed"] = now()
+            write_status(name, st)
+            j = add_journal(f"charter changed: {', '.join(changed)}", "charter",
+                            f"The planning session changed this package's charter "
+                            f"({', '.join(changed)}). Read it again: "
+                            f"{package_dir(name) / CHARTER_FILE}")
+            refresh_pages()
+    print(f"The charter of package {name} changed ({', '.join(changed)}); {j} journalled in the "
+          "package, so its session sees it at its next rs-memory open.")
+
+
+def cmd_package_done(a) -> None:
+    refuse_under_guard("mark packages done")
+    require_planner("rs-memory package done")
+    name = valid_package_name(a.name)
+    b = SESSION["binding"]
+    if b not in (("top", None), ("package", name)):
+        raise Refused(f"package {name} is marked done by the session that works in it or by the "
+                      "planning session, and this session is neither")
+    with working_in(package_memory(name)):
+        with Lock():
+            st = read_status(name)
+            if st["state"] != "open":
+                raise Refused(f"package {name} is {st['state']} already")
+            st["state"], st["changed"] = "done", now()
+            write_status(name, st)
+            j = add_journal("package marked done", PACKAGE_KIND)
+            refresh_pages()
+    print(f"Package {name} is done ({j}); it is kept as history and is not taken again.")
+
+
+def cmd_package_close(a) -> None:
+    refuse_under_guard("close packages")
+    require_planner("rs-memory package close")
+    require_planning("closes a package")
+    name = valid_package_name(a.name)
+    with working_in(package_memory(name)):
+        with Lock():
+            st = read_status(name)
+            if st["state"] == "closed":
+                raise Refused(f"package {name} is closed already")
+            h = st["holder"]
+            if holder_alive(h):
+                raise Refused(f"package {name} is being worked on in a live session "
+                              f"({h['session']}); it can be closed once that session gives it "
+                              "back or ends")
+            st["state"], st["changed"] = "closed", now()
+            write_status(name, st)
+            j = add_journal("package closed by the planning session", PACKAGE_KIND)
+            refresh_pages()
+    print(f"Package {name} is closed ({j}); its folder stays as history.")
+
+
+def cmd_package_list(a) -> None:
+    if a.json:
+        print(json.dumps(packages_json(), indent=2, sort_keys=True))
+        return
+    on = planner_on()
+    print(("This project works in work packages (its planner is on).\n\n" if on else
+           "This project's planner is off: every session works at the project's top; any "
+           "package below is kept as history.\n\n") + packages_text(SESSION["sid"]))
+
+
+def open_listing_text() -> str:
+    """open, with the planner on, for a session that holds nothing: the
+    packages, and what to do."""
+    parts = ["# rs-memory: work packages\n"
+             "This project works in work packages (its planner is on), and this session holds "
+             "none yet: its memory is not chosen, so nothing was read or consolidated. Open by "
+             "asking the user which package to take, or whether this session plans. Then:\n"
+             "- to plan (define the task with the user, add packages and their charters): "
+             "rs-memory plan\n"
+             "- to work in one package, and only in it: rs-memory take <package>\n"
+             "Under Claude Code give either call a Bash timeout of 600000 ms: it first "
+             "consolidates that memory's last session when the session ended without closing."]
+    if SESSION["lost"]:
+        parts.append(SESSION["lost"][0].upper() + SESSION["lost"][1:] + ".")
+    parts.append(packages_text(SESSION["sid"]))
+    switches = switches_open_line()
+    if switches:
+        parts.append(switches)
+    return "\n\n".join(parts) + "\n"
+
+
+def open_head() -> "str | None":
+    """open's first lines, with the planner on, for a session that holds
+    something: what it holds."""
+    if not SESSION["planner"] or SESSION["binding"] is None:
+        return None
+    if SESSION["binding"][0] == "top":
+        return ("## This session plans\nIt holds the project's top: define the task with the "
+                "user and write the packages and their charters with rs-memory package add, "
+                "package charter, package done and package close.\n\n"
+                + packages_text(SESSION["sid"]))
+    name = SESSION["binding"][1]
+    return (f"## This session's work package: {name}\nIts folder is {package_dir(name)}, its "
+            f"charter {package_dir(name) / CHARTER_FILE}: work only inside the charter, and bring "
+            "an idea outside it to the user as a suggestion. Its analyses go under "
+            f"{package_dir(name) / TASKS_DIR}/.")
 
 
 # ===================================================================== verbs
@@ -1436,8 +2470,8 @@ def cmd_switch(a) -> None:
                       "CLAUDE_CODE_SESSION_ID (Claude Code) nor PI_SESSION_ID (pi) is set in "
                       "this shell. Run it from the agent's session, as /rs-mode does")
     record_switches()                   # a record it cannot read refuses before any write
-    with Lock():
-        mine = session_record(sid)
+    with Lock(d=top_mem_dir()):
+        mine = session_data(sid)        # what the session holds is kept
         for k in SWITCHES:
             v = getattr(a, k)
             if v is not None:
@@ -2374,7 +3408,7 @@ def fmt_time(stamp: str) -> str:
 
 
 def pages_root() -> Path:
-    return workspace()
+    return folder()
 
 
 def staging_page(ident: str) -> Path:
@@ -2689,6 +3723,10 @@ class PageContext:
         # show a finding's checks wherever the project has them.
         self.checks = checks_kit()
         self.companion = companion_on()
+        # The project's top front page lists the work packages when the
+        # planner is on; a package's own page names its package.
+        self.package = current_package()
+        self.planner = self.package is None and planner_read()
         # Who points at whom, for "superseded by" and the like.
         self.by: "dict[tuple[str, str], list[str]]" = {}
         for o, oe in self.rec.items():
@@ -3171,6 +4209,87 @@ def task_lines(page: Path, w: PageWriter) -> "list[str]":
     return lines
 
 
+def package_inflight(name: str) -> "list[str]":
+    """The "In flight" items of a package's own front page (memory/front.md),
+    read without following a link; [] when there are none or it cannot be
+    read."""
+    mem = package_dir(name) / "memory"
+    if real_folder(mem) is not True:
+        return []
+    try:
+        text = read_small(mem / "front.md", TEXT_MAX_BYTES).decode("utf-8", errors="replace")
+    except (OSError, Unreadable):
+        return []
+    out, cur = [], False
+    heading = part_by_key(RESEARCHER_PARTS)["inflight"][0]
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            cur = line[3:].strip() == heading
+            continue
+        m = re.match(r"\A- \[I-[1-9][0-9]*\] (.*)\Z", line)
+        if cur and m:
+            out.append(m.group(1))
+    return out
+
+
+def package_latest_logbook(name: str) -> "tuple[Path, str] | None":
+    """A package's latest logbook entry (the last filed, by its file's time)
+    and its title; None when it has none. Links are never followed."""
+    d = package_dir(name) / LOGBOOK_DIR
+    if real_folder(d) is not True:
+        return None
+    best = None
+    try:
+        for n in os.listdir(d):
+            if n.startswith(".") or not n.endswith(".md"):
+                continue
+            st = os.lstat(d / n)
+            if stat.S_ISREG(st.st_mode) and (best is None or (st.st_mtime, n) > best):
+                best = (st.st_mtime, n)
+    except OSError:
+        return None
+    if best is None:
+        return None
+    try:
+        head = read_small(d / best[1], TEXT_MAX_BYTES).decode("utf-8", errors="replace")
+    except (OSError, Unreadable):
+        head = ""
+    first = head.split("\n", 1)[0]
+    return d / best[1], (first[2:].strip() if first.startswith("# ") else best[1])
+
+
+def packages_block(page: Path) -> "list[str]":
+    """The project's front page's "Packages", with the planner on: one line
+    per package with its state, what waits there, what is in flight, its
+    latest logbook entry, linked to its own front page. Read only."""
+    lines = ["", "## Packages", "",
+             "The work is split into work packages, each worked on in a session of its own, "
+             "with its own front page.", ""]
+    entries, problems = package_entries()
+    if not entries and not problems:
+        lines.append("No package yet: the planning session adds them.")
+    for e in entries:
+        n = e["name"]
+        readme = package_dir(n) / FRONT_PAGE
+        try:
+            linked = stat.S_ISREG(os.lstat(readme).st_mode)
+        except OSError:
+            linked = False
+        out = [rel_link(page, readme, n) if linked else md(n), md(state_words(e["status"]))]
+        if e["staged"]:
+            out.append(f"waiting for you: {e['staged']} staged")
+        flight = package_inflight(n)
+        if flight:
+            out.append("in flight: " + "; ".join(md(t) for t in flight))
+        lb = package_latest_logbook(n)
+        if lb:
+            out.append("latest logbook entry: " + rel_link(page, lb[0], lb[1]))
+        lines.append("- " + out[0] + " — " + " · ".join(out[1:]))
+    for n, why in problems:
+        lines.append(f"- {md(n)}: not a package rs-memory can read: {md(why)}")
+    return lines
+
+
 def front_page(ctx: PageContext, w: PageWriter) -> str:
     if ctx.companion:
         return companion_front_page(ctx, w)
@@ -3181,7 +4300,15 @@ def front_page(ctx: PageContext, w: PageWriter) -> str:
              "known (each accepted entry with its page in results/), and the logbook, the "
              "story of the work (logbook/). The agent keeps its own memory in memory/, and "
              "every page here is written from it.", ""]
+    if ctx.package:
+        lines[0] = f"# Work package {md(ctx.package)}, for the PI"
+        lines += ["This is one work package of the project, worked on in a session of its own: "
+                  "its " + rel_link(page, folder() / CHARTER_FILE, "charter") + " says what it "
+                  "covers. The " + rel_link(page, workspace() / FRONT_PAGE, "project's front page")
+                  + " lists every package.", ""]
     lines += waiting_lines(page, ctx)
+    if ctx.planner:
+        lines += packages_block(page)
     lines += running_block(page, ctx)
     lines += standing_block(page, ctx, w)
     lines += [""] + logbook_front_lines(page)
@@ -3238,6 +4365,18 @@ def refresh_pages() -> None:
     except Exception as e:                      # a view must never undo the verb
         PAGE_PROBLEMS.append(f"the PI's pages were not brought up to date "
                              f"({type(e).__name__}: {e})")
+    if current_package() is None:
+        return
+    # A package's write: the project's front page lists the packages. The
+    # package's lock is held here, and the top's is taken after it (never
+    # the other way round).
+    try:
+        with working_in(top_mem_dir()):
+            with Lock():
+                PAGE_PROBLEMS.extend(write_pages())
+    except Exception as e:
+        PAGE_PROBLEMS.append(f"the project's front page was not brought up to date "
+                             f"({type(e).__name__}: {e})")
 
 
 def take_page_problems() -> "list[str]":
@@ -3285,13 +4424,20 @@ def open_text(consolidation: "str | None" = None) -> str:
     # In flight: what is still running is read before the rest.
     jobs_part = jobs_section()
     switches = switches_open_line()
+    head = open_head()
     if not (d / "front.md").exists() and not journal_files():
-        return ("# rs-memory\nNo memory yet in this project. Write your first journal entry "
+        return ("# rs-memory\nNo memory yet in this "
+                + ("package" if current_package() else "project")
+                + ". Write your first journal entry "
                 "with rs-memory note, and the in-flight work with rs-memory checkpoint.\n"
+                + (f"\n{consolidation}\n" if consolidation else "")
+                + (f"\n{head}\n" if head else "")
                 + (f"\n{switches}\n" if switches else "")
                 + (f"\n{jobs_part}\n" if jobs_part else ""))
     front = read_front()
     parts = [consolidation] if consolidation else []
+    if head:
+        parts.append(head)
     if switches:
         parts.append(switches)
     parts.append((d / "front.md").read_text(encoding="utf-8").rstrip()
@@ -3380,8 +4526,29 @@ def catch_up(agent: "str | None") -> "str | None":
             "tries again.")
 
 
+def hook_text(text: str) -> str:
+    """open --hook's text: its first line, and cut to the hook's limit."""
+    text = "rs-memory open (start of session):\n\n" + text
+    if _utf16_len(text) > HOOK_OUTPUT_LIMIT:
+        tail = "\n[cut here; run rs-memory open for the rest]\n"
+        room, cut = HOOK_OUTPUT_LIMIT - _utf16_len(tail), 0
+        for ch in text:                     # whole characters only
+            room -= _utf16_len(ch)
+            if room < 0:
+                break
+            cut += 1
+        text = text[:cut] + tail
+    return text
+
+
 def cmd_open(a) -> None:
     if a.hook and under_guard():
+        return
+    # With the planner on, a session that holds nothing has no memory yet:
+    # it is shown the packages, and nothing is consolidated or written.
+    if SESSION["planner"] and SESSION["binding"] is None:
+        text = open_listing_text()
+        sys.stdout.write(hook_text(text) if a.hook else text)
         return
     # A consolidation or referee run reads only, and never starts another.
     consolidation = None
@@ -3396,16 +4563,7 @@ def cmd_open(a) -> None:
     if problems:
         text = ("## The PI's pages\n" + "\n".join(f"- {p}" for p in problems) + "\n\n" + text)
     if a.hook:
-        text = "rs-memory open (start of session):\n\n" + text
-        if _utf16_len(text) > HOOK_OUTPUT_LIMIT:
-            tail = "\n[cut here; run rs-memory open for the rest]\n"
-            room, cut = HOOK_OUTPUT_LIMIT - _utf16_len(tail), 0
-            for ch in text:                     # whole characters only
-                room -= _utf16_len(ch)
-                if room < 0:
-                    break
-                cut += 1
-            text = text[:cut] + tail
+        text = hook_text(text)
     sys.stdout.write(text)
 
 
@@ -3446,7 +4604,7 @@ _LINK_RES = (re.compile(r"(!?\[[^\]]*\]\(\s*<?([^)\s>]*)[^)]*\))"),
 
 
 def logbook_dir() -> Path:
-    return workspace() / LOGBOOK_DIR
+    return folder() / LOGBOOK_DIR
 
 
 def logbook_state() -> "tuple[list[dict], list[int]]":
@@ -3637,7 +4795,7 @@ def cmd_log(a) -> None:
         except OSError as e:
             raise Refused(f"the logbook entry could not be written into {d} "
                           f"({e.strerror or e}); nothing was filed")
-        rel = path.relative_to(workspace()).as_posix()
+        rel = path.relative_to(folder()).as_posix()
         span = ("none" if covers is None else
                 f"J-{covers[0]}" if covers[0] == covers[1] else f"J-{covers[0]} to J-{covers[1]}")
         j = add_journal(title, LOGBOOK_KIND, "",
@@ -3649,9 +4807,9 @@ def cmd_log(a) -> None:
 
 
 def read_logbook_entry(rel: str) -> "str | None":
-    """A filed entry's text, by its path in the workspace; None when it is not
-    there as a plain file (never followed or blocked on)."""
-    p = workspace() / rel
+    """A filed entry's text, by its path in the researcher's folder; None when
+    it is not there as a plain file (never followed or blocked on)."""
+    p = folder() / rel
     try:
         fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
@@ -3679,7 +4837,7 @@ def logbook_front_lines(page: Path) -> "list[str]":
              "The story of the work, one entry per topic, written by the agent when you ask "
              "for it; an entry is never changed after it is written.", ""]
     for e in reversed(entries[-LOGBOOK_FRONT_ENTRIES:]):
-        lines.append(f"- {file_ref(page, str(workspace() / one(e, 'entry')), e['headline'])}"
+        lines.append(f"- {file_ref(page, str(folder() / one(e, 'entry')), e['headline'])}"
                      f" — {md(one(e, 'time')[:10])}")
     if len(entries) > LOGBOOK_FRONT_ENTRIES:
         lines += ["", f"All {len(entries)} entries: " + rel_link(page, logbook_dir(), "logbook/")]
@@ -3707,7 +4865,7 @@ def logbook_open_line() -> str:
         return (f"Logbook: no entry yet ({entries_words(len(after))} so far); the PI "
                 "asks for it with /log.")
     last = entries[-1]
-    return (f"Latest logbook entry: {workspace() / one(last, 'entry')} "
+    return (f"Latest logbook entry: {folder() / one(last, 'entry')} "
             f"({one(last, 'time')[:10]}; {entries_words(len(after))} since); read it when you "
             "need the story of the work.")
 
@@ -4308,7 +5466,7 @@ def run_consolidation(agent: str) -> int:
         print("agent: " + " ".join(argv[:2]), flush=True)
         try:
             rc = run_group(argv, timeout=CONSOLIDATION_LIMIT_S, env=env,
-                           stdin=subprocess.DEVNULL, cwd=str(mem_dir().parent))
+                           stdin=subprocess.DEVNULL, cwd=str(workspace()))
         except OSError as e:
             print(f"result: not applied (could not start {argv[0]}: {e.strerror})", flush=True)
             return 1
@@ -4379,6 +5537,26 @@ def cmd_close(a) -> None:
     if under_guard():
         raise Refused("this is a consolidation run; it never starts another")
     agent = a.agent or detect_agent()
+    if not SESSION["planner"]:
+        close_memory(a, agent)
+        return
+    # With the planner on: the memory the session holds, then given back.
+    holds = session_data(SESSION["sid"]).get(HOLDS_KEY) if SESSION["sid"] else None
+    if SESSION["binding"] is None:
+        if holds is not None:
+            release_hold(SESSION["sid"], holds)
+        if not a.hook:
+            print("This session holds nothing, so there is nothing to close.")
+        return
+    close_memory(a, agent)
+    line = release_hold(SESSION["sid"], holds)
+    if not a.hook:
+        print(line)
+
+
+def close_memory(a, agent: str) -> None:
+    """close in the memory in use: the end journalled and, unless --hook, the
+    consolidation started and waited for."""
     try:
         lock = Lock(wait=not a.hook)
         lock.__enter__()
@@ -4811,6 +5989,43 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id")
     p.set_defaults(fn=cmd_job_done)
 
+    p = sub.add_parser("plan", help="(planner on) take the project's top: this session plans; "
+                       "consolidates its last session first when that one did not close")
+    p.add_argument("--agent", choices=("claude", "pi"),
+                   help="the agent that runs a consolidation still owed (default: this shell's)")
+    p.set_defaults(fn=cmd_plan)
+    p = sub.add_parser("take", help="(planner on) take a work package: this session works in "
+                       "it; consolidates its last session first when that one did not close")
+    p.add_argument("package")
+    p.add_argument("--agent", choices=("claude", "pi"),
+                   help="the agent that runs a consolidation still owed (default: this shell's)")
+    p.set_defaults(fn=cmd_take)
+    p = sub.add_parser("release", help="give back what this session holds (the top or a package)")
+    p.set_defaults(fn=cmd_release)
+    pk = sub.add_parser("package", help="work packages: add, change a charter, mark done, close, "
+                        "list").add_subparsers(dest="package_verb", required=True)
+    p = pk.add_parser("add", help="(the planning session) add an open package with its charter")
+    p.add_argument("name")
+    p.add_argument("--charter", required=True, metavar="DRAFT",
+                   help="the charter: the sections " + ", ".join(f"`## {h}`" for h in CHARTER_SECTIONS))
+    p.set_defaults(fn=cmd_package_add)
+    p = pk.add_parser("charter", help="(the planning session) change a package's charter; "
+                      "journalled in the package")
+    p.add_argument("name")
+    p.add_argument("--charter", required=True, metavar="DRAFT")
+    p.set_defaults(fn=cmd_package_charter)
+    p = pk.add_parser("done", help="(its session or the planning session) mark a package done")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_package_done)
+    p = pk.add_parser("close", help="(the planning session) close a package nobody works in")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_package_close)
+    p = pk.add_parser("list", help="every package with its state (--json: for RS and the "
+                      "browser)", description=PACKAGES_JSON_DOC,
+                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_package_list)
+
     # The verbs this command starts as tethered children of its own. Added with
     # no help, so the verb list leaves them out; the metavar below names only
     # the public verbs, so the usage line leaves them out too.
@@ -4828,6 +6043,16 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+# The verbs that write a memory: with the planner on, refused to a session
+# that holds nothing (refuse_unheld_write; `switch` with an option and
+# `consolidate --apply` too). `close` gives its own answer there; the
+# package verbs check who runs them themselves.
+WRITE_VERBS = (cmd_note, cmd_checkpoint, cmd_claim, cmd_amend, cmd_rerun_command, cmd_rerun,
+               cmd_referee, cmd_check, cmd_accept, cmd_strike, cmd_log, cmd_skill_propose,
+               cmd_skill_used, cmd_skill_promote, cmd_skill_retire, cmd_skill_sync, cmd_job_add,
+               cmd_job_done)
+
+
 def main(argv: "list[str] | None" = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     # The keeper (run_group) needs nothing of the project: it runs before
@@ -4837,6 +6062,8 @@ def main(argv: "list[str] | None" = None) -> int:
     a = build_parser().parse_args(argv)
     try:
         refuse_both_kinds()
+        choose_memory(a)
+        refuse_unheld_write(a)
         a.fn(a)
         if not getattr(a, "hook", False):
             print_page_problems()
