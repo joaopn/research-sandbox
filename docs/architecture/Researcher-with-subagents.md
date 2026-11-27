@@ -104,6 +104,23 @@ The planning session changes a charter through the memory command, which journal
 
 The project's front page gains a **Packages** section: one line per package with its state, what waits there, what it has in flight and its latest logbook entry, each linking the package's own front page. Turning the planner on is always allowed: the top memory and record become the planning session's. Turning it off is refused while any package is open, naming each; RS reads the packages' status files from the project's folder itself, so the refusal holds for a stopped project too.
 
+## The planning session and the work sessions
+
+With the planner on, a session takes a **role**: the planning session, which holds the project's top, or a work session, which holds one package. Each role is a skill installed into the project's agents, and each skill has a shortcut typed in the project's terminal.
+
+| Role | Skill (Claude; pi) | Shortcut (Claude; pi) | What the session does |
+|---|---|---|---|
+| Planning session | `/rs-plan`; `/skill:rs-plan` | `claude-plan`; `pi-plan` | Takes the project's top (`rs-memory plan`), defines the task with the user, splits it into packages with independent questions, writes each charter (`## Questions`, `## Data`, `## Out of scope`) through the memory command, changes charters when the plan changes, re-plans from the front page's Packages section, and marks packages done or closes them when the user says so. It does no analysis beyond quick looks. |
+| Work session | `/rs-work <package>`; `/skill:rs-work <package>` | `claude-work <package>`; `pi-work <package>` | Takes the package (`rs-memory take`), reads its charter and works only inside it, in the package's own folders (its `analyses/` for analysis folders and analysts' results), brings any idea outside the charter to the user as a suggestion, and follows the session's subagents and checks switches. |
+
+The skill's first step takes the role through the memory command; when that refuses (another live session holds the package or plans, the package is done or closed), the skill tells the user and stops. Without the planner on, either skill says the project works without packages and stops. The skills are installed in every project of this type whatever its planner setting, so turning the planner on later needs no reinstall.
+
+A shortcut starts the plain agent on the role's model with the skill as its first prompt: `claude --model <m> --effort <e> "/rs-plan"`, `pi --model <m> --thinking <t> "/skill:rs-work <package>"`. `claude-work` and `pi-work` without a name list the packages; a name that is not a package name (letters, digits, `-` and `_`, a letter or digit first) is refused before the agent starts. The shortcuts are written by the same installer as the helpers, into the agent's own `~/.local/bin` beside `claude` and `pi`, and only for the agents the project carries.
+
+A new session that holds nothing lists the packages and names both skills and shortcuts. A compaction drops a skill's text, so the instructions tell the session to invoke its role's skill again after one, and the memory command's opening text, which runs after every compaction under both agents, names the session's role ("This session is the planning session", "This session works in package X") and says to invoke the skill again when its text is not in context.
+
+**The roles' models.** Under Claude each role runs the model and effort set for the whole installation in **Host → Defaults → Planning session** and **→ Work session**, Opus at high effort by default (they are sessions the user talks to, like the agent itself). A new project of this type starts with them, and a project's own are set when it is created or later in ⚙ on Claude's tab; the skill's frontmatter carries the model and effort, so invoking `/rs-plan` in a session on another model runs that skill's turn on the role's model, and the shortcut starts the session on it. Under pi a role runs its own model and thinking level when they are set on pi's tab, and otherwise pi's Agent model. pi's skills take no model, so under pi only the shortcut carries the role's model: `/skill:rs-plan` typed in a running pi session keeps that session's model. A change in ⚙ re-runs the installer, so the next skill invoked and the next shortcut typed use it; nothing restarts.
+
 ## The helpers' models
 
 Under Claude the analyst and the surveyor each run the model and effort set for the whole installation in **Host → Defaults → Analyst** and **→ Surveyor**, Sonnet at high effort by default. A new project of this type starts with them, and a project's own are set when the project is created (the New Project window's Agents box, beside Agent), or later in ⚙ on Claude's tab. Under pi the analyst runs pi's default model unless its own model and thinking level are set on pi's tab, when the project is created or later in ⚙; there is no installation default for it, since pi names its models by provider. A change is written into the helper's definition, so the next helper launched uses it, and nothing restarts. A project created before these settings keeps running its Claude helpers on the researcher's model until they are set in its ⚙ Agents box.
@@ -145,3 +162,9 @@ Under Claude the referee runs the model set for the whole installation in **Host
 **The memory is chosen by what a session holds, never by a path.** Pointing the memory command at a package's folder directly is refused, and a session that holds nothing writes nothing, so a package's memory is written only by its session. Nothing stops a session reading another package's files: it keeps to its charter by instruction.
 
 **Turning the planner off with open packages is an error that names them.** Nothing is closed or moved for the user; they finish or close each package first.
+
+**Roles are skills inside the plain agents.** `claude` and `pi` open the agent as they do everywhere else; a role is a skill the session takes, so any session can take one, and switching roles needs no other program. The cost is that the role's text lives in the conversation and a compaction drops it.
+
+**Shortcuts are new names, never a wrapped `claude` or `pi`.** `claude-plan` and `claude-work` start the plain agent with the role's model and the skill as the first prompt. The cost is four more commands to learn, named in the greeting and in the start listing.
+
+**A role is loaded again after a compaction.** The instructions say so, and the memory command's opening text, which runs after every compaction, names the role. The cost is one skill call after each compaction.
