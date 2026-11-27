@@ -10523,7 +10523,13 @@ HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md",
                  # frontmatter, with the role's model) and the body of their
                  # four shortcuts, claude-plan, claude-work, pi-plan, pi-work.
                  "skill-roles/rs-plan.md", "skill-roles/rs-work.md",
-                 "skill-roles/shortcut.sh")
+                 "skill-roles/shortcut.sh",
+                 # The web through the search service, for a researcher-subagents
+                 # project whose agent is wired to it: the analyst's line on it,
+                 # the source-checker's passage and the rule both agents load
+                 # (~/.claude/rules/rs-search.md).
+                 "agents/analyst-search.md", "agents/source-checker-search.md",
+                 "rules/search.md")
 # The record key that gives a project the helper roles (`analyst` for both
 # agents, `surveyor` for Claude): `"subagents": true` in its
 # .orchestrator/project.json. Read where the kit is staged; a box, and every
@@ -10895,11 +10901,16 @@ def _harness_helper_pairs(marker: dict) -> dict[str, str]:
 def _harness_subagents_env(container: str, marker: dict) -> list[str]:
     """`-e` args that give the installer the helper roles, with their recorded
     models (_harness_helper_pairs), when the project's record carries
-    `"subagents": true`; none otherwise."""
+    `"subagents": true`; none otherwise. With the project's own agents wired
+    to the search service, RS_HARNESS_SEARCH=1 too: all web access then goes
+    through it (Claude's own web tools denied, no surveyor, the search rule)."""
     if marker.get(SUBAGENTS_RECORD_KEY) is not True:
         return []
+    servers = _harness_analyst_servers(container)
     args = ["-e", "RS_HARNESS_SUBAGENTS=1",
-            "-e", f"RS_HARNESS_ANALYST_MCP={' '.join(_harness_analyst_servers(container))}"]
+            "-e", f"RS_HARNESS_ANALYST_MCP={' '.join(servers)}"]
+    if search.MCP_SERVER_NAME in servers:
+        args += ["-e", "RS_HARNESS_SEARCH=1"]
     for k, v in _harness_helper_pairs(marker).items():
         args += ["-e", f"{k}={v}"]
     return args
@@ -21161,8 +21172,12 @@ def mcp_server_remove(req: McpServerNameRequest, *, blocking: bool = True,
     is gone (refused by the gateway), never a listed server that lost its
     wiring. `if_url` (Aldine's Turn off): remove the server only when it is on
     the list at exactly that address, and otherwise change nothing — an
-    absent one included — instead of refusing."""
+    absent one included — instead of refusing. A running researcher-subagents
+    project whose own agent it unwired has its helpers restaged at once, as a
+    wiring change does (_mcp_restage_unwired): the web follows the search
+    service's wiring without a start."""
     removed = False
+    unwired: set[str] = set()
     if if_url is None:
         # A server RS runs: everything RS made for it goes FIRST, each by its
         # name, while it is still on the list — a refusal half-way leaves it
@@ -21199,11 +21214,13 @@ def mcp_server_remove(req: McpServerNameRequest, *, blocking: bool = True,
                 mcp_servers.save(data)
                 mcp_servers.render(data)
                 touched = False
-                for row in grants["projects"].values():
-                    for consumer in row["consumers"].values():
+                for project, row in grants["projects"].items():
+                    for key, consumer in row["consumers"].items():
                         if req.name in consumer["servers"]:
                             consumer["servers"].remove(req.name)
                             touched = True
+                            if key == mcp_servers.AGENT_CONSUMER:
+                                unwired.add(project)
                 if touched:
                     mcp_servers.save_grants(grants)
                     mcp_servers.render_grants(grants)
@@ -21213,7 +21230,27 @@ def mcp_server_remove(req: McpServerNameRequest, *, blocking: bool = True,
     # Docker calls only after the lock is released.
     if removed:
         _mcp_gateway_hup(deadline)
+        _mcp_restage_unwired(unwired, deadline)
     return mcp_server_list(deadline)
+
+
+def _mcp_restage_unwired(projects: "set[str]", deadline: float | None) -> None:
+    """A removal took servers from these projects' own agents: in each one
+    that is RUNNING, restage the helpers (_mcp_restage_helpers, a no-op for a
+    project without them), as a wiring change does, so the web of a
+    researcher-subagents project follows the search service's wiring at once.
+    A stopped project gets it at its next start. Never raises: the removal is
+    already done, and one project's failure is a warning naming it."""
+    for project in sorted(projects):
+        container = container_name_for(project)
+        try:
+            r = _mcp_docker(["docker", "container", "inspect", "-f", "{{.State.Running}}",
+                             container], deadline)
+            if r.returncode != 0 or r.stdout.strip() != "true":
+                continue
+            _mcp_restage_helpers(project, container, deadline)
+        except (ValidationError, OSError, subprocess.TimeoutExpired) as e:
+            _report_warnings([f"project {project}: {_HARNESS_WARNING} ({e})"])
 
 
 def mcp_server_list_reset(*, blocking: bool = True,
@@ -21236,6 +21273,9 @@ def mcp_server_list_reset(*, blocking: bool = True,
             # this reset can be run again; the other order would leave a
             # readable list (no reset any more) with everyone still wired.
             gstate, grants, _gwhy = mcp_servers.read_grants()
+            unwired = ({p for p, row in grants["projects"].items()
+                        if (row["consumers"].get(mcp_servers.AGENT_CONSUMER) or {}).get("servers")}
+                       if gstate == mcp_servers.OK else set())
             if gstate == mcp_servers.OK and any(
                     c["servers"] for row in grants["projects"].values()
                     for c in row["consumers"].values()):
@@ -21249,6 +21289,7 @@ def mcp_server_list_reset(*, blocking: bool = True,
     except mcp_servers.ServerListError as e:
         raise _mcp_list_error(e) from None
     _mcp_gateway_hup(deadline)
+    _mcp_restage_unwired(unwired, deadline)
     return mcp_server_list(deadline)
 
 
@@ -23147,7 +23188,9 @@ def mcp_wire(req: McpWireRequest, *, blocking: bool = True,
 def _mcp_restage_helpers(project: str, container: str, deadline: float | None) -> None:
     """The project's own agents' servers changed: in a project whose record
     gives it the helper roles, run the kit's installer again so that pi's
-    analyst names the servers it has now (Claude's inherits them). Nothing for
+    analyst names the servers it has now (Claude's inherits them), and the web
+    follows the wiring of the search service (wired: Claude's own web tools
+    denied, no surveyor, the search rule; unwired: as before). Nothing for
     any other project. Its warnings are printed, never raised: the wiring is
     already applied."""
     workspace_path = workspace_path_for(project, load_config())
