@@ -11,11 +11,20 @@
 #       preloaded skills) when the deployed Claude Code honours that and RS's
 #       instruction writer has laid the role's part; else as before
 #     ~/.claude/agents/analyst.md, ~/.claude/agents/surveyor.md — the same way,
-#       only when RS_HARNESS_SUBAGENTS is 1
+#       only when RS_HARNESS_SUBAGENTS is 1; with RS_HARNESS_SEARCH 1 as well,
+#       the analyst is also denied Claude's web search and page fetch and its
+#       text gains the search service's line (agents/analyst-search.md), the
+#       surveyor is not written and an earlier one is removed, by name, and
+#       ~/.claude/settings.json's permissions.deny holds WebSearch and
+#       WebFetch: those RS added are named in ~/.claude/rs/web-deny.json, and
+#       only those are removed again (with the record) once the project is no
+#       longer wired
 #     ~/.claude/agents/source-checker.md and
 #       ~/.claude/skills/paper-check/{SKILL.md,bibpass.py} — only when
 #       RS_HARNESS_PAPER_CHECK is 1 (the role is never lean: its text is
-#       self-contained)
+#       self-contained); with RS_HARNESS_SEARCH 1 its web tools are the
+#       search service's three instead of Claude's own, and its text gains
+#       agents/source-checker-search.md
 #     ~/.claude/skills/rs-<role>-rules/SKILL.md — a link, made for a lean role;
 #     ~/.claude/skills/rs-project-instructions/SKILL.md and
 #       rs-workspace-instructions/SKILL.md — links, made when a role can be lean
@@ -36,7 +45,8 @@
 #   pi (pi in RS_HARNESS_AGENTS), under pi's agent dir:
 #     agents/doer.md, agents/checker.md, skills/harness/{…same…},
 #     skills/rs-test/{…same…}; agents/analyst.md only when RS_HARNESS_SUBAGENTS
-#     is 1 (pi has no surveyor yet: it has no web search of its own);
+#     is 1 (pi has no surveyor yet: it has no web search of its own), with the
+#     search service's line under RS_HARNESS_SEARCH 1 as for Claude;
 #     agents/source-checker.md and skills/paper-check/{SKILL.md,bibpass.py}
 #     only when RS_HARNESS_PAPER_CHECK is 1;
 #     skills/rs-plan/SKILL.md, skills/rs-work/SKILL.md (pi's skills take no
@@ -46,11 +56,15 @@
 #       — a link to the role's part, which the extension reads for that child
 #   either (any agent): ~/.claude/rules/rs-harness.md — the standing mode, and
 #     ~/.claude/rules/rs-tests.md — the standing test policy, written for a
-#     policy other than light whatever the mode.
+#     policy other than light whatever the mode, and ~/.claude/rules/rs-search.md
+#     — the web through the search service (rules/search.md), written when
+#     RS_HARNESS_SUBAGENTS and RS_HARNESS_SEARCH are both 1.
 #     Claude Code loads every ~/.claude/rules/*.md at session start; pi loads
 #     the same folder through RS's rules extension (rs-rules). Mode none removes
-#     rs-harness.md and the light test policy removes rs-tests.md, each that one
-#     file, by name; nothing else is ever removed.
+#     rs-harness.md, the light test policy removes rs-tests.md and a project not
+#     wired to the search service rs-search.md, each that one file, by name;
+#     beside them only the surveyor and RS's own deny entries above are ever
+#     removed.
 #
 # Inputs (environment; each re-checked here against the charset the host
 # validated — a value that fails is dropped with a warning, never used):
@@ -100,6 +114,10 @@
 #   RS_HARNESS_PI_WORK_THINKING       pi thinking level for it
 #                                     (these eight: the project's record, read
 #                                     with RS_HARNESS_SUBAGENTS only)
+#   RS_HARNESS_SEARCH                 1: the project's own agents are wired to
+#                                     the search service (the MCP server
+#                                     `search`), so all web access goes through
+#                                     it (read with RS_HARNESS_SUBAGENTS only)
 #   RS_HARNESS_ANALYST_MCP            the MCP servers the project's own agents
 #                                     are wired to (space separated), which pi's
 #                                     analyst names (pi gives a child no MCP
@@ -227,7 +245,8 @@ checked() {
 # mode's own rule body, and a test policy's, is checked when it is chosen, below.
 for f in agents/doer.md agents/checker.md agents/analyst.md agents/surveyor.md skill/SKILL.md modes/LIST skill-test/SKILL.md policies/LIST \
         skill-research/SKILL.md agents/source-checker.md skill-paper-check/SKILL.md skill-paper-check/bibpass.py \
-        skill-roles/rs-plan.md skill-roles/rs-work.md skill-roles/shortcut.sh; do
+        skill-roles/rs-plan.md skill-roles/rs-work.md skill-roles/shortcut.sh \
+        agents/analyst-search.md agents/source-checker-search.md rules/search.md; do
     if [ ! -r "$SRC/$f" ]; then
         warn "the shipped file $f is missing; nothing installed"
         echo RS_HARNESS_INSTALL_FAILED
@@ -264,6 +283,10 @@ PI_CHECKER_THINKING=$(checked RS_HARNESS_PI_CHECKER_THINKING "${RS_HARNESS_PI_CH
 # them (a box, and every other project, never gets them).
 SUBAGENTS=0
 [ "${RS_HARNESS_SUBAGENTS:-}" = 1 ] && SUBAGENTS=1
+# The web through the search service: only beside the helper roles (a
+# researcher-subagents project's agent wired to the server `search`).
+SEARCH=0
+[ "$SUBAGENTS" = 1 ] && [ "${RS_HARNESS_SEARCH:-}" = 1 ] && SEARCH=1
 # Their models (the project's record; unset: the analyst and surveyor keep the
 # session's model, pi's analyst pi's default).
 ANALYST_MODEL=$(checked RS_HARNESS_ANALYST_MODEL "${RS_HARNESS_ANALYST_MODEL:-}" claude_tier_ok)
@@ -303,7 +326,8 @@ set +f
 CLAUDE_ROLES="doer checker"
 PI_ROLES="doer checker"
 if [ "$SUBAGENTS" = 1 ]; then
-    CLAUDE_ROLES="$CLAUDE_ROLES analyst surveyor"
+    CLAUDE_ROLES="$CLAUDE_ROLES analyst"
+    [ "$SEARCH" = 1 ] || CLAUDE_ROLES="$CLAUDE_ROLES surveyor"
     PI_ROLES="$PI_ROLES analyst"
 fi
 
@@ -318,6 +342,11 @@ done
 
 DOER_DESC="Implements one unit of work from a self-contained brief (shipped by RS)."
 CHECKER_DESC="Reviews a change or a plan read-only - verifies against the code, asserts defects, flags forks (shipped by RS)."
+# The search service's tools as Claude Code names those of the user-scope MCP
+# server `search` (MIRROR of search.MCP_SERVER_NAME; measured on 2.1.325:
+# mcp__<server>__<tool>).
+SEARCH_TOOLS="mcp__search__search_submit, mcp__search__search_check, mcp__search__search_collect"
+
 ANALYST_DESC="Carries out one analysis from a self-contained brief, in the background, and reports its result files (shipped by RS)."
 SURVEYOR_DESC="Answers one survey question from the web, in the background, with a written summary and its sources (shipped by RS)."
 SOURCE_CHECKER_DESC="Checks one cited source against the sentences that cite it, or finds references for one uncited sentence, in the background (shipped by RS)."
@@ -352,6 +381,59 @@ skill_test() {
 skill_paper_check() {
     put "$1/SKILL.md" < "$SRC/skill-paper-check/SKILL.md" || FAILED=1
     put "$1/bibpass.py" < "$SRC/skill-paper-check/bibpass.py" || FAILED=1
+}
+
+# analyst_text — the analyst's text, with the search service's line when the
+# web goes through it.
+analyst_text() {
+    cat "$SRC/agents/analyst.md"
+    [ "$SEARCH" != 1 ] || cat "$SRC/agents/analyst-search.md"
+}
+
+# web_deny — Claude's own web search and page fetch in the user settings'
+# permissions.deny while the web goes through the search service. The names
+# RS added (never one that was there before) are recorded first, so that a
+# failed settings write leaves nothing unrecorded; once the project is not
+# wired, only the recorded names (and only these two) are removed, then the
+# record. A settings file whose permissions or deny is not of the shape Claude
+# Code reads fails (jq), and is left as it was. No settings file: nothing to
+# do while Claude Code is not deployed here yet (an Update that adds it runs
+# this first), a failure once it is.
+WEB_TOOLS='["WebSearch","WebFetch"]'
+WEB_DENY_RECORD="$HOME/.claude/rs/web-deny.json"
+web_deny() {
+    CS="$HOME/.claude/settings.json"
+    if [ "$SEARCH" = 1 ]; then
+        if [ ! -f "$CS" ]; then
+            [ -L "$HOME/.local/bin/claude" ] || [ -e "$HOME/.local/bin/claude" ] || return 0
+            warn "no $CS to deny Claude's web tools in"
+            return 1
+        fi
+        WD_OLD='[]'
+        if [ -f "$WEB_DENY_RECORD" ]; then
+            WD_OLD=$(cat "$WEB_DENY_RECORD") || return 1
+        fi
+        WD_ADD=$(jq -c --argjson t "$WEB_TOOLS" '$t - ((.permissions // {}).deny // [])' "$CS") || return 1
+        WD_REC=$(jq -cn --argjson a "$WD_OLD" --argjson b "$WD_ADD" --argjson t "$WEB_TOOLS" \
+            '($a + $b) | map(select(. as $n | $t | index($n) != null)) | unique') || return 1
+        printf '%s\n' "$WD_REC" | put "$WEB_DENY_RECORD" || return 1
+        [ "$WD_ADD" != '[]' ] || return 0
+        WD_NEW=$(jq --argjson a "$WD_ADD" '.permissions.deny = ((.permissions.deny // []) + $a)' "$CS") || return 1
+        printf '%s\n' "$WD_NEW" | put "$CS"
+        return
+    fi
+    [ -f "$WEB_DENY_RECORD" ] || return 0
+    if [ -f "$CS" ]; then
+        WD_OLD=$(cat "$WEB_DENY_RECORD") || return 1
+        WD_NEW=$(jq --argjson r "$WD_OLD" --argjson t "$WEB_TOOLS" \
+            '($r | map(select(. as $n | $t | index($n) != null))) as $r
+             | if (.permissions.deny // null) == null then .
+               else .permissions.deny -= $r
+                    | if .permissions.deny == [] then del(.permissions.deny) else . end end' "$CS") \
+            || return 1
+        printf '%s\n' "$WD_NEW" | put "$CS" || return 1
+    fi
+    rm -f "$WEB_DENY_RECORD" || { warn "could not remove $WEB_DENY_RECORD"; return 1; }
 }
 
 PLAN_DESC="Make this session the project's planning session - define the task with the user and split it into work packages with charters. Use when the user asks for the planning role, or after a compaction to reload this session's planning role."
@@ -465,38 +547,58 @@ if [ "$HAS_CLAUDE" = 1 ]; then
         # The analyst keeps every tool of the session (the project's MCP
         # servers included, which a fixed list would drop) except the one
         # that launches a subagent: an analyst does not delegate further.
+        # With the web through the search service, Claude's own web search
+        # and page fetch go too.
+        ANALYST_DENY=Agent
+        [ "$SEARCH" != 1 ] || ANALYST_DENY="Agent, WebSearch, WebFetch"
         {
             printf '%s\n' '---' 'name: analyst' "description: $ANALYST_DESC" "model: \"${ANALYST_MODEL:-inherit}\""
             [ -z "$ANALYST_EFFORT" ] || printf '%s\n' "effort: \"$ANALYST_EFFORT\""
-            printf '%s\n' 'disallowedTools: Agent'
+            printf '%s\n' "disallowedTools: $ANALYST_DENY"
             lean_lines analyst
             printf '%s\n' '---' ''
-            cat "$SRC/agents/analyst.md"
+            analyst_text
         } | put "$HOME/.claude/agents/analyst.md" || FAILED=1
-        # The surveyor has Claude's own web search and page fetch and nothing
-        # else (no shell, no files), and always runs in the background.
-        {
-            printf '%s\n' '---' 'name: surveyor' "description: $SURVEYOR_DESC" "model: \"${SURVEYOR_MODEL:-inherit}\""
-            [ -z "$SURVEYOR_EFFORT" ] || printf '%s\n' "effort: \"$SURVEYOR_EFFORT\""
-            printf '%s\n' 'tools: WebSearch, WebFetch' 'background: true'
-            lean_lines surveyor
-            printf '%s\n' '---' ''
-            cat "$SRC/agents/surveyor.md"
-        } | put "$HOME/.claude/agents/surveyor.md" || FAILED=1
+        if [ "$SEARCH" = 1 ]; then
+            # No surveyor while the web goes through the search service: an
+            # earlier one is removed, that one file, by name.
+            if [ -e "$HOME/.claude/agents/surveyor.md" ] && ! rm -f "$HOME/.claude/agents/surveyor.md"; then
+                warn "could not remove $HOME/.claude/agents/surveyor.md"
+                FAILED=1
+            fi
+        else
+            # The surveyor has Claude's own web search and page fetch and
+            # nothing else (no shell, no files), and always runs in the
+            # background.
+            {
+                printf '%s\n' '---' 'name: surveyor' "description: $SURVEYOR_DESC" "model: \"${SURVEYOR_MODEL:-inherit}\""
+                [ -z "$SURVEYOR_EFFORT" ] || printf '%s\n' "effort: \"$SURVEYOR_EFFORT\""
+                printf '%s\n' 'tools: WebSearch, WebFetch' 'background: true'
+                lean_lines surveyor
+                printf '%s\n' '---' ''
+                cat "$SRC/agents/surveyor.md"
+            } | put "$HOME/.claude/agents/surveyor.md" || FAILED=1
+        fi
+        web_deny || FAILED=1
     fi
     if [ "$PAPER_CHECK" = 1 ]; then
         # The source-checker reads the web and the shell, always in the
         # background, and starts without the session's instruction files
         # where the deployed Claude Code honours that: its text is all it
-        # needs (no preloaded skills).
+        # needs (no preloaded skills). With the web through the search
+        # service, it reads the web through that service's tools instead of
+        # Claude's own, and its text says how.
+        SC_WEB="WebSearch, WebFetch"
+        [ "$SEARCH" != 1 ] || SC_WEB=$SEARCH_TOOLS
         {
             printf '%s\n' '---' 'name: source-checker' "description: $SOURCE_CHECKER_DESC" \
                 "model: \"${SURVEYOR_MODEL:-inherit}\""
             [ -z "$SURVEYOR_EFFORT" ] || printf '%s\n' "effort: \"$SURVEYOR_EFFORT\""
-            printf '%s\n' 'tools: WebSearch, WebFetch, Bash, Read' 'background: true'
+            printf '%s\n' "tools: $SC_WEB, Bash, Read" 'background: true'
             [ "$CLAUDE_LEAN" != 1 ] || printf '%s\n' 'omitClaudeMd: true'
             printf '%s\n' '---' ''
             cat "$SRC/agents/source-checker.md"
+            [ "$SEARCH" != 1 ] || cat "$SRC/agents/source-checker-search.md"
         } | put "$HOME/.claude/agents/source-checker.md" || FAILED=1
         skill_paper_check "$HOME/.claude/skills/paper-check"
     fi
@@ -542,7 +644,7 @@ if [ "$HAS_PI" = 1 ]; then
             [ -z "$PI_ANALYST_MODEL" ] || printf '%s\n' "model: \"$PI_ANALYST_MODEL\""
             [ -z "$PI_ANALYST_THINKING" ] || printf '%s\n' "thinking: \"$PI_ANALYST_THINKING\""
             printf '%s\n' '---' ''
-            cat "$SRC/agents/analyst.md"
+            analyst_text
         } | put "$PI_DIR/agents/analyst.md" || FAILED=1
     fi
     if [ "$PAPER_CHECK" = 1 ]; then
@@ -622,6 +724,15 @@ if [ "$HAS_CLAUDE" = 1 ] || [ "$HAS_PI" = 1 ]; then
                 "Where the project's own instructions prescribe a different way of working, the project's instructions win. When such a difference decides something in the work in front of you and the project's instructions do not record the user's ruling on that difference, raise it with the user as a question; until they answer, do everything that does not depend on it and hold the part that does. The user can switch this session's test policy with the \`rs-test\` skill: \`/rs-test <policy>\` in Claude Code, \`/skill:rs-test <policy>\` in pi ($POLICY_LIST)." ''
             cat "$SRC/policies/$POLICY.md"
         } | put "$TEST_RULE" || FAILED=1
+    fi
+    # The web through the search service: its rule while the project is wired
+    # to it, else that one file is removed, by name.
+    SEARCH_RULE="$HOME/.claude/rules/rs-search.md"
+    if [ "$SEARCH" = 1 ]; then
+        put "$SEARCH_RULE" < "$SRC/rules/search.md" || FAILED=1
+    elif [ -e "$SEARCH_RULE" ] && ! rm -f "$SEARCH_RULE"; then
+        warn "could not remove $SEARCH_RULE"
+        FAILED=1
     fi
 fi
 
