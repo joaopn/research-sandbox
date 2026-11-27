@@ -46,6 +46,7 @@ Call `mcp__plain__finish` once, with:
 - `summary`: the answer to the question, written for the agent that asked. State what you found and how sure it is; say plainly what you could not find. Cite every claim with the number of its source, as [1], [2].
 - `sources`: every source you used, numbered in the order the summary cites them: title, address (and DOI when there is one), what it contributed, and the name of the saved file when you fetched or downloaded it.
 - `tiers`: every way of searching you tried and what each one hit: the database or tool, what you asked, what came back (results, nothing, blocked, an error, a paywall, a captcha). For `mcp__plain__web_search`, name every engine SearXNG reported as not answering and its reason.
+  When a site refused you because of where your requests come from (a page or an error that names your address or your network: "your IP address has been blocked", "access from your network is restricted", "not available in your region", a block that names the address), add `"blocked_by_address": true` to that line, with the site's address in `asked`. The asker can then ask again from another address.
 <!-- tier: browser -->
   Every page you opened in the browser is a line too: `browser`, the address, what it showed or how it was blocked.
 <!-- end tier -->

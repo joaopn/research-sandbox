@@ -1,0 +1,34 @@
+# rs-search-vpn — the search service's VPN gateway, and the one-shot helper
+# that routes a VPN search's sidecars through it (container/search/service.py).
+#
+# The gateway: one container inside the service's inner Docker while a VPN
+# configuration is stored, run with NET_ADMIN as its only capability and IPv4
+# forwarding on. vpn/up.sh, fed the configuration over `docker exec -i` stdin
+# into the tmpfs at /etc/wireguard (never a mount, never argv), sets the
+# firewall and the routing first (fail closed), then the kernel WireGuard
+# tunnel; vpn/status.sh says whether the tunnel has a fresh handshake.
+#
+# The helper: `docker run --rm --network container:<sidecar> --cap-add
+# NET_ADMIN` of this image runs vpn/route.sh in a sidecar's network namespace,
+# so the sidecar itself keeps no capability.
+#
+# Pins come from versions.env (passed as build args by the host): the Alpine
+# release and the three packages, each by its exact version.
+ARG SEARCH_VPN_ALPINE_VERSION=3.20.10
+FROM alpine:${SEARCH_VPN_ALPINE_VERSION}
+
+ARG SEARCH_VPN_WIREGUARD_TOOLS_VERSION=1.0.20210914-r4
+ARG SEARCH_VPN_IPROUTE2_VERSION=6.9.0-r0
+ARG SEARCH_VPN_IPTABLES_VERSION=1.8.10-r3
+
+RUN apk add --no-cache \
+        "wireguard-tools-wg=${SEARCH_VPN_WIREGUARD_TOOLS_VERSION}" \
+        "iproute2=${SEARCH_VPN_IPROUTE2_VERSION}" \
+        "iptables=${SEARCH_VPN_IPTABLES_VERSION}"
+
+COPY container/search/vpn/ /opt/rs-search-vpn/
+RUN chmod 755 /opt/rs-search-vpn/*.sh && mkdir -p /etc/wireguard && chmod 700 /etc/wireguard
+
+# The gateway does nothing on its own: its setup and its status checks come
+# over `docker exec`.
+ENTRYPOINT ["/bin/sleep", "infinity"]

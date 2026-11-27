@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""The plain tier: the search agent's tool server (MCP over stdio).
+"""The plain tier: the search agent's tool server (MCP over stdio, or over
+HTTP with --http).
 
-One process per search, started by the search agent's Claude Code from the
-tool list the service generates per search. Tools: the scholarly APIs
+One process per search: started by the search agent's Claude Code from the
+tool list the service generates per search (stdio), or, in a VPN search, as
+a sidecar of its own on the VPN's route that the agent calls over HTTP
+(`--http`: JSON replies on HTTP_PORT, the same tools). Tools: the scholarly APIs
 (OpenAlex, Crossref, arXiv, Unpaywall), a web search through the service's
 SearXNG, a page fetch
 that saves what it fetched into the search's volume, and `finish`, which
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import html.parser
 import http.cookiejar
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import re
@@ -538,9 +542,12 @@ TOOLS = {
                 "sources": {"type": "array", "items": {"type": "object"},
                             "description": "[{n, title, url, doi?, contributed, saved_as?}]"},
                 "tiers": {"type": "array", "items": {"type": "object"},
-                          "description": "[{tier, asked, hit}] — every tool tried, what it "
-                                         "returned or why it failed, and every SearXNG "
-                                         "engine that did not answer"}},
+                          "description": "[{tier, asked, hit, blocked_by_address?}] — every "
+                                         "tool tried, what it returned or why it failed, "
+                                         "and every SearXNG engine that did not answer; "
+                                         "blocked_by_address: true on a line where a site "
+                                         "refused because of the address the search "
+                                         "comes from"}},
                ["summary", "sources", "tiers"]),
 }
 
@@ -599,7 +606,71 @@ def handle(msg: dict) -> dict | None:
             "error": {"code": -32601, "message": f"method not found: {method}"}}
 
 
+# The HTTP server's port and path in a VPN search's plain-tier sidecar
+# (service.py SIDECAR_PORT / SIDECAR_PATH — MIRRORS).
+HTTP_PORT = 8931
+HTTP_PATH = "/mcp"
+
+
+def _reply(msg) -> dict | None:
+    if isinstance(msg, dict):
+        return handle(msg)
+    return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+
+
+class _Http(BaseHTTPRequestHandler):
+    """MCP over streamable HTTP with JSON replies (no server-initiated
+    stream, no session): every reply is its POST's own. The only caller is
+    the search's agent on the search's own network."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args) -> None:
+        pass
+
+    def _send(self, status: int, body: bytes = b"", extra: dict | None = None) -> None:
+        self.send_response(status)
+        if body:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        if self.path.split("?", 1)[0].rstrip("/") != HTTP_PATH:
+            return self._send(404)
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+            msg = json.loads(self.rfile.read(max(length, 0)) or b"")
+        except (ValueError, RecursionError):
+            return self._send(400, json.dumps({"jsonrpc": "2.0", "id": None, "error": {
+                "code": -32700, "message": "parse error"}}).encode())
+        if isinstance(msg, list):
+            replies = [r for r in (_reply(m) for m in msg) if r is not None]
+        else:
+            replies = _reply(msg)
+        if not replies:
+            return self._send(202)
+        self._send(200, json.dumps(replies).encode())
+
+    def do_GET(self) -> None:
+        self._send(405, extra={"Allow": "POST"})
+
+    do_DELETE = do_GET
+
+
+def serve_http() -> None:
+    server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _Http)
+    server.daemon_threads = True
+    server.serve_forever()
+
+
 def main() -> None:
+    if sys.argv[1:] == ["--http"]:
+        serve_http()
+        return
     for line in sys.stdin:
         line = line.strip()
         if not line:

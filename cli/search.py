@@ -29,10 +29,12 @@ MCP gateway server ``search``; the gateway passes the caller's project and
 consumer on to it (CALLER_HEADER) and to no other server.
 
 Host state lives under ``~/.research-sandbox/search/`` (never mounted into a
-container): the "on" record, the searcher settings, and the long-lived Claude
-token (0600). The settings and the token reach the service over a `docker
-exec` stdin, into a tmpfs only root in the service reads, at every start and
-at every change.
+container): the "on" record, the searchers' settings, the long-lived Claude
+token (0600) and the VPN configuration (0600, it holds the tunnel's private
+key). The settings, the token and the VPN configuration reach the service
+over a `docker exec` stdin, into a tmpfs only root in the service reads, at
+every start and at every change; the VPN configuration goes on from there
+only to the service's VPN gateway, over stdin again.
 
 The lifecycle (on / off / status / resume at `research start`) lives in
 rscore; this module decides names, the container's exact shape, and the
@@ -41,6 +43,8 @@ contents of the files.
 
 from __future__ import annotations
 
+import base64
+import ipaddress
 import json
 import os
 import re
@@ -63,15 +67,22 @@ AGENT_IMAGE = "rs-search-agent:latest"
 # has a tier on runs one container of that image beside its agent.
 BROWSER_IMAGE = "rs-search-browser:latest"
 STEALTH_IMAGE = "rs-search-stealth:latest"
+# The VPN gateway's image (container/search/Dockerfile.vpn: WireGuard's tools,
+# iproute2 and iptables on Alpine), built and staged the same way. The service
+# runs one container of it while a VPN configuration is stored (the gateway
+# VPN searches route through), and one-shot containers of it that set a VPN
+# search's sidecars' route.
+VPN_IMAGE = "rs-search-vpn:latest"
 # Every search image the host builds from this tree, with its Dockerfile (in
 # container/search/); the service image is first (the others are staged into
 # it).
 SEARCH_DOCKERFILES = (("Dockerfile.service", SERVICE_IMAGE),
                       ("Dockerfile.agent", AGENT_IMAGE),
                       ("Dockerfile.browser", BROWSER_IMAGE),
-                      ("Dockerfile.stealth", STEALTH_IMAGE))
+                      ("Dockerfile.stealth", STEALTH_IMAGE),
+                      ("Dockerfile.vpn", VPN_IMAGE))
 # The built images staged into the service's inner Docker under the same names.
-STAGED_BUILT_IMAGES = (AGENT_IMAGE, BROWSER_IMAGE, STEALTH_IMAGE)
+STAGED_BUILT_IMAGES = (AGENT_IMAGE, BROWSER_IMAGE, STEALTH_IMAGE, VPN_IMAGE)
 # The service's inner Docker store (images, search volumes): kept at Turn off,
 # so turning the service on again does not stage the images again.
 DOCKER_VOLUME = "rs-search-docker"
@@ -117,6 +128,10 @@ PASS_CALLER_KEY = "pass_caller"
 SERVICE_RUN_DIR = "/run/rs-search"
 SETTINGS_FILE_NAME = "settings.json"
 TOKEN_FILE_NAME = "claude.env"
+# The VPN configuration as the service is handed it (service.py VPN_PATH —
+# MIRROR): over stdin into the same tmpfs, and from there only to the VPN
+# gateway container, over stdin again.
+VPN_FILE_NAME = "vpn.json"
 # The host's agent bundles, read-only, so each search agent runs the Claude
 # Code the operator pulled (a MIRROR of service.py AGENT_DIST_DIR).
 SERVICE_AGENT_DIST = "/opt/agent-dist"
@@ -142,6 +157,9 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DOTTED_RE = re.compile(r"^\d+(\.\d+){1,3}$")
 _CAMOUFOX_BROWSER_RE = re.compile(r"^\d+(\.\d+){1,3}-[a-z]+\.\d+$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+# An Alpine package's version with its release (1.0.20210914-r4): the VPN
+# gateway's packages are installed as `name=version`.
+_APK_VERSION_RE = re.compile(r"^\d+(\.\d+){1,3}-r\d+$")
 SIDECAR_PIN_KEYS = (
     ("NODE_VERSION", _DOTTED_RE, "not a Node version"),
     ("SEARCH_PLAYWRIGHT_MCP_VERSION", _DOTTED_RE, "not a Playwright tool server version"),
@@ -149,6 +167,11 @@ SIDECAR_PIN_KEYS = (
     ("CAMOUFOX_VERSION", _DOTTED_RE, "not a camoufox version"),
     ("CAMOUFOX_BROWSER_VERSION", _CAMOUFOX_BROWSER_RE, "not a camoufox browser version"),
     ("CAMOUFOX_BROWSER_SHA256", _SHA256_HEX_RE, "not a sha256 checksum"),
+    # The VPN gateway (Dockerfile.vpn): its Alpine base and its three packages.
+    ("SEARCH_VPN_ALPINE_VERSION", _DOTTED_RE, "not an Alpine version"),
+    ("SEARCH_VPN_WIREGUARD_TOOLS_VERSION", _APK_VERSION_RE, "not an Alpine package version"),
+    ("SEARCH_VPN_IPROUTE2_VERSION", _APK_VERSION_RE, "not an Alpine package version"),
+    ("SEARCH_VPN_IPTABLES_VERSION", _APK_VERSION_RE, "not an Alpine package version"),
 )
 _PIN_BAD = ("the search service's version setting ({key}) is {what}; under "
             "Host → Software, Use repo version on its row puts the value this "
@@ -166,7 +189,12 @@ SETTINGS_PATH = STATE_DIR / "settings.json"
 # search agent through `docker run --env-file`, never on a command line.
 TOKEN_PATH = STATE_DIR / "claude.env"
 TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
-# Serializes the two writers of the host files (settings, token) between the
+# The VPN configuration (WireGuard), normalized by RS from the provider's file
+# or the fields typed by hand, with the VPN server's address resolved once at
+# save (0600, like the token: it holds the tunnel's private key). Handed to
+# the service over stdin, never mounted, never on a command line.
+VPN_PATH = STATE_DIR / "vpn.json"
+# Serializes the writers of the host files (settings, token, VPN) between the
 # broker and the host command. One non-blocking attempt on the broker.
 LOCK_PATH = STATE_DIR / "settings.lock"
 # A setup-token is one line of letters, digits, `-` and `_` (sk-ant-oat01-…).
@@ -177,7 +205,10 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # --- the searcher ------------------------------------------------------------------
 
-SETTINGS_VERSION = 1
+# 2: a list of searchers, with searches at once beside them. A record of
+# version 1 (one `searcher`, which held `at_once`) reads as that one searcher.
+SETTINGS_VERSION = 2
+SETTINGS_VERSION_ONE_SEARCHER = 1
 # A searcher's name: what a caller names in its submit. The server-name rule
 # (a lowercase letter, then lowercase letters, digits and dashes).
 SEARCHER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -234,6 +265,9 @@ _CONTACT_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 # and the searcher tries them only after the plain tier failed. A settings
 # file saved before the setting existed reads as both on.
 TIER_NAMES = ("browser", "stealth")
+# What a searcher is: its name, model and effort, its browser tiers and
+# whether its searches reach sites through the VPN.
+SEARCHER_KEYS = ("name", "model", "effort", "tiers", "vpn")
 
 
 class SearchError(Exception):
@@ -338,6 +372,7 @@ def service_run_argv(*, dind_mode: str, dns: list[str], pins: dict[str, str],
              "-e", f"RS_SEARCH_AGENT_IMAGE={AGENT_IMAGE}",
              "-e", f"RS_SEARCH_BROWSER_IMAGE={BROWSER_IMAGE}",
              "-e", f"RS_SEARCH_STEALTH_IMAGE={STEALTH_IMAGE}",
+             "-e", f"RS_SEARCH_VPN_IMAGE={VPN_IMAGE}",
              "-e", f"RS_SEARCH_SEARXNG_IMAGE={inner_searxng_image(pins)}",
              f"--pids-limit={pids_limit}"]
     for s in dns:
@@ -389,12 +424,15 @@ def default_tiers() -> dict[str, bool]:
     return {t: True for t in TIER_NAMES}
 
 
+def default_searcher() -> dict[str, Any]:
+    return {"name": DEFAULT_SEARCHER_NAME, "model": DEFAULT_MODEL, "effort": DEFAULT_EFFORT,
+            "tiers": default_tiers(), "vpn": False}
+
+
 def default_settings() -> dict[str, Any]:
-    return {"version": SETTINGS_VERSION,
-            "searcher": {"name": DEFAULT_SEARCHER_NAME, "model": DEFAULT_MODEL,
-                         "effort": DEFAULT_EFFORT, "at_once": DEFAULT_AT_ONCE,
-                         "tiers": default_tiers()},
-            "contact": "", "recent": DEFAULT_RECENT, "sidebar": False}
+    return {"version": SETTINGS_VERSION, "searchers": [default_searcher()],
+            "at_once": DEFAULT_AT_ONCE, "contact": "", "recent": DEFAULT_RECENT,
+            "sidebar": False}
 
 
 def tiers_problem(value: Any) -> str | None:
@@ -441,39 +479,89 @@ def contact_problem(value: Any) -> str | None:
     return None
 
 
-def settings_problem(data: Any, model_ok) -> str | None:
-    """Why `data` is not a valid settings record, or None. `model_ok(model,
-    effort)` is the catalog's check (rscore passes it in: this module does
-    not import the model catalog). A record without `recent` or `sidebar`, or
-    a searcher without `tiers`, is valid: it was saved before that setting
-    existed (read_settings fills the default)."""
+SEARCHERS_EMPTY = "there must be at least one searcher"
+SEARCHERS_NO_NORMAL = ("at least one searcher must search from this installation's own "
+                       "address (not through the VPN)")
+SEARCHERS_NO_VPN = "store a VPN configuration under VPN first"
+
+
+def searchers_problem(value: Any, model_ok) -> str | None:
+    """Why `value` is not a valid list of searchers, or None: at least one,
+    each with every key of SEARCHER_KEYS, names of the name rule and each
+    once, at least one that does not search through the VPN, and a model and
+    effort the catalog offers (`model_ok`)."""
+    if not isinstance(value, list) or not value:
+        return SEARCHERS_EMPTY
+    names: list[str] = []
+    for s in value:
+        if not isinstance(s, dict) or set(s) != set(SEARCHER_KEYS):
+            return ("each searcher has a name, a model, an effort, its browser tiers "
+                    "and whether it searches through the VPN, and nothing else")
+        for problem in (searcher_name_problem(s["name"]), tiers_problem(s["tiers"])):
+            if problem:
+                return problem
+        if not isinstance(s["vpn"], bool):
+            return "a searcher either searches through the VPN or not"
+        if not isinstance(s["model"], str) or not isinstance(s["effort"], str):
+            return "a searcher's model and effort must be text"
+        problem = model_ok(s["model"], s["effort"])
+        if problem:
+            return f"the searcher {s['name']}: {problem}"
+        names.append(s["name"])
+    if len(set(names)) != len(names):
+        dup = next(n for n in names if names.count(n) > 1)
+        return f"two searchers are named {dup}; each searcher needs its own name"
+    if all(s["vpn"] for s in value):
+        return SEARCHERS_NO_NORMAL
+    return None
+
+
+def _from_one_searcher(data: Any) -> dict[str, Any] | None:
+    """A version-1 record (one `searcher` holding `at_once`, saved before the
+    list of searchers) as the version-2 shape, or None when it is not one RS
+    wrote. Its searcher keeps its fields and searches from this
+    installation's address; a searcher without `tiers`, a record without
+    `recent` or `sidebar` were saved before those settings existed."""
     if not isinstance(data, dict) \
             or set(data) - {"recent", "sidebar"} != {"version", "searcher", "contact"}:
+        return None
+    s = data["searcher"]
+    if not isinstance(s, dict) or set(s) - {"tiers"} != {"name", "model", "effort", "at_once"}:
+        return None
+    out = {"version": SETTINGS_VERSION,
+           "searchers": [{"name": s["name"], "model": s["model"], "effort": s["effort"],
+                          "tiers": s.get("tiers", default_tiers()), "vpn": False}],
+           "at_once": s["at_once"], "contact": data["contact"]}
+    for k in ("recent", "sidebar"):
+        if k in data:
+            out[k] = data[k]
+    return out
+
+
+def settings_problem(data: Any, model_ok) -> str | None:
+    """Why `data` (the version-2 shape) is not a valid settings record, or
+    None. `model_ok(model, effort)` is the catalog's check (rscore passes it
+    in: this module does not import the model catalog)."""
+    if not isinstance(data, dict) or set(data) != {"version", "searchers", "at_once",
+                                                   "contact", "recent", "sidebar"}:
         return "it does not have the expected shape"
     if data["version"] != SETTINGS_VERSION or isinstance(data["version"], bool):
         return "it was written by another version of RS"
-    s = data["searcher"]
-    if not isinstance(s, dict) or set(s) - {"tiers"} != {"name", "model", "effort", "at_once"}:
-        return "its searcher does not have the expected shape"
-    for problem in (searcher_name_problem(s["name"]), at_once_problem(s["at_once"]),
-                    tiers_problem(s["tiers"]) if "tiers" in s else None,
-                    contact_problem(data["contact"]),
-                    recent_problem(data["recent"]) if "recent" in data else None,
-                    sidebar_problem(data["sidebar"]) if "sidebar" in data else None):
+    for problem in (at_once_problem(data["at_once"]), contact_problem(data["contact"]),
+                    recent_problem(data["recent"]), sidebar_problem(data["sidebar"])):
         if problem:
             return problem
-    if not isinstance(s["model"], str) or not isinstance(s["effort"], str):
-        return "its model and effort must be text"
-    return model_ok(s["model"], s["effort"])
+    return searchers_problem(data["searchers"], model_ok)
 
 
 SETTINGS_DAMAGED = ("the search settings kept on the host cannot be used ({why}); "
-                    "save the searcher again on the Search page to replace them")
+                    "save the searchers again on the Search page to replace them")
 
 
 def read_settings(model_ok, path: Path | None = None) -> dict[str, Any]:
-    """The settings (the defaults when none were saved). SearchError when the
-    file is there but unreadable or not one RS wrote."""
+    """The settings (the defaults when none were saved), in the version-2
+    shape: a record saved with one searcher reads as that searcher. SearchError
+    when the file is there but unreadable or not one RS wrote."""
     path = SETTINGS_PATH if path is None else path
     try:
         raw = path.read_bytes()
@@ -486,20 +574,32 @@ def read_settings(model_ok, path: Path | None = None) -> dict[str, Any]:
         data = json.loads(raw)
     except (ValueError, RecursionError):
         raise SearchError(SETTINGS_DAMAGED.format(why="it is not valid JSON")) from None
+    if isinstance(data, dict) and data.get("version") == SETTINGS_VERSION_ONE_SEARCHER \
+            and not isinstance(data.get("version"), bool):
+        converted = _from_one_searcher(data)
+        if converted is None:
+            raise SearchError(SETTINGS_DAMAGED.format(
+                why="its searcher does not have the expected shape"))
+        converted.setdefault("recent", DEFAULT_RECENT)  # saved before the setting existed
+        converted.setdefault("sidebar", False)          # likewise
+        data = converted
     problem = settings_problem(data, model_ok)
     if problem:
         raise SearchError(SETTINGS_DAMAGED.format(why=problem))
-    data.setdefault("recent", DEFAULT_RECENT)       # saved before the setting existed
-    data.setdefault("sidebar", False)               # likewise
-    data["searcher"].setdefault("tiers", default_tiers())     # likewise
     return data
 
 
+def first_normal_searcher(data: dict[str, Any]) -> dict[str, Any]:
+    """The searcher a question goes to when none is named: the first one
+    that does not search through the VPN (a valid record has one)."""
+    return next(s for s in data["searchers"] if not s["vpn"])
+
+
 def service_settings(data: dict[str, Any]) -> dict[str, Any]:
-    """What the service is handed: the settings with the contact filled (the
-    searcher carries its `tiers`, filled by read_settings)."""
-    return {"version": SETTINGS_VERSION, "searcher": dict(data["searcher"]),
-            "contact": data["contact"] or GENERIC_CONTACT, "recent": data["recent"]}
+    """What the service is handed: the settings with the contact filled."""
+    return {"version": SETTINGS_VERSION, "searchers": [dict(s) for s in data["searchers"]],
+            "at_once": data["at_once"], "contact": data["contact"] or GENERIC_CONTACT,
+            "recent": data["recent"]}
 
 
 # --- host files ------------------------------------------------------------------
@@ -587,3 +687,356 @@ def set_on(on: bool, path: Path | None = None) -> None:
             path.unlink()
         except FileNotFoundError:
             pass
+
+
+# --- the VPN configuration (WireGuard) ---------------------------------------------
+# The operator pastes the configuration file their VPN provider gives, or
+# types its fields by hand; both become ONE normalized configuration, checked
+# here (pure). The host resolves the VPN server's name once, at save
+# (rscore), and stores the result in VPN_PATH (0600). What RS applies is
+# IPv4 only (the service's networks are IPv4): an IPv6 address, resolver or
+# allowed range is kept out and the status says so.
+
+VPN_RECORD_VERSION = 1
+# The lines of a configuration file RS reads, per section (WireGuard reads
+# key names without regard to case), and the ones that may repeat (their
+# values add up, as wg-quick reads them).
+_VPN_INTERFACE_KEYS = {"privatekey": "PrivateKey", "address": "Address", "dns": "DNS",
+                       "listenport": "ListenPort", "mtu": "MTU"}
+_VPN_PEER_KEYS = {"publickey": "PublicKey", "endpoint": "Endpoint", "allowedips": "AllowedIPs",
+                  "presharedkey": "PresharedKey", "persistentkeepalive": "PersistentKeepalive"}
+_VPN_LIST_KEYS = ("Address", "DNS", "AllowedIPs")
+# wg-quick's lines that run commands or change the host's routing or files:
+# RS runs none of them, and refuses a configuration that has one rather than
+# quietly leaving it out.
+_VPN_REFUSED_KEYS = {"preup": "PreUp", "postup": "PostUp", "predown": "PreDown",
+                     "postdown": "PostDown", "table": "Table", "saveconfig": "SaveConfig"}
+# The manual form's fields, each to the configuration file's line it fills;
+# the last two may be left empty.
+VPN_MANUAL_FIELDS = {"private_key": "PrivateKey", "address": "Address", "dns": "DNS",
+                     "public_key": "PublicKey", "endpoint": "Endpoint",
+                     "allowed_ips": "AllowedIPs", "preshared_key": "PresharedKey",
+                     "keepalive": "PersistentKeepalive"}
+VPN_MANUAL_OPTIONAL = ("preshared_key", "keepalive")
+# What the operator sees each field called.
+_VPN_SHOWN = {"PrivateKey": "the private key", "Address": "the address", "DNS": "the DNS",
+              "PublicKey": "the server's public key", "Endpoint": "the endpoint",
+              "AllowedIPs": "the allowed addresses", "PresharedKey": "the preshared key",
+              "PersistentKeepalive": "the keepalive", "ListenPort": "the listen port",
+              "MTU": "the MTU", "EndpointPort": "the endpoint's port"}
+# A port and a keepalive interval are 16-bit numbers in WireGuard (the
+# kernel's own bounds); an MTU is any positive number the kernel takes (it
+# refuses one out of its range when the tunnel is set up, and the status
+# says so).
+_PORT_MAX = 65535
+_KEEPALIVE_MAX = 65535
+# A WireGuard key: base64 of exactly 32 bytes.
+_WG_KEY_BYTES = 32
+_WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
+# The VPN server's name: DNS labels (letters, digits, dashes), or an IPv4
+# address.
+_ENDPOINT_HOST_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+                               r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+# A line's name as WireGuard spells one (quoted back in a refusal only then).
+_VPN_LINE_NAME_RE = re.compile(r"^[A-Za-z]{1,40}$")
+VPN_IPV6_NOTE = ("the configuration's IPv6 parts ({parts}) are not used: the search "
+                 "service's networks are IPv4 only")
+VPN_NO_DNS = ("the configuration names no IPv4 DNS server; a VPN search resolves names "
+              "only through the tunnel, so RS needs one (the DNS line your VPN provider "
+              "gives)")
+VPN_DAMAGED = ("the VPN configuration kept on the host is not one RS wrote, so it was "
+               "not used; store it again under VPN")
+
+
+def _vpn_key_problem(field: str, value: str) -> str | None:
+    if not _WG_KEY_RE.match(value):
+        return (f"{_VPN_SHOWN[field]} is not a WireGuard key (44 characters of base64 "
+                "that stand for 32 bytes)")
+    try:
+        if len(base64.b64decode(value, validate=True)) != _WG_KEY_BYTES:
+            raise ValueError
+    except ValueError:
+        return (f"{_VPN_SHOWN[field]} is not a WireGuard key (44 characters of base64 "
+                "that stand for 32 bytes)")
+    return None
+
+
+def _vpn_items(value: str) -> list[str]:
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _vpn_int(field: str, value: str, low: int, high: int | None) -> int:
+    if not value.isascii() or not value.isdigit() or str(int(value)) != value \
+            or int(value) < low or (high is not None and int(value) > high):
+        bound = f"from {low} to {high}" if high is not None else f"of at least {low}"
+        raise SearchError(f"{_VPN_SHOWN[field]} must be a whole number {bound}")
+    return int(value)
+
+
+def _vpn_normalize(fields: dict[str, str]) -> dict[str, Any]:
+    """The one normalized configuration from the configuration file's values
+    (each a string; a repeated line's values joined by commas). SearchError
+    in plain words on the first problem."""
+    if not fields.get("DNS"):
+        raise SearchError(VPN_NO_DNS)
+    missing = [_VPN_SHOWN[k] for k in ("PrivateKey", "Address", "PublicKey",
+                                        "Endpoint", "AllowedIPs") if not fields.get(k)]
+    if missing:
+        raise SearchError("the VPN configuration needs " + ", ".join(missing))
+    for k in ("PrivateKey", "PublicKey", "PresharedKey"):
+        if fields.get(k):
+            problem = _vpn_key_problem(k, fields[k])
+            if problem:
+                raise SearchError(problem)
+    ipv6: list[str] = []
+    addresses = []
+    for a in _vpn_items(fields["Address"]):
+        try:
+            iface = ipaddress.ip_interface(a)
+        except ValueError:
+            raise SearchError(f"the address {a} is not an IP address with its prefix "
+                              "(as in 10.64.0.2/32)") from None
+        if iface.version == 6:
+            ipv6.append(a)
+        else:
+            addresses.append(str(iface))
+    if not addresses:
+        raise SearchError("the configuration has no IPv4 address for the tunnel; the "
+                          "search service's networks are IPv4 only")
+    dns = []
+    for d in _vpn_items(fields["DNS"]):
+        try:
+            ip = ipaddress.ip_address(d)
+        except ValueError:
+            raise SearchError(f"the DNS entry {d} is not an IP address (RS uses only "
+                              "the DNS servers, no search domains)") from None
+        if ip.version == 6:
+            ipv6.append(d)
+        elif str(ip) not in dns:
+            dns.append(str(ip))
+    if not dns:
+        raise SearchError(VPN_NO_DNS)
+    allowed = []
+    for n in _vpn_items(fields["AllowedIPs"]):
+        try:
+            net = ipaddress.ip_network(n, strict=False)
+        except ValueError:
+            raise SearchError(f"the allowed address {n} is not an address range (as in "
+                              "0.0.0.0/0)") from None
+        if net.version == 6:
+            ipv6.append(n)
+        elif str(net) not in allowed:
+            allowed.append(str(net))
+    if not allowed:
+        raise SearchError("the allowed addresses hold no IPv4 range, so no search could "
+                          "pass the tunnel")
+    for d in dns:
+        if not any(ipaddress.ip_address(d) in ipaddress.ip_network(n) for n in allowed):
+            raise SearchError(f"the DNS server {d} is outside the allowed addresses, so "
+                              "it cannot be reached through the tunnel")
+    endpoint = fields["Endpoint"]
+    if endpoint.startswith("["):
+        raise SearchError("the endpoint is an IPv6 address; RS reaches the VPN server "
+                          "over IPv4 only (its name or its IPv4 address)")
+    host, sep, port = endpoint.rpartition(":")
+    if not sep or not _ENDPOINT_HOST_RE.match(host):
+        raise SearchError("the endpoint is the VPN server's name or IPv4 address and its "
+                          "port, as in vpn.example.net:51820")
+    port_n = _vpn_int("EndpointPort", port, 1, _PORT_MAX)
+    keepalive = None
+    ka = fields.get("PersistentKeepalive", "")
+    if ka and ka.lower() != "off":
+        keepalive = _vpn_int("PersistentKeepalive", ka, 0, _KEEPALIVE_MAX) or None
+    listen = fields.get("ListenPort")
+    mtu = fields.get("MTU")
+    return {"version": VPN_RECORD_VERSION,
+            "private_key": fields["PrivateKey"], "addresses": addresses, "dns": dns,
+            "listen_port": _vpn_int("ListenPort", listen, 1, _PORT_MAX) if listen else None,
+            "mtu": _vpn_int("MTU", mtu, 1, None) if mtu else None,
+            "public_key": fields["PublicKey"], "preshared_key": fields.get("PresharedKey") or None,
+            "endpoint_host": host.lower(), "endpoint_port": port_n,
+            "allowed_ips": allowed, "keepalive": keepalive, "ipv6_ignored": ipv6}
+
+
+def parse_vpn_file(text: Any) -> dict[str, Any]:
+    """A WireGuard configuration file, as a VPN provider gives it, as the one
+    normalized configuration (without the resolved endpoint address).
+    SearchError in plain words."""
+    if not isinstance(text, str) or not text.strip():
+        raise SearchError("the configuration file is empty")
+    section = None
+    seen: dict[str, int] = {}
+    iface: dict[str, list[str]] = {}
+    peer: dict[str, list[str]] = {}
+    refused: list[str] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            if section not in ("interface", "peer"):
+                raise SearchError("the configuration has a section other than [Interface] "
+                                  "and [Peer]")
+            seen[section] = seen.get(section, 0) + 1
+            if seen[section] > 1:
+                raise SearchError("RS uses one VPN server: the configuration needs exactly "
+                                  "one [Peer] section" if section == "peer" else
+                                  "the configuration needs exactly one [Interface] section")
+            continue
+        key, eq, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not eq or not key:
+            # The line itself is never quoted: it could hold a key.
+            raise SearchError("the configuration has a line that is neither a setting "
+                              "(name = value) nor a section")
+        lk = key.lower()
+        if lk in _VPN_REFUSED_KEYS:
+            if _VPN_REFUSED_KEYS[lk] not in refused:
+                refused.append(_VPN_REFUSED_KEYS[lk])
+            continue
+        if section is None:
+            raise SearchError("the configuration has settings before its [Interface] section")
+        known = _VPN_INTERFACE_KEYS if section == "interface" else _VPN_PEER_KEYS
+        if lk not in known:
+            # The name is quoted only when it is a name: a key line that lost
+            # its `=` splits at the key's own padding.
+            raise SearchError(f"the configuration's [{section.capitalize()}] section has a "
+                              "line RS does not use"
+                              + (f" ({key}); remove it" if _VPN_LINE_NAME_RE.match(key)
+                                 else "; remove it"))
+        name = known[lk]
+        target = iface if section == "interface" else peer
+        if name in target and name not in _VPN_LIST_KEYS:
+            raise SearchError(f"the configuration has the {name} line twice")
+        target.setdefault(name, []).append(value)
+    if refused:
+        raise SearchError("RS does not run commands from a VPN configuration: remove the "
+                          + ", ".join(refused) + (" lines" if len(refused) > 1 else " line"))
+    if seen.get("interface", 0) != 1:
+        raise SearchError("the configuration needs exactly one [Interface] section")
+    if seen.get("peer", 0) != 1:
+        raise SearchError("RS uses one VPN server: the configuration needs exactly one "
+                          "[Peer] section")
+    fields = {k: ", ".join(v) for k, v in {**iface, **peer}.items()}
+    return _vpn_normalize(fields)
+
+
+def parse_vpn_manual(value: Any) -> dict[str, Any]:
+    """The manual form's fields (VPN_MANUAL_FIELDS; each a text, the address,
+    DNS and allowed addresses also a list of texts, the keepalive also a
+    number) as the one normalized configuration. SearchError in plain words."""
+    if not isinstance(value, dict):
+        raise SearchError("the VPN fields did not arrive as RS sends them")
+    unknown = sorted(set(value) - set(VPN_MANUAL_FIELDS))
+    if unknown:
+        raise SearchError(f"the VPN fields have one RS does not use ({unknown[0]})")
+    fields: dict[str, str] = {}
+    for key, line in VPN_MANUAL_FIELDS.items():
+        v = value.get(key)
+        if v is None or v == "":
+            if key in VPN_MANUAL_OPTIONAL or key not in value:
+                continue
+            v = ""
+        if key == "keepalive" and isinstance(v, int) and not isinstance(v, bool):
+            v = str(v)
+        if isinstance(v, list) and line in _VPN_LIST_KEYS \
+                and all(isinstance(x, str) for x in v):
+            v = ", ".join(v)
+        if not isinstance(v, str):
+            raise SearchError(f"{_VPN_SHOWN[line]} must be text")
+        if "\n" in v or "\r" in v:
+            raise SearchError(f"{_VPN_SHOWN[line]} must be one line")
+        if v.strip():
+            fields[line] = v.strip()
+    return _vpn_normalize(fields)
+
+
+def vpn_record_problem(data: Any) -> str | None:
+    """Why `data` is not a VPN record RS wrote (the normalized configuration
+    with its resolved `endpoint_ip`), or None."""
+    keys = {"version", "private_key", "addresses", "dns", "listen_port", "mtu", "public_key",
+            "preshared_key", "endpoint_host", "endpoint_port", "allowed_ips", "keepalive",
+            "ipv6_ignored", "endpoint_ip"}
+    if not isinstance(data, dict) or set(data) != keys \
+            or data["version"] != VPN_RECORD_VERSION or isinstance(data["version"], bool):
+        return "it does not have the expected shape"
+    try:
+        fields = {"PrivateKey": data["private_key"], "PublicKey": data["public_key"],
+                  "Address": ", ".join(data["addresses"]), "DNS": ", ".join(data["dns"]),
+                  "AllowedIPs": ", ".join(data["allowed_ips"]),
+                  "Endpoint": f"{data['endpoint_host']}:{data['endpoint_port']}"}
+        for k, line in (("preshared_key", "PresharedKey"), ("keepalive", "PersistentKeepalive"),
+                        ("listen_port", "ListenPort"), ("mtu", "MTU")):
+            if data[k] is not None:
+                fields[line] = str(data[k])
+        again = _vpn_normalize(fields)
+        ipaddress.IPv4Address(data["endpoint_ip"])
+    except (SearchError, TypeError, ValueError, AttributeError):
+        return "its values are not ones RS checked"
+    if not (isinstance(data["ipv6_ignored"], list)
+            and all(isinstance(x, str) for x in data["ipv6_ignored"])):
+        return "it does not have the expected shape"
+    if {k: v for k, v in again.items() if k != "ipv6_ignored"} != \
+            {k: v for k, v in data.items() if k not in ("ipv6_ignored", "endpoint_ip")}:
+        return "its values are not ones RS checked"
+    return None
+
+
+def read_vpn_file(path: Path | None = None) -> dict[str, Any] | None:
+    """The stored VPN configuration, or None when none is stored. SearchError
+    when the file is there but not one RS wrote."""
+    path = VPN_PATH if path is None else path
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise SearchError(VPN_DAMAGED) from None
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise SearchError(VPN_DAMAGED) from None
+    if vpn_record_problem(data):
+        raise SearchError(VPN_DAMAGED)
+    return data
+
+
+def write_vpn_file(record: dict[str, Any], path: Path | None = None) -> None:
+    """Raises OSError (the caller words it). 0600, through a fresh temp."""
+    _write_atomic(VPN_PATH if path is None else path,
+                  json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+def clear_vpn_file(path: Path | None = None) -> None:
+    path = VPN_PATH if path is None else path
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def vpn_destination(record: dict[str, Any]) -> tuple[str, int]:
+    """The service's router destination for the tunnel: (address, UDP port)."""
+    return record["endpoint_ip"], record["endpoint_port"]
+
+
+def vpn_public(record: dict[str, Any] | None) -> dict[str, Any]:
+    """What may be shown of a stored configuration (never a key)."""
+    if record is None:
+        return {"configured": False, "endpoint": None, "endpoint_ip": None, "address": None,
+                "dns": [], "note": None}
+    return {"configured": True,
+            "endpoint": f"{record['endpoint_host']}:{record['endpoint_port']}",
+            "endpoint_ip": record["endpoint_ip"], "address": ", ".join(record["addresses"]),
+            "dns": list(record["dns"]),
+            "note": (VPN_IPV6_NOTE.format(parts=", ".join(record["ipv6_ignored"]))
+                     if record["ipv6_ignored"] else None)}
+
+
+def vpn_service_record(record: dict[str, Any]) -> dict[str, Any]:
+    """What the service is handed: what the gateway applies (the server by
+    its resolved address; IPv4 parts only)."""
+    return {k: record[k] for k in ("version", "private_key", "addresses", "dns", "listen_port",
+                                   "mtu", "public_key", "preshared_key", "endpoint_ip",
+                                   "endpoint_port", "allowed_ips", "keepalive")}

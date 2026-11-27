@@ -659,6 +659,29 @@ def _verb_search_settings_set(args: dict, _progress=None) -> dict:
     return rscore.search_settings_set(req, blocking=False, deadline=deadline)
 
 
+def _verb_search_vpn(_args: dict, _progress=None) -> dict:
+    """The VPN: the stored configuration's public parts and the tunnel's
+    state (never a key)."""
+    return rscore.search_vpn(rscore._mcp_deadline())
+
+
+def _verb_search_vpn_set(args: dict, _progress=None) -> dict:
+    """Store the VPN configuration (field `config`, the provider's file, or
+    `manual`, its fields) and bring the service's tunnel up with it."""
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    safe = {k: v for k, v in args.items() if k in SEARCH_VPN_WEBUI_FIELDS}
+    req = rscore.SearchVpnRequest.from_kwargs(**safe)
+    return rscore.search_vpn_set(req, blocking=False, deadline=deadline)
+
+
+def _verb_search_vpn_clear(_args: dict, _progress=None) -> dict:
+    """Remove the VPN configuration (refused while a VPN searcher exists)."""
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    return rscore.search_vpn_clear(blocking=False, deadline=deadline)
+
+
 def _verb_search_clear(_args: dict, _progress=None) -> dict:
     """The operator's clear: every ended, uncollected search goes, by name."""
     deadline = rscore._mcp_deadline()
@@ -704,7 +727,8 @@ def _verb_search_test(_args: dict, _progress=None) -> dict:
 
 def _verb_search_ask(args: dict, _progress=None) -> dict:
     """The operator's question (Quick Search): a search in the same queue as the
-    agents' (fields `question`, `conversation`, `include`)."""
+    agents' (fields `question`, `conversation`, `include`, and optionally
+    `searcher`)."""
     deadline = rscore._mcp_deadline()
     _search_not_turning_on()
     safe = {k: v for k, v in args.items() if k in SEARCH_ASK_WEBUI_FIELDS}
@@ -1613,15 +1637,21 @@ MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 # The search service's sign-in: the long-lived token `claude setup-token`
 # prints (a SECRET: repr=False on the request, never in a result or a log).
 SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
-# The one searcher and the contact address, saved whole.
-SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact",
-                                          "recent", "sidebar", "tiers"})
+# The searchers (each its name, model, effort, browser tiers and VPN flag),
+# searches at once, the contact address, the recent list and the sidebar
+# switch, saved whole.
+SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"searchers", "at_once", "contact", "recent",
+                                          "sidebar"})
+# The VPN configuration: the provider's file as text, OR its fields typed by
+# hand (an object). Both hold the tunnel's private key (a SECRET: repr=False
+# on the request, never in a result or a log).
+SEARCH_VPN_WEBUI_FIELDS = frozenset({"config", "manual"})
 # One search in the service (view, report, stop), or one kept conversation,
 # by its id.
 SEARCH_ID_WEBUI_FIELDS = frozenset({"id"})
 # The operator's question from the Search page: the text, the conversation it
 # continues (or null for a new one), and whether to include that conversation.
-SEARCH_ASK_WEBUI_FIELDS = frozenset({"question", "conversation", "include"})
+SEARCH_ASK_WEBUI_FIELDS = frozenset({"question", "conversation", "include", "searcher"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # Put one version pin back to the shipped value (the Host → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
@@ -1894,6 +1924,9 @@ VERBS = {
     "search_token_clear": _verb_search_token_clear,
     "search_settings": _verb_search_settings,
     "search_settings_set": _verb_search_settings_set,
+    "search_vpn": _verb_search_vpn,
+    "search_vpn_set": _verb_search_vpn_set,
+    "search_vpn_clear": _verb_search_vpn_clear,
     "search_clear": _verb_search_clear,
     "search_list": _verb_search_list,
     "search_view": _verb_search_view,
