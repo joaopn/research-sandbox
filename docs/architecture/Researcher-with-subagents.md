@@ -104,6 +104,12 @@ The planning session changes a charter through the memory command, which journal
 
 The project's front page gains a **Packages** section: one line per package with its state, what waits there, what it has in flight and its latest logbook entry, each linking the package's own front page. Turning the planner on is always allowed: the top memory and record become the planning session's. Turning it off is refused while any package is open, naming each; RS reads the packages' status files from the project's folder itself, so the refusal holds for a stopped project too.
 
+## In the browser
+
+The three settings sit in one box, in the New Project window and in the project's ⚙ → Workflow section (shown only for this project type, Claude and pi projects alike). Beside them the browser draws the workflow they make, composed from one part per setting (one session or a planning session over one work session per package; analysts fanning out from each working session; a re-run and referee step on the staged findings or on every result), and shows the matching row of what each setting is good for. A create sends the settings that differ from the defaults; ⚙'s Apply sends only the settings that changed, as an update of their own, which writes the agent's instructions again without a restart.
+
+**The planner lock.** With the planner on, ⚙ asks the broker once, as it opens, for the project's packages (`project_packages`, a token-gated read behind `GET /broker/project/<name>/packages`). It walks the same status files as the refusal, through the same descriptor-based reader that never follows a link and reads only small plain files, and answers each package's name, state and whether a holder is recorded; a recorded holder is reported as such, since whether its agent still runs cannot be seen from the host. The read stops after 200 entries of `packages/` and says so, and cuts a name past 64 characters. While a package is open, or RS cannot read one, the browser disables Off with the reason; the save itself is still checked by the update, so a package opened after the window opened is refused there.
+
 ## The planning session and the work sessions
 
 With the planner on, a session takes a **role**: the planning session, which holds the project's top, or a work session, which holds one package. Each role is a skill installed into the project's agents, and each skill has a shortcut typed in the project's terminal.
@@ -154,6 +160,10 @@ Under Claude the referee runs the model set for the whole installation in **Host
 **Checks off says so, it does not hide it.** A finding accepted unchecked carries that on its record entry and its pages, so the record never reads as checked when it was not. The cost is a line of text the user sees on every such entry.
 
 **The agent can switch its own session.** The memory command records what the agent tells it, as it already accepts a claim when the agent says the user did; both rest on the agent's instruction to act only on the user's word. A project can weaken only its own checks this way.
+
+**The drawing is composed, not chosen.** Each setting adds or changes its own part of the drawing, so twelve combinations need no twelve pictures, and a new value of one setting changes one part. The cost is a plainer drawing than a hand-made one per case.
+
+**The planner lock is a convenience; the update is the check.** The browser reads the packages once when the window opens and never polls; the update re-reads them before it writes. The cost is that a package opened meanwhile shows up only as a refused save.
 
 **Packages are folders of the same layout.** A package is one researcher's folder, as the top is, so its pages, memory and checks are the ones already built; the cost is that ids repeat across packages (each has its `F-1`), and the project's front page names the package beside each.
 
