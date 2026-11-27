@@ -6049,7 +6049,7 @@ def build_parser() -> argparse.ArgumentParser:
 # package verbs check who runs them themselves.
 WRITE_VERBS = (cmd_note, cmd_checkpoint, cmd_claim, cmd_amend, cmd_rerun_command, cmd_rerun,
                cmd_referee, cmd_check, cmd_accept, cmd_strike, cmd_log, cmd_skill_propose,
-               cmd_skill_used, cmd_skill_promote, cmd_skill_retire, cmd_skill_sync, cmd_job_add,
+               cmd_skill_used, cmd_skill_promote, cmd_skill_retire, cmd_job_add,
                cmd_job_done)
 
 
