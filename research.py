@@ -3872,7 +3872,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="(a server RS runs) a secret environment setting whose "
                             "value is one line read from stdin, after the "
                             "--header-stdin lines (repeatable)")
-        p.add_argument("--destination", action="append", metavar="HOST:PORT",
+        p.add_argument("--destination", action="append", metavar="HOST:PORT[/udp]",
                        help="(a server RS runs) a place on the local network or this "
                             "machine it may reach (repeatable"
                             + ("" if add else "; replaces the destinations") + ")")

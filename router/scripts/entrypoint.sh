@@ -50,9 +50,13 @@ if [ -d "$RULES_DIR" ] && [ "$(ls -A "$RULES_DIR" 2>/dev/null)" ]; then
                 SUBNET=$(awk '{print $1}' "$rulefile")
                 IP=$(awk '{print $2}' "$rulefile")
                 PORT=$(awk '{print $3}' "$rulefile")
+                # Fourth field: the protocol (absent on a record written
+                # before protocols were recorded — such a record is TCP).
+                PROTO=$(awk '{print $4}' "$rulefile")
+                PROTO="${PROTO:-tcp}"
                 if [ -n "$SUBNET" ] && [ -n "$IP" ] && [ -n "$PORT" ]; then
-                    echo "  mcp $SUBNET -> $IP:$PORT"
-                    /scripts/mcp-allow.sh "$SUBNET" "$IP" "$PORT" \
+                    echo "  mcp $SUBNET -> $IP:$PORT/$PROTO"
+                    /scripts/mcp-allow.sh "$SUBNET" "$IP" "$PORT" "$PROTO" \
                         || echo "WARNING: replay of $rulefile failed" >&2
                 fi
                 ;;

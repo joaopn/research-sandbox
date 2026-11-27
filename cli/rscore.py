@@ -21825,7 +21825,7 @@ def _mcp_run_resolve(destinations: list) -> dict:
     router's allow is by address)."""
     resolved = {}
     for dest in destinations:
-        host, _port = mcp_run.split_destination(dest)
+        host, _port, _proto = mcp_run.split_destination(dest)
         try:
             resolved[dest] = _resolve_mcp_host(host)
         except (OSError, UnicodeError):
@@ -21872,9 +21872,9 @@ def _mcp_run_router_rules(name: str, run_: dict, network: str) -> None:
         apply_firewall_rules(network, "locked", resolvers)
         subnet = get_network_subnet(network)
         for dest in run_["destinations"]:
-            _host, port = mcp_run.split_destination(dest)
+            _host, port, proto = mcp_run.split_destination(dest)
             run_check(["docker", "exec", ROUTER_CONTAINER, "/scripts/mcp-allow.sh",
-                       subnet, run_["resolved"][dest], str(port)])
+                       subnet, run_["resolved"][dest], str(port), proto])
     except SystemExit:
         raise mcp_run.RunError(f"the egress rules of the MCP server {name} could not "
                                "be set on RS's router (the operation's log has the "
@@ -25016,8 +25016,9 @@ def _allow_mcp_for_project(project: str, cfg: "Config", mcp_name: str,
 
     network = project_network_for(project)
     subnet = get_network_subnet(network)
+    # A registered MCP is served over HTTP: its allow is TCP (as its deny).
     r = run(["docker", "exec", ROUTER_CONTAINER,
-             "/scripts/mcp-allow.sh", subnet, ip, str(port)],
+             "/scripts/mcp-allow.sh", subnet, ip, str(port), "tcp"],
             capture_output=True)
     if r.returncode != 0:
         return False, (r.stderr or r.stdout).strip() or "mcp-allow.sh failed"
@@ -25064,7 +25065,7 @@ def _deny_mcp_for_project(project: str, cfg: "Config", mcp_name: str,
         subnet = get_network_subnet(network)
         run(["docker", "exec", ROUTER_CONTAINER,
              "/scripts/mcp-deny.sh", subnet,
-             str(target.get("ip", "")), str(target.get("port", ""))],
+             str(target.get("ip", "")), str(target.get("port", "")), "tcp"],
             capture_output=True)
 
     allowlist = [e for e in allowlist if e.get("name") != mcp_name]

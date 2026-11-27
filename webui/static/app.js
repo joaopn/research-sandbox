@@ -3118,7 +3118,8 @@ const MCP_RUN_PACKAGE_UPDATE_TITLE = "Installing the package again for the MCP s
 // How a package server's registry is shown.
 const MCP_RUN_REGISTRY_TEXT = { npm: "npm", pypi: "PyPI" };
 const MCP_RUN_DEST_HINT = "One host:port per line, on your network or this machine, "
-    + "for example db.lab.example:5432. Without any, the server reaches only the "
+    + "for example db.lab.example:5432 (add /udp for a UDP port, as in "
+    + "vpn.example:51820/udp). Without any, the server reaches only the "
     + "internet, on the web ports (80 and 443).";
 
 // The Add dialog's kind switch (both forms carry one).

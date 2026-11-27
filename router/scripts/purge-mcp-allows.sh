@@ -26,13 +26,17 @@ fi
 # Matched on the record's content (its first field is the subnet the host
 # passed to mcp-allow.sh), never on the filename token. The record goes first:
 # a kill after it leaves only a live rule, which no router restart replays.
+# Both protocols' rules go, whatever the record's fourth field says (a record
+# without one is TCP); the sweep below takes anything else on the range.
 for f in /etc/sandbox/rules/mcp-*; do
     [ -f "$f" ] || continue
     read -r s ip port rest < "$f" || true
     [ "$s" = "$SUBNET" ] || continue
     rm -f "$f"
     if [ -n "$ip" ] && [ -n "$port" ]; then
-        while iptables -D FORWARD -s "$SUBNET" -d "$ip" -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do :; done
+        for proto in tcp udp; do
+            while iptables -D FORWARD -s "$SUBNET" -d "$ip" -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do :; done
+        done
     fi
 done
 

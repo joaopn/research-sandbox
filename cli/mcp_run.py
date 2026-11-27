@@ -303,6 +303,10 @@ PINNED_RE = re.compile(
 # A destination host: an IPv4 literal or a DNS name (letters, digits, dots
 # and dashes; no leading or trailing dot or dash).
 _HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
+# A destination's protocol, as RS's router opens it (router/scripts/mcp-allow.sh
+# takes the same two words); a destination that names none is TCP.
+PROTOCOLS = ("tcp", "udp")
+DEFAULT_PROTOCOL = "tcp"
 RUN_KEYS = frozenset({"image", "digest", "args", "port", "path", "data",
                       "settings", "destinations", "resolved", "stopped"})
 RUN_REQUIRED = RUN_KEYS - {"data"}
@@ -400,27 +404,36 @@ def settings_problem(settings: Any) -> str | None:
     return None
 
 
-def split_destination(dest: Any) -> tuple[str, int] | None:
-    """(host, port) of a `host:port` destination, or None."""
+def split_destination(dest: Any) -> tuple[str, int, str] | None:
+    """(host, port, protocol) of a `host:port` destination (TCP, the form every
+    entry saved before protocols has), a `host:port/tcp` or a `host:port/udp`
+    one, or None."""
     if not isinstance(dest, str):
         return None
-    host, sep, port = dest.rpartition(":")
+    address, slash, proto = dest.partition("/")
+    if not slash:
+        proto = DEFAULT_PROTOCOL
+    elif proto not in PROTOCOLS:
+        return None
+    host, sep, port = address.rpartition(":")
     if not sep or not _HOST_RE.fullmatch(host) or not port.isascii() or not port.isdigit():
         return None
     n = int(port)
     if not 1 <= n <= 65535 or str(n) != port:
         return None
-    return host, n
+    return host, n, proto
 
 
 def destinations_problem(dests: Any) -> str | None:
     if not isinstance(dests, list):
         return "the destinations must be a list of host:port"
-    for d in dests:
-        if split_destination(d) is None:
-            return ("a destination is a host name or IPv4 address and a port, "
-                    "as in db.lab.example:5432")
-    if len(set(dests)) != len(dests):
+    parts = [split_destination(d) for d in dests]
+    if None in parts:
+        return ("a destination is a host name or IPv4 address and a port, "
+                "optionally followed by /udp, as in db.lab.example:5432 or "
+                "vpn.example:51820/udp")
+    # host:port and host:port/tcp are the same destination.
+    if len(set(parts)) != len(parts):
         return "a destination is named twice"
     return None
 

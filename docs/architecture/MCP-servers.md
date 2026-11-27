@@ -18,7 +18,7 @@ The page adds, edits, tests and removes servers. `research mcp server list | add
 
 ## Servers RS runs
 
-The operator gives an image reference, the port and path it serves MCP on (streamable HTTP), and optionally its arguments, a data folder kept across restarts, its settings (environment values, each secret or not), per-request secret headers, and named destinations (`host:port`) on the local network or this machine it may reach.
+The operator gives an image reference, the port and path it serves MCP on (streamable HTTP), and optionally its arguments, a data folder kept across restarts, its settings (environment values, each secret or not), per-request secret headers, and named destinations (`host:port`) on the local network or this machine it may reach. A destination is reached over TCP; one written `host:port/udp` (a WireGuard VPN's endpoint, for instance) is reached over UDP only.
 
 ```mermaid
 flowchart LR
