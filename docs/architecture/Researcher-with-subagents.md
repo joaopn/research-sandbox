@@ -84,6 +84,26 @@ A running session switches its own with `/rs-mode` (under pi `/skill:rs-mode`): 
 
 The web is the researcher's own for a quick lookup. A survey goes to a **surveyor** under Claude: it has only Claude's web search and page fetch, runs in the background, and answers with a summary and its sources. Under pi there is no survey helper yet, and the researcher says so.
 
+## Work packages
+
+A third setting, the **planner**, is off by default: one session works at the project's top, as above. Turned on (`--planner on` of `project create` or `project update`), the work is split into **work packages**. It is a project setting only; no session switches it, and `/rs-mode` does not name it.
+
+Each package is a folder `/workspace/packages/<name>/` laid out like the workspace's top: its own front page `README.md`, `staging/`, `results/`, `logbook/`, `analyses/` and memory. Beside them sit its **charter**, `charter.md` (its questions, its data, what is out of its scope), and a small status file, `package.json` (open, done or closed, and which session holds it).
+
+| A session | holds | writes into |
+|---|---|---|
+| planning | the project's top (`rs-memory plan`), one session at a time | the top memory; adds packages, changes charters, closes packages |
+| work | one package (`rs-memory take <package>`) | that package's memory and pages only |
+| new | nothing yet | nothing: every write is refused until it takes one |
+
+A session that holds nothing opens by listing the packages (open and free, being worked on in a live session, done, closed) and asking the user which to take, or whether it plans; its memory is not chosen yet, so nothing is consolidated at that start. Taking a memory first consolidates its last session when that one ended without closing, as a session start does without the planner, so under Claude the take has the same ten-minute timeout as closing. A session's end journals it in the memory it held and gives that back; closing also consolidates it. Inside a package, the project's record (whether a finding's checks apply, the referee's model) and a re-run's folder are the workspace's, never the package's, so a package's findings are held for their checks exactly as the top's are.
+
+A take records the session's id, its agent's process and that process's start time. A take of something whose recorded agent is still running is refused; when that agent has ended, the package or the top is free again by itself, with no step to forget. Under Claude the agent's process is named to every command it runs; under pi it is found by walking up from the memory command to the first process that does not carry the session's id (pi's shell tool sets it for its commands, pi itself does not have it).
+
+The planning session changes a charter through the memory command, which journals the change in the package, naming the sections that changed, so the package's session sees it the next time it loads its memory. The package's own session or the planning session marks a package done; the planning session closes one nobody is working in. Done and closed packages are kept as history and are not taken again.
+
+The project's front page gains a **Packages** section: one line per package with its state, what waits there, what it has in flight and its latest logbook entry, each linking the package's own front page. Turning the planner on is always allowed: the top memory and record become the planning session's. Turning it off is refused while any package is open, naming each; RS reads the packages' status files from the project's folder itself, so the refusal holds for a stopped project too.
+
 ## The helpers' models
 
 Under Claude the analyst and the surveyor each run the model and effort set for the whole installation in **Host → Defaults → Analyst** and **→ Surveyor**, Sonnet at high effort by default. A new project of this type starts with them, and a project's own are set when the project is created (the New Project window's Agents box, beside Agent), or later in ⚙ on Claude's tab. Under pi the analyst runs pi's default model unless its own model and thinking level are set on pi's tab, when the project is created or later in ⚙; there is no installation default for it, since pi names its models by provider. A change is written into the helper's definition, so the next helper launched uses it, and nothing restarts. A project created before these settings keeps running its Claude helpers on the researcher's model until they are set in its ⚙ Agents box.
@@ -117,3 +137,11 @@ Under Claude the referee runs the model set for the whole installation in **Host
 **Checks off says so, it does not hide it.** A finding accepted unchecked carries that on its record entry and its pages, so the record never reads as checked when it was not. The cost is a line of text the user sees on every such entry.
 
 **The agent can switch its own session.** The memory command records what the agent tells it, as it already accepts a claim when the agent says the user did; both rest on the agent's instruction to act only on the user's word. A project can weaken only its own checks this way.
+
+**Packages are folders of the same layout.** A package is one researcher's folder, as the top is, so its pages, memory and checks are the ones already built; the cost is that ids repeat across packages (each has its `F-1`), and the project's front page names the package beside each.
+
+**Holding is checked by the agent's process, not by a lease.** A take names the agent's process and its start time, so a session that ended frees its package by itself, and a reused process id is never mistaken for it. The cost is that a session that is still running but idle keeps its package until the user ends it.
+
+**The memory is chosen by what a session holds, never by a path.** Pointing the memory command at a package's folder directly is refused, and a session that holds nothing writes nothing, so a package's memory is written only by its session. Nothing stops a session reading another package's files: it keeps to its charter by instruction.
+
+**Turning the planner off with open packages is an error that names them.** Nothing is closed or moved for the user; they finish or close each package first.
