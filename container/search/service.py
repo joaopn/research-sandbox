@@ -693,7 +693,7 @@ class Searches:
         threading.Thread(target=self._run, args=(sid,), daemon=True).start()
         log(f"submit {sid} for {project}/{consumer}")
 
-    # --- the operator's asks (the Search page's Quick Ask) ---
+    # --- the operator's asks (the Search page's Quick Search) ---
 
     def ask(self, question, conversation, include: bool) -> dict:
         """The operator's question: a search like any other (the same queue,

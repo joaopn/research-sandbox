@@ -703,7 +703,7 @@ def _verb_search_test(_args: dict, _progress=None) -> dict:
 
 
 def _verb_search_ask(args: dict, _progress=None) -> dict:
-    """The operator's question (Quick Ask): a search in the same queue as the
+    """The operator's question (Quick Search): a search in the same queue as the
     agents' (fields `question`, `conversation`, `include`)."""
     deadline = rscore._mcp_deadline()
     _search_not_turning_on()

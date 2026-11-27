@@ -9,7 +9,7 @@ installation, turned on by the operator (Services → Search):
     Docker keeps its images on the named volume ``rs-search-docker``, so the
     search images are staged into it once (at Turn on, and again only when
     the host's image changes) and survive a restart and a re-create; the
-    operator's Quick Ask conversations live on ``rs-search-conversations``,
+    operator's Quick Search conversations live on ``rs-search-conversations``,
     kept the same way;
   - on ``rs-search-net``, its own ``--internal`` network with RS's router on
     it: the route out is injected after every start and the router holds a
@@ -61,7 +61,7 @@ AGENT_IMAGE = "rs-search-agent:latest"
 # The service's inner Docker store (images, search volumes): kept at Turn off,
 # so turning the service on again does not stage the images again.
 DOCKER_VOLUME = "rs-search-docker"
-# The operator's conversations (the Search page's Quick Ask), one file the
+# The operator's conversations (the Search page's Quick Search), one file the
 # service alone writes, on a volume of their own mounted at this path in the
 # service container (container/search/service.py CONVERSATIONS_DIR — MIRROR).
 # Made by RS with OWNER_LABEL before the container that mounts it, and kept at

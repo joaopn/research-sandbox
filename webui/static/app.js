@@ -2330,7 +2330,7 @@ const HOST_PAGES = {
     search: {
         title: "Search",
         get landing() { return searchRunning === false ? "settings" : "ask"; },
-        tabs: [["ask", "Quick Ask"], ["activity", "Activity"], ["settings", "Settings"]],
+        tabs: [["ask", "Quick Search"], ["activity", "Activity"], ["settings", "Settings"]],
         shown: (k) => searchRunning !== false || !SEARCH_RUNNING_TABS.includes(k),
         get: () => searchActiveTab,
         set: (k) => { searchActiveTab = k; },
@@ -8921,7 +8921,7 @@ function renderSearchPageInto(view) {
     return renderSearchInto(view);
 }
 
-// Record what a status read said about the service: Quick Ask and Activity
+// Record what a status read said about the service: Quick Search and Activity
 // show only while it runs, so a page on one of them moves to Settings (not
 // remembered: the next open, with the service running, comes back to it).
 function searchNoteRunning(a) {
@@ -8940,7 +8940,7 @@ function searchSelectTab(key) {
     return undefined;
 }
 
-// Services → Search's second strip: Quick Ask, Activity, Settings, drawn like
+// Services → Search's second strip: Quick Search, Activity, Settings, drawn like
 // the main strip's tabs (never .tab or .host-tab, which the strip code walks).
 function searchSubStrip() {
     const keys = hostTabKeys("search");
@@ -8956,7 +8956,7 @@ function searchSubStrip() {
         }));
 }
 
-// The tab on screen: Quick Ask (the operator's own questions), Activity (every
+// The tab on screen: Quick Search (the operator's own questions), Activity (every
 // waiting, running and recent search) or Settings (the service itself). Under
 // Services the sub-tab strip comes first; on the Search page the main strip
 // carries the tabs.
@@ -9215,7 +9215,7 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
 }
 
 const SEARCH_SIDEBAR_HINT =
-    "Adds Search to the sidebar, above Services. Opening it shows Quick Ask, "
+    "Adds Search to the sidebar, above Services. Opening it shows Quick Search, "
     + "Activity and Settings as its tabs, the way a project shows its terminal and "
     + "editor. Services → Search stays where it is. Kept on the host with the "
     + "searcher, so every browser shows the same.";
@@ -9309,7 +9309,7 @@ function searchEndedAt(ts) {
 }
 
 // Who asked a search: "project/consumer", or "operator" for the operator's own
-// asks from Quick Ask (the reserved identity -operator-/webui, a name no
+// asks from Quick Search (the reserved identity -operator-/webui, a name no
 // project can have).
 const SEARCH_OPERATOR = { project: "-operator-", consumer: "webui" };
 
@@ -9627,7 +9627,7 @@ function searchTierLines(r) {
 }
 
 // A whole report as plain text, the way the report box shows it (its Copy,
-// and Quick Ask's): the question, the summary, the sources, what was tried.
+// and Quick Search's): the question, the summary, the sources, what was tried.
 function searchReportText(r) {
     const sourceLines = searchSourceLines(r);
     const tierLines = searchTierLines(r);
@@ -9724,7 +9724,7 @@ function searchReportBox(view, id) {
     return backdrop;
 }
 
-// ---- Quick Ask: the operator's own questions to the searcher ---------------
+// ---- Quick Search: the operator's own questions to the searcher ---------------
 // Each message is one search, queued like an agent's on the same searcher and
 // shown everywhere as asked by "operator". The service keeps the conversations
 // on its own disk until they are cleared. Every value a reply carries is shown
@@ -9843,10 +9843,10 @@ function installSearchSideDrag(handle, chat) {
     };
 }
 
-// Quick Ask: the conversations on the side (New conversation and Clear
+// Quick Search: the conversations on the side (New conversation and Clear
 // conversations on top, a delete button on each, the list scrolling on its
 // own and resized by its edge), the selected conversation (scrolling on its
-// own, opened at its bottom), and the composer under it. Quick Ask fills the
+// own, opened at its bottom), and the composer under it. Quick Search fills the
 // page under the strips. The side list is read when the tab opens, after each
 // ask and each delete (and once more when the conversation on screen has
 // nothing left running, so its state there is current); the conversation is

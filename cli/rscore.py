@@ -24139,7 +24139,7 @@ def search_test(deadline: float | None = None) -> dict:
     return {"ok": t["ok"], "text": _search_reply_str(t.get("text"), _SEARCH_REASON_MAX)}
 
 
-# --- the operator's own questions (the Search page's Quick Ask) ----------------
+# --- the operator's own questions (the Search page's Quick Search) ----------------
 # An ask is a search in the service's one queue under the project no caller
 # can be (service.py OPERATOR_PROJECT), kept with its answer in a conversation
 # on the service's own volume. The service says why it refuses an ask or a

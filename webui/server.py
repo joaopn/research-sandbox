@@ -1001,7 +1001,7 @@ async def broker_aldine_session_handler(request: web.Request) -> web.Response:
 # broker and nowhere else (no log line, no reply carries it).
 _SEARCH_SETTINGS_FIELDS = ("name", "model", "effort", "at_once", "contact", "recent",
                            "sidebar")
-# The operator's own ask (Services → Search → Quick Ask): the question, the
+# The operator's own ask (Services → Search → Quick Search): the question, the
 # conversation it belongs to (null = a new one) and whether the conversation's
 # earlier questions and answers go with it.
 _SEARCH_ASK_FIELDS = ("question", "conversation", "include")

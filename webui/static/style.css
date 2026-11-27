@@ -2627,7 +2627,7 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-report-h:first-child { margin-top: 0; }
 .searchsvc-report-item { margin: 0 0 6px; color: var(--fg-base); white-space: pre-wrap; overflow-wrap: anywhere; }
 .searchsvc-report-item > div + div { color: var(--fg-muted); }
-/* Services → Search's sub-tabs (Quick Ask, Activity, Settings): a second
+/* Services → Search's sub-tabs (Quick Search, Activity, Settings): a second
    strip drawn like the main strip's .host-tab (mirrored here, never .tab or
    .host-tab, which the strip code walks). */
 .searchsvc-subtabs {
@@ -2653,16 +2653,16 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
     box-shadow: 0 -2px 0 var(--fg-accent) inset;
 }
 .searchsvc-subtab:hover:not(.active) { background: var(--border); }
-/* "operator" in an Asked by cell (the operator's own Quick Ask searches). */
+/* "operator" in an Asked by cell (the operator's own Quick Search searches). */
 .searchsvc-runs .searchsvc-operator { color: var(--fg-accent); }
 /* Settings → Layout: the sidebar switch. */
 .searchsvc-switch-row { flex-wrap: wrap; }
-/* Quick Ask: the conversations on the side, the conversation and its
+/* Quick Search: the conversations on the side, the conversation and its
    composer. Self-scoped classes only (the textarea carries .searchsvc-input,
    no bare textarea rule). */
 .searchsvc-ask-problem { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 10px 10px; }
 .searchsvc-ask-problem[hidden] { display: none; }
-/* The page body while Quick Ask is on screen fills the page under the top
+/* The page body while Quick Search is on screen fills the page under the top
    strip, like the Gitea and Aldine tabs (LOCKSTEP with .dev-gitea-body's
    height: the strip and the host view's padding); what sits above the chat
    (Services' sub-tabs, the error line, a flash) keeps its height and the
@@ -2692,7 +2692,7 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-side-acts { display: flex; flex-wrap: wrap; gap: 6px; flex-shrink: 0; }
 .searchsvc-side-acts > .btn { padding: 5px 10px; font-size: 12px; }
 .searchsvc-side .searchsvc-flash { margin: 6px 4px; }
-/* New and Clear at the top of Quick Ask's list: small, plain buttons whose
+/* New and Clear at the top of Quick Search's list: small, plain buttons whose
    colour is only a thin badge-like border (green for New, red for Clear). */
 .searchsvc-pill {
     background: transparent;
