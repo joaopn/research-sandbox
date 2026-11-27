@@ -20,6 +20,9 @@
 #     ~/.claude/skills/rs-project-instructions/SKILL.md and
 #       rs-workspace-instructions/SKILL.md — links, made when a role can be lean
 #     ~/.claude/skills/harness/{SKILL.md,modes/<mode>.md for every staged mode}
+#       — where RS_HARNESS_SUBAGENTS is 1 its SKILL.md is the research one
+#       (skill-research/SKILL.md: /rs-mode switches the session's subagents
+#       and checks instead of its working mode)
 #     ~/.claude/skills/rs-test/{SKILL.md,policies/<policy>.md for every staged
 #       test policy} — the test-policy switch
 #   pi (pi in RS_HARNESS_AGENTS), under pi's agent dir:
@@ -58,7 +61,8 @@
 #   RS_HARNESS_PI_CHECKER_THINKING    pi thinking level for checker
 #   RS_HARNESS_SUBAGENTS              1: also write the analyst and surveyor
 #                                     helper roles (the project's record asks
-#                                     for them); anything else: neither
+#                                     for them), and the research rs-mode
+#                                     skill; anything else: neither
 #   RS_HARNESS_PAPER_CHECK            1: also write the paper-check skill and its
 #                                     source-checker helper role (a researcher
 #                                     project's agent, a zotero box's agent);
@@ -197,7 +201,7 @@ checked() {
 # otherwise leave a frontmatter-only agent file that reads as a success. A
 # mode's own rule body, and a test policy's, is checked when it is chosen, below.
 for f in agents/doer.md agents/checker.md agents/analyst.md agents/surveyor.md skill/SKILL.md modes/LIST skill-test/SKILL.md policies/LIST \
-        agents/source-checker.md skill-paper-check/SKILL.md skill-paper-check/bibpass.py; do
+        skill-research/SKILL.md agents/source-checker.md skill-paper-check/SKILL.md skill-paper-check/bibpass.py; do
     if [ ! -r "$SRC/$f" ]; then
         warn "the shipped file $f is missing; nothing installed"
         echo RS_HARNESS_INSTALL_FAILED
@@ -284,9 +288,14 @@ SOURCE_CHECKER_DESC="Checks one cited source against the sentences that cite it,
 
 # skill DIR — the mode-switch skill (named rs-mode; its folder keeps the name
 # harness, so nothing is ever removed) with its own copy of every staged mode's
-# rule body.
+# rule body. A researcher-subagents project's rs-mode is the research one: it
+# switches the session's subagents and checks, and carries their text itself.
 skill() {
-    put "$1/SKILL.md" < "$SRC/skill/SKILL.md" || FAILED=1
+    SKILL_SRC=skill/SKILL.md
+    if [ "$SUBAGENTS" = 1 ]; then
+        SKILL_SRC=skill-research/SKILL.md
+    fi
+    put "$1/SKILL.md" < "$SRC/$SKILL_SRC" || FAILED=1
     for m in "$SRC"/modes/*.md; do
         [ -r "$m" ] || continue
         put "$1/modes/${m##*/}" < "$m" || FAILED=1

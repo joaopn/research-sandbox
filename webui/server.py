@@ -1524,6 +1524,8 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
                       "analyst_model", "analyst_effort",
                       "surveyor_model", "surveyor_effort",
                       "pi_analyst_model", "pi_analyst_thinking",
+                      # its subagents and checks switches
+                      "subagents_switch", "checks_switch",
                       "agents", "pi_model", "pi_thinking", "reset",
                       "harness_mode", "doer_model", "checker_model",
                       "pi_doer_model", "pi_doer_thinking",

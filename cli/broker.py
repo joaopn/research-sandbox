@@ -1077,6 +1077,11 @@ CREATE_WEBUI_FIELDS = frozenset({
     "referee_model", "referee_effort", "analyst_model", "analyst_effort",
     "surveyor_model", "surveyor_effort", "pi_referee_model", "pi_referee_thinking",
     "pi_analyst_model", "pi_analyst_thinking",
+    # Its two switches (subagents on/off, checks off/staged/all): IN-BOX — two
+    # words written into the project's record, which rs-memory and RS's
+    # instruction writer read; from_kwargs holds them to their value lists and
+    # refuses them on any other workflow.
+    "subagents_switch", "checks_switch",
     # The working mode and the doer/checker models (dev workflows only, refused
     # elsewhere in from_kwargs): IN-BOX — they land in the agent's own config
     # files inside the container; tiers, pi ids and levels are shape-checked.
@@ -1127,6 +1132,11 @@ UPDATE_WEBUI_FIELDS = frozenset({
     # update() on any other project. No container is restarted.
     "analyst_model", "analyst_effort", "surveyor_model", "surveyor_effort",
     "pi_analyst_model", "pi_analyst_thinking",
+    # Its two switches (the same project type): IN-BOX — two words written
+    # into the project's record, then RS's instructions written again in the
+    # running container; value lists in from_kwargs, the project type and
+    # "on their own" in update(). No container is restarted.
+    "subagents_switch", "checks_switch",
     # The project's agent SET (STAGE_PI_AGENT): applied live on sandbox-dind
     # for an add; a removal (I33 slice 3) restarts the project; an enum list,
     # validated in from_kwargs, removal rules in update().

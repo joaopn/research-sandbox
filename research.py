@@ -525,6 +525,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         surveyor_model=args.surveyor_model, surveyor_effort=args.surveyor_effort,
         pi_referee_model=args.pi_referee_model, pi_referee_thinking=args.pi_referee_thinking,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
+        subagents_switch=args.subagents_switch, checks_switch=args.checks_switch,
         status_bar=args.status_bar,
         block_account_links=args.block_account_links,
         **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
@@ -989,6 +990,7 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         surveyor_model=args.surveyor_model, surveyor_effort=args.surveyor_effort,
         pi_referee_model=args.pi_referee_model, pi_referee_thinking=args.pi_referee_thinking,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
+        subagents_switch=args.subagents_switch, checks_switch=args.checks_switch,
         agents=agents,
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
         reset=args.reset or [],
@@ -3338,6 +3340,16 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--pi-analyst-thinking", dest="pi_analyst_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="thinking level of pi's analyst helper (unset = pi's default)")
+    c.add_argument("--subagents", dest="subagents_switch", default="",
+                   choices=("",) + rscore.RESEARCH_SWITCHES["subagents"], metavar="on|off",
+                   help="a researcher-subagents project's new sessions hand analyses to "
+                        "parallel analysts (on) or do them themselves (off) (unset = on)")
+    c.add_argument("--checks", dest="checks_switch", default="",
+                   choices=("",) + rscore.RESEARCH_SWITCHES["checks"], metavar="off|staged|all",
+                   help="a researcher-subagents project's finding checks (a re-run and an "
+                        "independent referee): needed for the findings the agent stages "
+                        "(staged), staged and run on every result (all), or not needed (off) "
+                        "(unset = staged)")
     c.add_argument("--status-bar", dest="status_bar", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="RS's status bar under the prompt of the project container's "
@@ -3468,6 +3480,16 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--pi-analyst-thinking", dest="pi_analyst_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="thinking level of pi's analyst helper (unset = leave unchanged)")
+    u.add_argument("--subagents", dest="subagents_switch", default="",
+                   choices=("",) + rscore.RESEARCH_SWITCHES["subagents"], metavar="on|off",
+                   help="what a researcher-subagents project's new sessions start with: "
+                        "analysts on or off (unset = leave unchanged; on its own, with "
+                        "--checks; running sessions keep theirs)")
+    u.add_argument("--checks", dest="checks_switch", default="",
+                   choices=("",) + rscore.RESEARCH_SWITCHES["checks"], metavar="off|staged|all",
+                   help="what a researcher-subagents project's new sessions start with: "
+                        "finding checks off, staged or all (unset = leave unchanged; on its "
+                        "own, with --subagents; running sessions keep theirs)")
     u.add_argument("--pi-model", dest="pi_model", default="", metavar="PROVIDER/MODEL",
                    help="pi's starting model (written into pi's settings)")
     u.add_argument("--pi-thinking", dest="pi_thinking", default="",

@@ -1484,6 +1484,12 @@ class CreateRequest:
     pi_referee_thinking: str = ""
     pi_analyst_model: str = ""
     pi_analyst_thinking: str = ""
+    # A researcher-subagents project's two switches (RESEARCH_SWITCHES), what
+    # its new sessions start with: "" = the default (RESEARCH_SWITCH_DEFAULTS).
+    # Refused on any other workflow; written into the record's
+    # RESEARCH_SWITCHES_KEY object when either is given.
+    subagents_switch: str = ""
+    checks_switch: str = ""
     # The working mode and the doer/checker models (I33; HARNESS_FIELDS, "" =
     # unset). Dev workflows only; validated in _validated_harness.
     harness_mode: str = ""
@@ -1848,6 +1854,10 @@ class CreateRequest:
                                                  pairs=model_pairs, pi_model=pi_model)
         harness = _validated_harness(_harness_shape(kw), dev=bool(manifest.get("dev")),
                                      agents=agents)
+        switches = _research_switch_args(kw)
+        if any(switches.values()) and not research_subagents:
+            raise ValidationError("the subagents and checks settings apply only to a "
+                                  "researcher-subagents project")
         return cls(
             name=_require_name(kw.get("name")),
             status_bar=status_bar,
@@ -1889,6 +1899,7 @@ class CreateRequest:
             role_model=rol_m, role_effort=rol_e,
             pi_model=pi_model, pi_thinking=pi_thinking,
             **helper_pairs,
+            **switches,
             **harness,
         )
 
@@ -2420,6 +2431,12 @@ class UpdateRequest:
     # Written live into a running project's Claude, owed to the next start of
     # a stopped one.
     block_account_links: bool | None = None
+    # A researcher-subagents project's two switches (RESEARCH_SWITCHES): "" =
+    # unchanged. Changed on their own: written into the record, and into the
+    # agent's instructions at once on a running project (no restart); what
+    # new sessions start with, never a running session's.
+    subagents_switch: str = ""
+    checks_switch: str = ""
 
     def model_changes(self) -> dict[str, dict[str, str]]:
         """The per-type model/effort fields the caller actually SET, as
@@ -2581,6 +2598,7 @@ class UpdateRequest:
             reset=tuple(reset),
             status_bar=_status_bar_arg(kw.get("status_bar")),
             block_account_links=_account_links_arg(kw.get("block_account_links")),
+            **_research_switch_args(kw),
             **harness,
             **vals,
         )
@@ -5296,6 +5314,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # rs-memory's finding checks, key on it. Only written when set, so a
         # researcher project's record is exactly as before.
         marker[SUBAGENTS_RECORD_KEY] = True
+        # Its two switches, only when the create chose one (from_kwargs
+        # refused them elsewhere): every switch named, the unchosen one at its
+        # default. A record without them reads as the defaults.
+        chosen = {k: getattr(req, f) for k, f in RESEARCH_SWITCH_FIELDS.items()
+                  if getattr(req, f)}
+        if chosen:
+            marker[RESEARCH_SWITCHES_KEY] = {**RESEARCH_SWITCH_DEFAULTS, **chosen}
     if req.research_companion:
         # The companion type: rs-memory's companion mode keys on it. Only
         # written when set, so a researcher project's record is exactly as
@@ -6399,6 +6424,10 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # live on a running project, owed to the next start of a stopped one.
     if req.block_account_links is not None:
         return _update_account_links(req, cfg, project, container, progress)
+    # A researcher-subagents project's switches: their own change, the record
+    # and then (running) the agent's instructions, nothing restarted.
+    if req.subagents_switch or req.checks_switch:
+        return _update_research_switches(req, cfg, project, container, progress)
     # The docker substrate has no in-container editable surface (no templates, no
     # worker/extension cone) and no sysbox store to re-stage. The ONE meaningful
     # update is toggling the editor (code-server), which recreates the plain runc
@@ -10419,6 +10448,122 @@ HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md",
 # .orchestrator/project.json. Read where the kit is staged; a box, and every
 # project without the key, gets neither.
 SUBAGENTS_RECORD_KEY = "subagents"
+# Such a project's two switches, what a NEW session starts with (a running
+# session switches its own with /rs-mode, which records them through
+# `rs-memory switch`): one object in the record, chosen at create and changed
+# by update. `subagents` on = the agent hands analyses to parallel analysts,
+# off = it does them itself (the analyst stays installed either way, so a
+# session can switch it on); `checks` staged = a staged finding needs its
+# re-run and its referee before it is accepted, all = the same and every
+# result is staged and checked, off = a finding can be accepted unchecked. A
+# record without the object, or without one of its keys, reads as
+# RESEARCH_SWITCH_DEFAULTS (today's behaviour); a malformed object is an
+# error, never read as the defaults. Never set on any other project.
+# SUBAGENTS_RECORD_KEY keeps meaning "a researcher-subagents project".
+# MIRROR of rs-memory's SWITCHES_KEY / SWITCHES / SWITCH_DEFAULTS (the
+# command reads what the host writes).
+RESEARCH_SWITCHES_KEY = "research_switches"
+RESEARCH_SWITCHES = {"subagents": ("on", "off"), "checks": ("off", "staged", "all")}
+RESEARCH_SWITCH_DEFAULTS = {"subagents": "on", "checks": "staged"}
+# The request fields that set them (CreateRequest, UpdateRequest), by switch.
+RESEARCH_SWITCH_FIELDS = {"subagents": "subagents_switch", "checks": "checks_switch"}
+# The instruction text of a researcher-subagents project marks each passage
+# that depends on a switch with a whole line `<!-- rs-switch: NAME VALUE... -->`
+# before it and `<!-- rs-switch: end -->` after it: the passage is kept when
+# the project's NAME is one of the VALUEs, dropped otherwise, and the marker
+# lines never reach the agent (_compose_research_text). The rs-mode skill of
+# such a project carries every passage, grouped by switch and value
+# (research_switch_pieces), so a session switched with /rs-mode has the text
+# of its new switches.
+RESEARCH_SWITCH_TEXT = SCRIPT_DIR / "workflows" / "researcher-subagents.instructions.md"
+_RESEARCH_SWITCH_MARK_RE = re.compile(r"\A<!-- rs-switch: ([a-z]+(?: [a-z]+)*) -->\Z")
+
+
+def _research_switch_blocks(text: str) -> "list[tuple[tuple[str, tuple[str, ...]] | None, str]]":
+    """The text cut at its switch markers, in order: (None, text) for text
+    every combination keeps, ((switch, values), text) for a marked passage.
+    A marker naming an unknown switch or value, a nested or unclosed passage
+    and a stray end are a broken text (ValueError: RS's own file)."""
+    out: "list[tuple[tuple[str, tuple[str, ...]] | None, str]]" = []
+    cur: "tuple[str, tuple[str, ...]] | None" = None
+    buf: "list[str]" = []
+    for line in text.splitlines(keepends=True):
+        m = _RESEARCH_SWITCH_MARK_RE.match(line.rstrip("\n"))
+        if not m:
+            buf.append(line)
+            continue
+        words = m.group(1).split(" ")
+        if words == ["end"]:
+            if cur is None:
+                raise ValueError("an rs-switch end marker without its start")
+            out.append((cur, "".join(buf)))
+            cur, buf = None, []
+            continue
+        if cur is not None:
+            raise ValueError("an rs-switch passage inside another")
+        name, values = words[0], tuple(words[1:])
+        if (name not in RESEARCH_SWITCHES or not values
+                or any(v not in RESEARCH_SWITCHES[name] for v in values)):
+            raise ValueError(f"an rs-switch marker RS does not know: {m.group(1)!r}")
+        out.append((None, "".join(buf)))
+        cur, buf = (name, values), []
+    if cur is not None:
+        raise ValueError("an rs-switch passage that is never closed")
+    out.append((None, "".join(buf)))
+    return out
+
+
+def _compose_research_text(text: str, switches: "dict[str, str]") -> str:
+    """The instruction text for these switches (every switch named): the
+    common text, and of each marked passage the ones whose values hold."""
+    return "".join(t for key, t in _research_switch_blocks(text)
+                   if key is None or switches[key[0]] in key[1])
+
+
+def research_switch_pieces(text: str) -> "dict[tuple[str, str], str]":
+    """{(switch, value): its passages}, each passage stripped and joined by a
+    blank line, for every switch value (a value no passage names maps to "")."""
+    pieces: "dict[tuple[str, str], list[str]]" = {
+        (k, v): [] for k, vals in RESEARCH_SWITCHES.items() for v in vals}
+    for key, t in _research_switch_blocks(text):
+        if key is not None and t.strip():
+            for v in key[1]:
+                pieces[(key[0], v)].append(t.strip())
+    return {k: "\n\n".join(v) for k, v in pieces.items()}
+
+
+def read_research_switches(marker: dict) -> "dict[str, str]":
+    """A researcher-subagents record's switches, every switch named: the
+    record's object over the defaults. ValueError (its text in project terms)
+    for an object that is not one RS writes."""
+    raw = marker.get(RESEARCH_SWITCHES_KEY, {})
+    if not isinstance(raw, dict):
+        raise ValueError("it is not an object")
+    for k, v in raw.items():
+        if k not in RESEARCH_SWITCHES:
+            raise ValueError(f"it holds a switch RS does not know ({str(k)[:40]!r})")
+        if v not in RESEARCH_SWITCHES[k]:
+            raise ValueError(f"its {k} switch is not one of {', '.join(RESEARCH_SWITCHES[k])}")
+    return {**RESEARCH_SWITCH_DEFAULTS, **raw}
+
+
+def _research_switch_args(kw: dict) -> "dict[str, str]":
+    """The request's switch fields, shape-checked: {field: value or ""}."""
+    out: "dict[str, str]" = {}
+    for k, f in RESEARCH_SWITCH_FIELDS.items():
+        v = kw.get(f)
+        if v is None:
+            v = ""
+        if not isinstance(v, str):
+            raise ValidationError(f"the {k} setting must be a string")
+        v = v.strip()
+        if v and v not in RESEARCH_SWITCHES[k]:
+            raise ValidationError(f"the {k} setting {v!r} is not one of "
+                                  f"{', '.join(RESEARCH_SWITCHES[k])}")
+        out[f] = v
+    return out
+
+
 # The record key that makes a project's agent a companion: `"companion": true`
 # in its .orchestrator/project.json. rs-memory reads it (standing preferences
 # on the front page, no claims from the consolidation, the task folders on the
@@ -10433,6 +10578,12 @@ COMPANION_RECORD_KEY = "companion"
 HELPER_MODEL_TYPES = ("analyst", "surveyor")
 HARNESS_SKILL_TEMPLATE = "skill/SKILL.template.md"
 HARNESS_TEST_SKILL_TEMPLATE = "skill-test/SKILL.template.md"
+# The rs-mode skill of a researcher-subagents project (the installer lays it in
+# place of the working-mode one where RS_HARNESS_SUBAGENTS is 1): it switches
+# the session's subagents and checks, and carries the instruction text of
+# every switch value (research_switch_pieces of RESEARCH_SWITCH_TEXT), filled
+# into {{RS_SWITCH_<SWITCH>_<VALUE>}} with their headings one level down.
+HARNESS_RESEARCH_SKILL_TEMPLATE = "skill-research/SKILL.template.md"
 # Number words for the skill's "one of these three" (a catalog longer than this
 # list reads as digits — no mode count is assumed).
 _COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven",
@@ -10558,6 +10709,25 @@ def harness_suite_files() -> dict[str, bytes]:
         raise ValidationError("RS's test-policy catalog is broken: the skill template "
                               "has a marker RS does not fill")
     files["skill-test/SKILL.md"] = skill.encode("utf-8")
+    # The research rs-mode skill: every switch value's passages from the
+    # researcher-subagents instructions.
+    try:
+        skill = (HARNESS_SRC / HARNESS_RESEARCH_SKILL_TEMPLATE).read_bytes().decode("utf-8")
+        pieces = research_switch_pieces(RESEARCH_SWITCH_TEXT.read_bytes().decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise ValidationError("RS's research switches are broken: the skill template or the "
+                              f"researcher-subagents instructions cannot be read ({e})")
+    for (k, v), text in pieces.items():
+        if not text:
+            raise ValidationError("RS's research switches are broken: the researcher-subagents "
+                                  f"instructions have no text for {k} {v}")
+        demoted = "\n".join("#" + line if line.startswith("#") else line
+                             for line in text.split("\n"))
+        skill = skill.replace("{{RS_SWITCH_" + f"{k}_{v}".upper() + "}}", demoted)
+    if "{{RS_SWITCH_" in skill:
+        raise ValidationError("RS's research switches are broken: the skill template has a "
+                              "marker RS does not fill")
+    files["skill-research/SKILL.md"] = skill.encode("utf-8")
     return files
 
 
@@ -17252,6 +17422,16 @@ def _plan_project_instructions(project: str, workspace_path: "Path", *,
                 body = instr
         if not plan.cleared:
             plan.check_old = st == "missing"     # F-L1: RS cannot tell what it wrote
+    # A researcher-subagents project: the passages of its switches only (the
+    # record's, what a new session starts with). A switches object RS did not
+    # write leaves the instructions as they were, with its warning.
+    if body and data.get(SUBAGENTS_RECORD_KEY) is True:
+        try:
+            switches = read_research_switches(data)
+        except ValueError:
+            return _InstrPlan(what="the project's subagents and checks settings "
+                                   f"({orch_files.SHOWN_FOLDER}/project.json)")
+        body = _compose_research_text(body, switches)
     plan.text = _compose_rs_text(body)
     return plan
 
@@ -18417,7 +18597,11 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # Version 9: the pi extension passes `rs-memory open --agent`, and `close`,
 # `rerun` and `referee` wait for what they start (the session's end hook only
 # journals it; the next session start consolidates).
-MEMORY_KIT_VERSION = "9"
+# Version 10: the researcher-subagents instructions and its rs-mode skill name
+# `rs-memory switch` (a session's own subagents and checks switches) and
+# `rs-memory check` (both checks of several findings at once), and rely on
+# accept honouring the checks switch (the record's research_switches).
+MEMORY_KIT_VERSION = "10"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")
@@ -18984,6 +19168,64 @@ def _update_account_links(req: "UpdateRequest", cfg: "Config", project: str,  # 
                                        "pending": [a for a in local if a in owed]})
 
 
+def _update_research_switches(req: "UpdateRequest", cfg: "Config", project: str,  # type: ignore[name-defined]
+                              container: str, progress) -> "UpdateResult":
+    """A researcher-subagents project's two switches, alone in their request:
+    merged into the record's RESEARCH_SWITCHES_KEY object, then, on a running
+    project, RS's instructions written again from it (what the agent's next
+    session reads; no container is restarted, a running session keeps its
+    switches). A stopped project gets them at its next start, which writes the
+    instructions anyway. Refused before any write on another project type, on
+    an unreadable record and on a switches object RS did not write."""
+    if _dc_replace(req, subagents_switch="", checks_switch="") != UpdateRequest(name=req.name):
+        raise ValidationError("change the subagents and checks settings on their own, not "
+                              "together with other settings")
+    workspace_path = workspace_path_for(project, cfg)
+    state, data = _read_marker_three_way(workspace_path)
+    if state != "ok":
+        raise ValidationError("cannot change the subagents and checks settings: the project's "
+                              f"record {orch_files.SHOWN_FOLDER}/project.json is missing or "
+                              "unreadable")
+    if data.get(SUBAGENTS_RECORD_KEY) is not True:
+        raise ValidationError("the subagents and checks settings apply only to a "
+                              f"researcher-subagents project; {project!r} is not one")
+    try:
+        read_research_switches(data)
+    except ValueError as e:
+        raise ValidationError(_research_switches_unreadable(str(e)))
+    chosen = {k: getattr(req, f) for k, f in RESEARCH_SWITCH_FIELDS.items() if getattr(req, f)}
+
+    def mutate(d: dict) -> None:
+        try:
+            now_set = read_research_switches(d)
+        except ValueError as e:      # changed since the check above
+            raise ValidationError(_research_switches_unreadable(str(e)))
+        d[RESEARCH_SWITCHES_KEY] = {**now_set, **chosen}
+    progress.step("switches", "saving the subagents and checks settings")
+    _marker_rmw(workspace_path, mutate, "change the subagents and checks settings")
+    words = ", ".join(f"{k} {v}" for k, v in
+                      read_research_switches(_read_marker_dict(workspace_path)).items())
+    if not container_running(container):
+        progress.step("saved", "saved; applied at the project's next start")
+        print(f"{project!r} is stopped: its settings ({words}) are saved, and its next start "
+              "writes them into the agent's instructions.")
+        return UpdateResult(project=project, rebuilt=False)
+    progress.step("instructions", "writing the agent's instructions")
+    found = _write_project_instructions(project, container, workspace_path, progress=progress)
+    print(f"{project!r} now starts new sessions with {words}; a running session keeps its "
+          "own until it is switched with /rs-mode.")
+    _raise_old_instructions(found)
+    return UpdateResult(project=project, rebuilt=False)
+
+
+def _research_switches_unreadable(why: str) -> str:
+    """Operator text for a switches object RS did not write (browser-safe:
+    the fix is made in the project's own terminal)."""
+    return (f"the project's record {orch_files.SHOWN_FOLDER}/project.json holds subagents and "
+            f"checks settings RS cannot read ({why}). Remove the \"{RESEARCH_SWITCHES_KEY}\" "
+            "entry from that file in the project's terminal, then set them again")
+
+
 def _uninstall_claude_extension(container: str, home: str = _AGENT_HOME) -> None:
     """Remove Claude Code's editor extension from the project's editor when the
     project's own container no longer runs Claude (its extensions live in the
@@ -19374,6 +19616,14 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
         out["pi_referee"] = {
             "model": prm if isinstance(prm, str) and PI_MODEL_RE.match(prm) else "",
             "thinking": prt if isinstance(prt, str) and prt in PI_THINKING_LEVELS else ""}
+        # Its two switches, what a new session starts with (the defaults for a
+        # record without them); a switches object RS did not write reads as
+        # none, with the reason in project terms.
+        try:
+            out["research_switches"] = read_research_switches(data)
+        except ValueError as e:
+            out["research_switches"] = {}
+            out["research_switches_error"] = _research_switches_unreadable(str(e))
         # The helper roles' recorded pairs (what the next helper launched
         # runs; "" = the session's model, pi's default for pi's analyst).
         pairs = _harness_helper_pairs(data)
