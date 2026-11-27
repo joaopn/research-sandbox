@@ -15,13 +15,16 @@
 //   any other (before a run starts, after its last answer, a /compact) is
 //   answered at the next run the PI starts, so it never starts a turn of its
 //   own. pi reports itself busy during every compaction, so ctx.isIdle()
-//   cannot tell these apart.
-// - At the end of a session it hands the journal to a consolidation run
-//   (`rs-memory close --hook`), which starts one only when there is something
-//   new. The call is made synchronously and detached (`setsid -f`): pi may
-//   already be dying when its window closes, and a spawn from an asynchronous
-//   handler never happens then (measured for RS's activity recorder); `setsid
-//   -f` returns at once and the run lives on in its own session.
+//   cannot tell these apart. `open` is passed `--agent pi` (pi does not set
+//   PI_SESSION_ID in this extension's process, so rs-memory cannot tell the
+//   agent itself): when the last session ended without its consolidation,
+//   open runs it first, as pi, and waits for it.
+// - At the end of a session it journals the end (`rs-memory close --hook`),
+//   which starts nothing: the next session start, or an explicit
+//   `rs-memory close`, consolidates. The call is made synchronously and
+//   detached (`setsid -f`): pi may already be dying when its window closes,
+//   and a spawn from an asynchronous handler never happens then (measured for
+//   RS's activity recorder); `setsid -f` returns at once.
 // - A pi-subagents child, and a consolidation run itself, do nothing.
 // - Nothing here ever throws into pi.
 //
@@ -41,7 +44,7 @@ export function closeArgs(): string[] {
 }
 
 export function openArgs(): string[] {
-	return ["open", "--hook"];
+	return ["open", "--hook", "--agent", "pi"];
 }
 
 // The message a run starts with, or undefined when the tool had nothing to say.

@@ -55,7 +55,7 @@ logbook tells the story; the record holds the truth: where they disagree, an
 entry's standing in the record is what holds.
 
 Verbs:
-  open [--hook]                 what to read at the start of a session
+  open [--hook] [--agent claude|pi]  what to read at the start of a session
   note HEADLINE --kind K [--body TEXT]
   checkpoint ITEM...            replace the "In flight" part of the front page
   claim STATEMENT --title T --scope S --evidence FILE... [--hedge H] [relations]
@@ -71,11 +71,27 @@ Verbs:
   log --topic SLUG --file DRAFT file a logbook entry from the agent's draft
   skill propose|used|promote|retire|sync|list
   consolidate --prompt [--out FILE]  /  consolidate --apply DELTA
-  close [--hook] [--agent claude|pi]
+  close [--hook] [--agent claude|pi]  end of session (--hook: journal it only)
   analyst-check [--hook claude]  whether an analyst's reply names a results
                                 folder holding its writeup.md (reads only)
   job add --pid N --log PATH --name TEXT [--expect-end TEXT]
   job list [--all]  /  job done ID
+
+Nothing rs-memory starts outlives the call that started it. `close` runs
+the consolidation (a headless agent on a brief, which merges its delta with
+consolidate --apply) and waits for it, then says whether the front page was
+rewritten; its agent is stopped after CONSOLIDATION_LIMIT_S seconds.
+`close --hook` (the session's end hook) only journals the end, fast; the
+next `open` then consolidates first, when the journal has a session's end
+after the last consolidation, and its text says how that went. `rerun` and
+`referee` wait for their check and print its result. Each run stays in its
+caller's process group and the kernel stops it when its caller ends; a
+caller stopped with SIGTERM, SIGINT or SIGHUP stops its run first. What a
+run starts (the re-run's command, an agent) runs under a keeper that leads
+a process group of its own and takes that whole group down when its run
+ends, however it ends (a SIGKILL to the caller's process group included),
+so nothing the command left in the background keeps going. A check whose
+run was stopped reads failed.
 
 The checks (--rerun, rerun-command, rerun, referee, --over-objection and
 accept's conditions on a finding) exist only in a project whose record,
@@ -126,6 +142,7 @@ Standard library only; run by RS's own interpreter.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime as _dt
 import fcntl
 import hashlib
@@ -133,6 +150,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -173,6 +191,21 @@ PI_REFEREE_TOOLS = "read,grep,find,ls"
 # command's spacing can matter (a command holding a newline is refused).
 # "rerun" is the claim's command, "command" the one a re-run check ran.
 RAW_FIELDS = ("rerun", "command")
+# Linux's prctl option (<linux/prctl.h>) by which a process asks the kernel
+# for a signal when the process that started it ends: every run rs-memory
+# starts asks for SIGTERM with it, so nothing it starts outlives its caller.
+PR_SET_PDEATHSIG = 1
+# How long a consolidation's agent may run before it is stopped. A
+# consolidation runs inside `open` (Claude Code's SessionStart hook, pi's
+# start) or `close` (the agent's Bash tool call). Claude Code cancels a
+# SessionStart command hook at 600 s by default and discards its output, and
+# caps a Bash tool call at 600 s (both documented defaults), so the agent is
+# stopped at 540 s: that leaves a minute for the rest of `open` or `close` to
+# write the pages and report, inside the 600 s. A run that needs longer is a
+# run gone wrong (it reads one brief and writes one delta); its log says it
+# was stopped and the next session start or `close` tries again. Re-runs and
+# referees have no limit of their own.
+CONSOLIDATION_LIMIT_S = 540
 # Claude Code adds a SessionStart hook's output to the context only up to this
 # many characters (its documented hook-output limit); `open --hook` stays under
 # it and says how to read the rest.
@@ -412,6 +445,157 @@ class Lock:
         fcntl.flock(self.fd, fcntl.LOCK_UN)
         os.close(self.fd)
         return False
+
+
+# --------------------------------------------------------- tethered runs
+def tethered(own_group: bool = False) -> "callable":
+    """The preexec_fn of every process rs-memory starts: the new process asks
+    the kernel for SIGTERM when the process that started it ends, and exits
+    at once when that one already went before the request was in place;
+    with `own_group`, it first becomes the leader of a process group of its
+    own (run_group). Made in the starting process, so libc is loaded before
+    the fork."""
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    parent = os.getpid()
+
+    def preexec() -> None:
+        if own_group:
+            os.setpgid(0, 0)
+        # `close` ignores a hang-up while it starts its run; an ignored
+        # signal is inherited, so the run gets the default back.
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        if prctl(PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0) != 0:
+            os.write(2, f"rs-memory: the kernel refused to tie this run to its caller "
+                        f"(prctl errno {ctypes.get_errno()}); it was not started\n".encode())
+            os._exit(127)
+        if os.getppid() != parent:
+            os._exit(1)
+    return preexec
+
+
+class _Stopped(BaseException):
+    """The waiting caller was told to stop (raised from its signal handler)."""
+
+
+def start_tethered(argv: "list[str]", log: Path) -> subprocess.Popen:
+    """Start one of this command's own runs tied to its caller: in the
+    caller's process group, no input, its output appended to its log, and
+    stopped by the kernel when the caller ends. The caller waits for it
+    with wait_tethered."""
+    fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
+    try:
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
+                                close_fds=True, preexec_fn=tethered())
+    finally:
+        os.close(fd)
+
+
+def run_group(argv: "list[str]", timeout: "float | None" = None, **kw) -> "int | None":
+    """Run what a run starts (the re-run's command, an agent) under a keeper
+    (`_keep`, keep()): the keeper leads a process group of its own, tied to
+    this run, and starts the command inside that group. The whole group is
+    ended whatever happens: here when the command ends (so nothing it left
+    in the background keeps going), at `timeout` (then None is returned), and
+    when this run is told to stop (SIGTERM, SIGINT, SIGHUP: what the parent-
+    death request and wait_tethered send it; it then exits non-zero); and by
+    the keeper itself when this run dies in a way no handler sees (a SIGKILL
+    to the caller's whole process group, which is how pi stops a call): the
+    keeper's parent-death signal then takes its group down. The group is the
+    keeper's own because a runtime that kills the caller's group would
+    otherwise kill this run and leave the command's children running. A
+    command that cannot be found raises FileNotFoundError here, as starting
+    it directly would."""
+    env = kw.get("env", os.environ)
+    if shutil.which(argv[0], path=env.get("PATH", os.defpath)) is None:
+        raise FileNotFoundError(2, os.strerror(2), argv[0])
+    sigs = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+    def stop(signum, _frame):
+        raise _Stopped(signum)
+    old = {s: signal.signal(s, stop) for s in sigs}
+    child = None
+    me = os.path.realpath(sys.argv[0])
+    try:
+        child = subprocess.Popen([sys.executable, me, KEEP_VERB, "--", *argv],
+                                 preexec_fn=tethered(own_group=True), **kw)
+        try:
+            return child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+    except _Stopped as e:
+        for s in sigs:
+            signal.signal(s, signal.SIG_IGN)
+        sys.exit(128 + e.args[0])
+    finally:
+        if child is not None:
+            stop_group(child)
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
+KEEP_VERB = "_keep"
+
+
+def keep(argv: "list[str]") -> int:
+    """The keeper (`rs-memory _keep -- ARGV...`), started by run_group as the
+    leader of a process group of its own: a stop signal (SIGTERM, SIGINT,
+    SIGHUP; its parent-death signal is SIGTERM) ends the whole group with
+    SIGKILL, the keeper included. Its handlers are in place before ARGV is
+    started, so a signal that comes earlier ends the keeper before ARGV
+    exists. ARGV runs in the keeper's group, tied to the keeper, and the
+    keeper exits with its status (128 + the signal when a signal ended it).
+    It reads no project record and prints nothing on stdout (which may be a
+    referee's answer file)."""
+    def end(_signum, _frame):
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, end)
+    try:
+        child = subprocess.Popen(argv, preexec_fn=tethered())
+    except (OSError, IndexError) as e:
+        print(f"rs-memory: the keeper could not start {argv[:1]}: {e}", file=sys.stderr)
+        return 127
+    rc = child.wait()
+    return 128 - rc if rc < 0 else rc
+
+
+def stop_group(child: subprocess.Popen) -> None:
+    """End every process left in the group `child` leads, then reap `child`.
+    SIGKILL straight away, with no grace for SIGTERM: everything in the group
+    is a run rs-memory ends on purpose and nothing in it is kept beyond the
+    files it already wrote (rs-memory writes the check's record and the
+    consolidation's result itself, after the group is gone, and every
+    rs-memory write is a temp file and a rename, never half a file); and
+    SIGKILL cannot be caught or ignored, so the stop is certain and needs no
+    wait of a chosen length. The group's id stays the leader's pid while any
+    member is alive (the kernel never hands out a pid still in use as a
+    group's id), so this never signals a stranger."""
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass                            # the group is empty: nothing left
+    child.wait()
+
+
+def wait_tethered(child: subprocess.Popen) -> int:
+    """Wait for a run start_tethered started. A caller told to stop (SIGTERM,
+    SIGINT, SIGHUP) stops the run, waits for it to go, and exits non-zero."""
+    sigs = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+    def stop(signum, _frame):
+        raise _Stopped(signum)
+    old = {s: signal.signal(s, stop) for s in sigs}
+    try:
+        return child.wait()
+    except _Stopped as e:
+        for s in sigs:
+            signal.signal(s, signal.SIG_IGN)
+        child.terminate()
+        child.wait()
+        sys.exit(128 + e.args[0])
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
 
 
 # ------------------------------------------------------------------- journal
@@ -1125,20 +1309,28 @@ def check_live(d: Path, kind: str, ident: str, n: int) -> bool:
     return f"\0{child_verb(kind)}\0{ident}\0{n}\0".encode() in cmd
 
 
-def start_check(ident: str, n: int, d: Path, kind: str, log_name: str) -> Path:
-    """Start the check's run detached, in a session of its own (as close
-    starts a consolidation), and note its pid."""
+def start_check(ident: str, n: int, d: Path, kind: str, log_name: str) -> "tuple[Path, subprocess.Popen]":
+    """Start the check's run tied to its caller (start_tethered) and note its
+    pid; the caller releases the lock, then waits for it."""
     log = d / log_name
-    fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
     me = os.path.realpath(sys.argv[0])
-    try:
-        child = subprocess.Popen([sys.executable, me, child_verb(kind), ident, str(n)],
-                                 stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
-                                 start_new_session=True, close_fds=True)
-    finally:
-        os.close(fd)
+    child = start_tethered([sys.executable, me, child_verb(kind), ident, str(n)], log)
     write_text(d / "pid", f"{child.pid}\n")
-    return log
+    return log, child
+
+
+def check_result(ident: str, n: int) -> str:
+    """A finished check's result, in the words rs-memory view uses for it."""
+    c = next((c for c in check_list(ident) if c["n"] == n), None)
+    if c is None or c["rec"] is None:
+        log = c["log"] if c else checks_dir(ident) / str(n)
+        return f"check {n} failed: it ended without a record; its log is {log}"
+    if c["kind"] == "rerun":
+        return f"{rerun_summary(c)}; its record is {c['dir'] / 'rerun.md'}, its log is {c['log']}"
+    if one(c["rec"], "verdict") not in VERDICTS:
+        return (f"check {n} gave no verdict: {one(c['rec'], 'failed')}; "
+                f"its log is {c['log']}")
+    return f"{verdict_summary(c)}; its verdict is {c['dir'] / 'verdict.md'}, its log is {c['log']}"
 
 
 def check_list(ident: str) -> "list[dict]":
@@ -1347,15 +1539,17 @@ def cmd_rerun(a) -> None:
                           f"rs-memory rerun-command {a.id} --rerun CMD")
         n, d = new_check(a.id, "rerun", [("command", cmd)] + binding_fields(meta))
         (d / "rerun").mkdir()
-        log = start_check(a.id, n, d, "rerun", "rerun.log")
+        log, child = start_check(a.id, n, d, "rerun", "rerun.log")
         refresh_pages()
-    print(f"Re-run of {a.id} started in the background (check {n}), writing into "
-          f"{d / 'rerun'}; its log is {log}. Its result shows in rs-memory view {a.id}.")
+    print(f"Re-run of {a.id} started (check {n}), writing into {d / 'rerun'}; "
+          f"its log is {log}. Waiting for it to end.", flush=True)
+    wait_tethered(child)
+    print(f"Re-run of {a.id}: {check_result(a.id, n)}")
 
 
 def run_rerun(ident: str, n: int) -> int:
-    """The detached re-run: the command in the workspace, then its record."""
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    """The re-run, tied to the rerun call: the command in the workspace,
+    then its record."""
     d = checks_dir(ident) / str(n)
     info = parse_entry(d / "check.md")
     cmd = one(info, "command")
@@ -1364,8 +1558,8 @@ def run_rerun(ident: str, n: int) -> int:
     env["RS_RERUN_OUT"] = str(out_dir)
     print(f"command: {cmd}\nRS_RERUN_OUT={out_dir}", flush=True)
     try:
-        rc = str(subprocess.run(["bash", "-c", cmd], cwd=str(workspace()), env=env,
-                                stdin=subprocess.DEVNULL).returncode)
+        rc = str(run_group(["bash", "-c", cmd], cwd=str(workspace()), env=env,
+                           stdin=subprocess.DEVNULL))
     except OSError as e:
         rc = f"none (could not start bash: {e.strerror})"
     print(f"exit: {rc}", flush=True)
@@ -1508,11 +1702,12 @@ def cmd_referee(a) -> None:
             manifest[name] = sha256_text(text)
         write_text(snap / "MANIFEST.sha256",
                    "".join(f"{h}  {name}\n" for name, h in sorted(manifest.items())), mode=0o444)
-        log = start_check(a.id, n, d, "referee", "referee.log")
+        log, child = start_check(a.id, n, d, "referee", "referee.log")
         refresh_pages()
-    print(f"Referee of {a.id} started in the background (check {n}, {agent} "
-          f"{' '.join(model_flags)}), reading only {snap}; its log is {log}. "
-          f"Its verdict lands in {d / 'verdict.md'} and shows in rs-memory view {a.id}.")
+    print(f"Referee of {a.id} started (check {n}, {agent} {' '.join(model_flags)}), "
+          f"reading only {snap}; its log is {log}. Waiting for its verdict.", flush=True)
+    wait_tethered(child)
+    print(f"Referee of {a.id}: {check_result(a.id, n)}")
 
 
 def parse_claude_output(text: str) -> dict:
@@ -1618,9 +1813,8 @@ def write_verdict(ident: str, n: int, result: "dict | None", failed: str, run: d
 
 
 def run_referee(ident: str, n: int) -> int:
-    """The detached referee: the lean agent run in the snapshot folder, its
-    answer parsed, the verdict written."""
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    """The referee, tied to the referee call: the lean agent run in the
+    snapshot folder, its answer parsed, the verdict written."""
     d = checks_dir(ident) / str(n)
     info = parse_entry(d / "check.md")
     agent = one(info, "agent")
@@ -1637,8 +1831,7 @@ def run_referee(ident: str, n: int) -> int:
     try:
         fd = os.open(str(out_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
         with os.fdopen(fd, "wb") as out:
-            rc = subprocess.run(argv, cwd=str(snap), env=env, stdin=subprocess.DEVNULL,
-                                stdout=out).returncode
+            rc = run_group(argv, cwd=str(snap), env=env, stdin=subprocess.DEVNULL, stdout=out)
     except OSError as e:
         write_verdict(ident, n, None, f"could not start {argv[0]}: {e.strerror}", {}, "")
         print(f"result: no verdict (could not start {argv[0]})", flush=True)
@@ -2725,10 +2918,14 @@ def last_run_report() -> "str | None":
     if results and not results[-1].startswith("result: not applied"):
         return None
     return (f"The last consolidation run did not apply its delta; its log is {last}. "
-            "The front page was not updated from those entries; the next close covers them again.")
+            "The front page was not updated from those entries; the next session start or close "
+            "tries again.")
 
 
-def open_text() -> str:
+def open_text(consolidation: "str | None" = None) -> str:
+    """What open prints; `consolidation` is the line on the run this open
+    made: it comes first (a hook's cut never drops it) and stands in for
+    last_run_report's line."""
     d = mem_dir()
     # The jobs come right after the front page, whose last but one part is
     # In flight: what is still running is read before the rest.
@@ -2738,8 +2935,9 @@ def open_text() -> str:
                 "with rs-memory note, and the in-flight work with rs-memory checkpoint.\n"
                 + (f"\n{jobs_part}\n" if jobs_part else ""))
     front = read_front()
-    parts = [(d / "front.md").read_text(encoding="utf-8").rstrip()
-             if (d / "front.md").exists() else "# Front page\n(not written yet)"]
+    parts = [consolidation] if consolidation else []
+    parts.append((d / "front.md").read_text(encoding="utf-8").rstrip()
+                 if (d / "front.md").exists() else "# Front page\n(not written yet)")
     if jobs_part:
         parts.append(jobs_part)
     # A companion stages claims only when the PI asks for one: its knowledge
@@ -2765,7 +2963,7 @@ def open_text() -> str:
                     if p.is_dir()) if (d / "skills" / "active").is_dir() else []
     if active:
         parts.append("Earned skills: " + ", ".join(active))
-    rep = last_run_report()
+    rep = None if consolidation else last_run_report()
     if rep:
         parts.append(rep)
     del front
@@ -2778,17 +2976,48 @@ def _utf16_len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
 
 
+def catch_up(agent: "str | None") -> "str | None":
+    """At a session's start: a session that ended without its consolidation
+    (the window closed, so only the end hook ran) is consolidated now, as
+    close does it, before the front page is read. The line on it, or None
+    when nothing was owed or a run is already in flight (open's last-run
+    line says so)."""
+    with Lock():
+        ended = any(one(parse_entry(f), "kind") == "session-end"
+                    for _n, f in entries_since_mark())
+        if not ended or not new_since_mark() or marker_live():
+            return None
+        if agent is None:
+            return ("The last session ended without consolidating its journal, and rs-memory "
+                    "could not tell which agent runs here (pass open --agent claude or --agent "
+                    "pi), so it did not consolidate now; the next session start or close tries "
+                    "again.")
+        log, child = launch_consolidation(agent)
+    wait_tethered(child)
+    outcome, detail = run_outcome(log)
+    if outcome == "applied":
+        return (f"The last session's journal was consolidated at this start into front page "
+                f"{read_front()['page']}; its log is {log}.")
+    if outcome == "nothing":
+        return None
+    return (f"The last session's journal was not consolidated at this start: the run did not "
+            f"apply its delta{detail}; its log is {log}. The next session start or close "
+            "tries again.")
+
+
 def cmd_open(a) -> None:
     if a.hook and under_guard():
         return
-    # The pages the PI reads are brought in line here too: this is how an
-    # existing project gets them at its first session after an update. A
-    # consolidation or referee run reads only.
+    # A consolidation or referee run reads only, and never starts another.
+    consolidation = None
     if not under_guard() and mem_dir().is_dir():
+        consolidation = catch_up(a.agent or detect_agent(quiet=True))
+        # The pages the PI reads are brought in line here too: this is how an
+        # existing project gets them at its first session after an update.
         with Lock():
             refresh_pages()
     problems = take_page_problems()
-    text = open_text()
+    text = open_text(consolidation)
     if problems:
         text = ("## The PI's pages\n" + "\n".join(f"- {p}" for p in problems) + "\n\n" + text)
     if a.hook:
@@ -3667,9 +3896,10 @@ def marker_live() -> bool:
 
 
 def run_consolidation(agent: str) -> int:
-    """The background run: brief to a file, the agent headless on it, and a
-    result line in the log. Runs in its own session, detached by `close`."""
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    """The consolidation run: brief to a file, the agent headless on it, and
+    a result line in the log. Started by `close` or `open`, tied to that call
+    (start_tethered), which waits for it; its agent is stopped at
+    CONSOLIDATION_LIMIT_S."""
     marker = inflight_marker()
     marker.parent.mkdir(parents=True, exist_ok=True)
     write_text(marker, f"{os.getpid()}\n")
@@ -3702,14 +3932,24 @@ def run_consolidation(agent: str) -> int:
             argv = ["pi", "-p", instruction]
         print("agent: " + " ".join(argv[:2]), flush=True)
         try:
-            rc = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL,
-                                cwd=str(mem_dir().parent)).returncode
+            rc = run_group(argv, timeout=CONSOLIDATION_LIMIT_S, env=env,
+                           stdin=subprocess.DEVNULL, cwd=str(mem_dir().parent))
         except OSError as e:
             print(f"result: not applied (could not start {argv[0]}: {e.strerror})", flush=True)
             return 1
+        # None: the time limit stopped the agent's whole group.
+        stopped = rc is None
+        if stopped:
+            rc = "none (stopped)"
         applied = consolidated_mark() >= int(through[2:])
         print(f"agent exit: {rc}", flush=True)
-        print("result: applied" if applied else "result: not applied", flush=True)
+        if applied:
+            print("result: applied", flush=True)
+        elif stopped:
+            print(f"result: not applied (stopped at the time limit, {CONSOLIDATION_LIMIT_S} s)",
+                  flush=True)
+        else:
+            print("result: not applied", flush=True)
         return 0 if applied else 1
     finally:
         try:
@@ -3719,9 +3959,45 @@ def run_consolidation(agent: str) -> int:
             pass
 
 
+def launch_consolidation(agent: str) -> "tuple[Path, subprocess.Popen]":
+    """Start a consolidation run tied to the caller and mark it in flight;
+    the caller holds the lock (so a second close or open at the same moment
+    sees this run), then releases it and waits (wait_tethered): the run takes
+    the lock itself."""
+    runs = ensure_layout() / "runs"
+    log = runs / (_dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                  + f"-{os.getpid()}.log")
+    me = os.path.realpath(sys.argv[0])
+    child = start_tethered([sys.executable, me, "_run", "--agent", agent], log)
+    marker = inflight_marker()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    write_text(marker, f"{child.pid}\n")
+    return log, child
+
+
+def run_outcome(log: Path) -> "tuple[str, str]":
+    """A finished consolidation run, by its log's last result line: applied,
+    nothing (nothing new to do), or not applied (with what the line adds, as
+    " (...)", or "")."""
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    results = [l for l in text.splitlines() if l.startswith("result: ")]
+    last = results[-1] if results else ""
+    if last == "result: applied":
+        return "applied", ""
+    if last.startswith("result: nothing to do"):
+        return "nothing", ""
+    if not last.startswith("result: not applied"):
+        return "not applied", " (it ended without a result)"
+    detail = last[len("result: not applied"):].strip()
+    return "not applied", f" {detail}" if detail else ""
+
+
 def cmd_close(a) -> None:
     # A hang-up (the session's window closing) must not stop close between
-    # starting the run and marking it.
+    # starting the run and marking it; the wait after it is tethered.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     if under_strict_guard():
         raise Refused("this is a referee run; it never ends a session or starts a consolidation")
@@ -3733,30 +4009,19 @@ def cmd_close(a) -> None:
         lock.__enter__()
     except BlockingIOError:
         return                          # busy: the next close covers it
-    launched = in_flight = None
+    launched = child = in_flight = None
     try:
         since = new_since_mark()
         if since:
             add_journal("session ended", "session-end")
         staged = sorted(i for i, (w, _p) in claim_files().items() if w == "staged")
-        if since:
+        # The hook (the session's end) only journals it: it must stay fast,
+        # and nothing it started would be watched. The next session start,
+        # or an explicit close, consolidates.
+        if since and not a.hook:
             in_flight = marker_live()
             if not in_flight:
-                # Launched and marked under the lock, so a second close at the
-                # same moment sees this run.
-                runs = ensure_layout() / "runs"
-                log = runs / (_dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                              + f"-{os.getpid()}.log")
-                fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
-                me = os.path.realpath(sys.argv[0])
-                child = subprocess.Popen([sys.executable, me, "_run", "--agent", agent],
-                                         stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
-                                         start_new_session=True, close_fds=True)
-                os.close(fd)
-                marker = inflight_marker()
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                write_text(marker, f"{child.pid}\n")
-                launched = log
+                launched, child = launch_consolidation(agent)
         refresh_pages()
     finally:
         lock.__exit__()
@@ -3769,7 +4034,21 @@ def cmd_close(a) -> None:
     elif in_flight:
         print("A consolidation run is still in flight; the next close covers these entries.")
     else:
-        print(f"Consolidation started in the background ({agent}); its log is {launched}.")
+        print(f"Consolidating the journal into the front page ({agent}); its log is {launched}.",
+              flush=True)
+        wait_tethered(child)
+        print(consolidation_words(launched))
+
+
+def consolidation_words(log: Path) -> str:
+    """One line on a consolidation run that just ended."""
+    outcome, detail = run_outcome(log)
+    if outcome == "applied":
+        return f"Consolidated: front page {read_front()['page']} written; its log is {log}."
+    if outcome == "nothing":
+        return f"Nothing new to consolidate; its log is {log}."
+    return (f"The consolidation did not apply its delta{detail}; its log is {log}. "
+            "The front page was not updated; the next session start or close tries again.")
 
 
 def cmd_run(a) -> None:
@@ -3988,6 +4267,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("open", help="what to read at the start of a session")
     p.add_argument("--hook", action="store_true", help="the quiet, capped form a start hook calls")
+    p.add_argument("--agent", choices=("claude", "pi"),
+                   help="the agent that runs a consolidation the last session still owes "
+                   "(default: the one this shell runs in)")
     p.set_defaults(fn=cmd_open)
 
     p = sub.add_parser("note", help="append a journal entry")
@@ -4044,11 +4326,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-rerun", metavar="REASON")
     p.set_defaults(fn=cmd_rerun_command)
 
-    p = sub.add_parser("rerun", help="re-run a staged finding's command in the background")
+    p = sub.add_parser("rerun", help="re-run a staged finding's command and wait for its result")
     p.add_argument("id")
     p.set_defaults(fn=cmd_rerun)
 
-    p = sub.add_parser("referee", help="start an independent referee of a staged finding")
+    p = sub.add_parser("referee", help="run an independent referee of a staged finding and "
+                       "wait for its verdict")
     p.add_argument("id")
     p.add_argument("--agent", choices=("claude", "pi"))
     p.set_defaults(fn=cmd_referee)
@@ -4114,7 +4397,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out")
     p.set_defaults(fn=cmd_consolidate)
 
-    p = sub.add_parser("close", help="end of session: start a consolidation when there is something new")
+    p = sub.add_parser("close", help="end of session: consolidate when there is something new, "
+                       "and wait for it (--hook: only journal the end)")
     p.add_argument("--hook", action="store_true")
     p.add_argument("--agent", choices=("claude", "pi"))
     p.set_defaults(fn=cmd_close)
@@ -4140,7 +4424,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id")
     p.set_defaults(fn=cmd_job_done)
 
-    # The verbs this command starts as detached children of its own. Added with
+    # The verbs this command starts as tethered children of its own. Added with
     # no help, so the verb list leaves them out; the metavar below names only
     # the public verbs, so the usage line leaves them out too.
     public = [v for v in sub.choices if not v.startswith("_")]
@@ -4158,6 +4442,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: "list[str] | None" = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    # The keeper (run_group) needs nothing of the project: it runs before
+    # anything reads the record, so it never fails on one.
+    if args[:2] == [KEEP_VERB, "--"]:
+        return keep(args[2:])
     a = build_parser().parse_args(argv)
     try:
         refuse_both_kinds()

@@ -18344,7 +18344,8 @@ def _apply_activity(container: str, workspace_path: "Path", local: "Sequence[str
 # The researcher memory kit: a project whose record says `memory: true` (the
 # researcher workflow) gets RS's memory command on PATH, Claude's built-in
 # memory off, each agent's hooks (the front page at a session's start and after
-# a compaction, rs-memory open; the consolidation at its end, rs-memory close),
+# a compaction, rs-memory open, which also runs a consolidation the last
+# session still owes; the session's end journalled, rs-memory close --hook),
 # and its earned skills in both agents' homes. Run at create, at every start (after the
 # status bar) and on the Agents Update; idempotent. Failures are collected as
 # end-of-operation errors, never a silent skip; an unreadable record is a
@@ -18369,7 +18370,10 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # (the record's `companion` key: standing preferences instead of a line of
 # inquiry and beliefs, no claims from the consolidation, the task folders on
 # the PI's page).
-MEMORY_KIT_VERSION = "8"
+# Version 9: the pi extension passes `rs-memory open --agent`, and `close`,
+# `rerun` and `referee` wait for what they start (the session's end hook only
+# journals it; the next session start consolidates).
+MEMORY_KIT_VERSION = "9"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")
