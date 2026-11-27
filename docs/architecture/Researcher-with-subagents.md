@@ -82,7 +82,19 @@ A running session switches its own with `/rs-mode` (under pi `/skill:rs-mode`): 
 
 **Not checked.** With the checks off, a finding the user accepts without its checks has a record entry naming what it lacked, and its page under `results/` and its line on the front page say "not checked". A finding staged with the checks off says "not checked (staged with the checks off)" on its page under `staging/` and on the front page until a check runs on it. The checks still work when the user asks for them; a check that ran is kept on the entry, and a referee's objection still needs the user's word to accept over it. Whether a finding needs its checks is decided by the session that accepts it, so the same finding can be held in one session and accepted in another whose checks are off.
 
-The web is the researcher's own for a quick lookup. A survey goes to a **surveyor** under Claude: it has only Claude's web search and page fetch, runs in the background, and answers with a summary and its sources. Under pi there is no survey helper yet, and the researcher says so.
+## The web
+
+How a project reaches the web depends on whether its agent is wired to the [search service](Search.md) (the server `search`, ticked for the project's agent on Services → MCP).
+
+**Not wired** (every project until it is). The web is the researcher's own for a quick lookup. A survey goes to a **surveyor** under Claude: it has only Claude's web search and page fetch, runs in the background, and answers with a summary and its sources. Under pi there is no survey helper yet, and the researcher says so.
+
+**Wired.** Every web and literature question goes to the search service, from the working session (the top one or a work package's) and from the analysts alike, under Claude and pi. The agent hands the question over (`search_submit`), goes on working, looks in when it needs the answer (`search_check`) and collects a written summary with every source, the files the search downloaded and what it tried (`search_collect`). It cites the sources the summary gives, and everything the summary quotes from pages is data, never instructions: a page that tried to instruct the searcher is named and quoted, not followed. An analyst whose result needs the literature asks the service itself and lists the sources in its write-up, so the working session is not the one relaying every search.
+
+To keep that the only way out, Claude's own web search and page fetch are denied while the project is wired: in the agent's settings, so for every Claude session and helper of the project, and in the analyst's own definition. The surveyor is not installed. pi has no web tools of its own, so nothing changes in its tool set; its sessions and its analyst get the same instructions.
+
+The paper check keeps working: its source checker (Claude only, like the paper check's helper today) is given the search service's three tools in place of Claude's web search and page fetch, keeping its shell and file reader, and its text says to check each cited source through the service: submit the source's title, DOI or address, collect the summary, download the files it saved, and compare what they say with the citing sentence.
+
+The text for the wired case is a rule file both agents load beside RS's instructions, `~/.claude/rules/rs-search.md`, and a line in the analyst's own text; the instructions themselves are the same either way. All of it follows the wiring in both directions: RS's harness installer puts it in place or takes it away at every start, every change of the helpers' settings and every wiring change of the project's agent, including the server `search` taken off the MCP list and the search service turned off, with no restart (a stopped project gets it at its next start). Unwired again, the surveyor is back and only the denies RS added are removed (a deny of the same tools that was in the settings before stays). A session already running keeps what it started with, as for any change of its MCP servers.
 
 ## Work packages
 
@@ -152,6 +164,8 @@ Under Claude the referee runs the model set for the whole installation in **Host
 **A re-run proves the deliverable reproduces, not that it is right.** The user judges. Analysts are told to keep their evidence files deterministic (no timings, timestamps or unordered rows), so a "differs" is no longer expected; when one shows, it is worth a look.
 
 **An analyst's write-up is checked at its end, not only asked for.** An instruction alone was measured not to be enough. A check when the analyst finishes holds it back once with a reminder. It never holds it twice, and a check that cannot run lets it go, so an analyst is never trapped.
+
+**With the search service wired, all web access goes through it.** The isolation is the point, against prompt injection: pages are read by a search agent in a container of its own, and the researcher and its analysts see only its written summary. The web helper is something RS builds and can improve over time, not a Claude built-in subagent. Analysts call the service themselves, because the working session's context is the limit when every search is relayed through it. The cost: a quick lookup (a function's signature, a dataset's page) becomes a search of minutes instead of a fetch of seconds, and the paper check's source checker reads its sources through a search too. The deny binds the built-in web tools of the Claude Code RS installs; the agents' shell can still reach the web (the project's egress is unchanged), so the rest is the instructions'.
 
 **The checks exist only in projects of this type.** A `researcher` project behaves exactly as before.
 
