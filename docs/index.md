@@ -102,7 +102,7 @@ Chosen in the New Project window. Inner-Docker projects can hold boxes and conta
 |---|---|---|---|
 | `research` | inner Docker | Claude | A supervisor that plans with you, runs each analysis in a worker container, reviews it, and logs the session |
 | `researcher` | inner Docker | Claude, pi | One agent on one line of inquiry for weeks, with a memory, pages it writes for you to read in the Reader tab, and a logbook; findings enter the record when you accept them |
-| `researcher-subagents` | inner Docker | Claude, pi | A researcher that hands analyses to helpers running in parallel; each finding is re-run and refereed before you accept it |
+| `researcher-subagents` | inner Docker | Claude, pi | A researcher that, by default, hands analyses to helpers running in parallel and has each finding re-run and refereed before you accept it; both are switches |
 | `companion` | inner Docker | Claude, pi | A researcher for one-off and mixed tasks: one folder per task, your standing preferences remembered, and claims only when you ask |
 | `dev` | inner Docker | Claude, pi | An agent on one GitHub repository's fork, with working modes and its own Docker for tests |
 | `sandbox-dind` | inner Docker | Claude, pi | A confined agent with its own Docker and boxes |

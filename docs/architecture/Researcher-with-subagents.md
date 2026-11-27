@@ -65,6 +65,23 @@ When the researcher stages a finding, it gives the command that reproduces it, o
 
 Each check waits until it ends and answers the researcher, which tells the user. Under Claude the researcher starts both as background tasks of its own session, which report back when they end, so it can go on meanwhile; under pi it waits for each, and Esc stops it. Stopping a check's call stops the check, which then reads failed, so nothing runs unwatched. The finding's page under `staging/`, and its line on the front page, show both in plain words (for example "re-run: reproduced exactly, 3 of 3 files · referee: supported"), and a referee's objection with its narrower claim in full; once accepted, its page under `results/` keeps them, with the objection it was accepted over. The user decides: a finding the referee objects to can still be accepted when the user says so, and the objection stays on it. A changed claim or evidence voids both checks. Open questions, retractions and facts about the data need no checks: the user accepts a fact without a re-run or a referee.
 
+## Subagents and checks: two switches
+
+A project of this type has two switches, which decide how its sessions work:
+
+| Switch | Values | What it does |
+|---|---|---|
+| **Subagents** | on (default), off | On: the researcher hands analyses to analysts running in parallel, as above. Off: it does every analysis itself, one at a time, and launches no analyst. The analysts stay installed, so a session can switch them on. |
+| **Checks** | staged (default), all, off | Staged: a finding the researcher stages needs both checks before the user can accept it, as above. All: the same, and the researcher stages every result it reports (each analyst's, or each analysis it finished itself) and starts its checks. Off: a finding can be accepted without its checks. |
+
+The project's switches are what every new session starts with. They are set when the project is created and changed later (on the command line, `--subagents` and `--checks` of `project create` and `project update`); a change is written into the agent's instructions at once, and nothing restarts. A project created before the switches, with none recorded, works with subagents on and checks staged, as it always did.
+
+A running session switches its own with `/rs-mode` (under pi `/skill:rs-mode`): for example `/rs-mode checks all` or `/rs-mode subagents off checks off`. The agent records them for that session through the memory command, which keys them on the session's id, and works under them from its next unit of work; the skill carries the instruction text of every switch value, so the session has the text of its new switches. Other running sessions keep theirs, and new sessions still start with the project's. At every session start the memory command's opening text names the switches the session works under and where each comes from.
+
+**Checking many results at once.** The memory command checks several staged findings with one call: it starts every re-run and every referee side by side and waits until all have ended, printing each result as a single check does. Under Claude the researcher starts that call as one background task; under pi, where a call waits, it is one wait instead of one per check. With checks on every result, this is how a finished batch of analyses is checked.
+
+**Not checked.** With the checks off, a finding the user accepts without its checks has a record entry naming what it lacked, and its page under `results/` and its line on the front page say "not checked". A finding staged with the checks off says "not checked (staged with the checks off)" on its page under `staging/` and on the front page until a check runs on it. The checks still work when the user asks for them; a check that ran is kept on the entry, and a referee's objection still needs the user's word to accept over it. Whether a finding needs its checks is decided by the session that accepts it, so the same finding can be held in one session and accepted in another whose checks are off.
+
 The web is the researcher's own for a quick lookup. A survey goes to a **surveyor** under Claude: it has only Claude's web search and page fetch, runs in the background, and answers with a summary and its sources. Under pi there is no survey helper yet, and the researcher says so.
 
 ## The helpers' models
@@ -94,3 +111,9 @@ Under Claude the referee runs the model set for the whole installation in **Host
 **An analyst's write-up is checked at its end, not only asked for.** An instruction alone was measured not to be enough. A check when the analyst finishes holds it back once with a reminder. It never holds it twice, and a check that cannot run lets it go, so an analyst is never trapped.
 
 **The checks exist only in projects of this type.** A `researcher` project behaves exactly as before.
+
+**The switches are the project's default, switchable per session.** As with a dev project's working mode, the project's setting is what a new session starts with and `/rs-mode` changes one running session. The cost is that a change in the project's settings does not reach a session already running.
+
+**Checks off says so, it does not hide it.** A finding accepted unchecked carries that on its record entry and its pages, so the record never reads as checked when it was not. The cost is a line of text the user sees on every such entry.
+
+**The agent can switch its own session.** The memory command records what the agent tells it, as it already accepts a claim when the agent says the user did; both rest on the agent's instruction to act only on the user's word. A project can weaken only its own checks this way.
