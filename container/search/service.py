@@ -27,10 +27,10 @@ the running server from inside the container (the admin routes answer
 127.0.0.1 only): the operator's list of waiting and running searches, a
 read-only view of one search's work, stopping one, and testing the sign-in.
 `admin ask` (its body on stdin), `admin conversations|conversations-clear`
-and `admin conversation ID` are the Search page's Quick Ask: the operator's
-own questions, searches in the same queue under a project no caller can be,
-collected by the service itself at their end and kept, with their answers,
-in conversations on a volume of their own.
+and `admin conversation|conversation-delete ID` are the Search page's Quick
+Ask: the operator's own questions, searches in the same queue under a project
+no caller can be, collected by the service itself at their end and kept, with
+their answers, in conversations on a volume of their own.
 
 Stdlib only (the dind image's conda Python).
 """
@@ -217,27 +217,10 @@ OPERATOR_CONSUMER = "webui"
 CONVERSATIONS_DIR = "/var/lib/rs-search-conversations"
 CONVERSATIONS_NAME = "conversations.json"
 CONVERSATIONS_VERSION = 1
-# How many conversations are kept; the oldest (the one asked in longest ago)
-# goes when a new one starts. A conversation is one line of the page's list,
-# and the asks are the operator's own (a handful a day at most), so 20 is a
-# few weeks of them: a list read without scrolling far. The whole file is
-# written again at every ask's start and end. At half, a busy week pushes out a
-# thread still being followed; at ten times the list becomes an archive the
-# page is not meant to be (a report worth keeping is copied out of it), and
-# every save writes ten times as much.
-CONVERSATIONS_MAX = 20
-# The largest conversations file the service reads (and so the largest it
-# writes: past this the oldest conversations go first, as past
-# CONVERSATIONS_MAX, and one conversation alone past it loses its oldest
-# asks). One ask keeps its full report (REPORT_MAX_BYTES at most, a few to
-# tens of KB in practice), its work view (about 220 KB at worst, see
-# Searches.recent) and its question (QUESTION_MAX_CHARS): 1.4 MB at worst, tens
-# of KB in practice, so CONVERSATIONS_MAX conversations of ten real asks each
-# are a few MB. 64 MiB is several times a heavy real store and still read at
-# start and written at every save in well under a second. At half a store
-# holding a few reports at the cap could reach it; at ten times the service's
-# memory (it holds the store) and every save become the cost.
-CONVERSATIONS_MAX_BYTES = 64 * 1024 * 1024
+# Every conversation is kept until the operator deletes it or clears them
+# all: no count and no size is capped, here or when the file is read (the
+# file is the operator's own questions and their answers, written only by
+# this service).
 # One ask's request body (`admin ask`'s stdin): the question of at most
 # QUESTION_MAX_CHARS characters as JSON, where one character can take 12 bytes
 # (a character outside the BMP written as two \u escapes), plus the
@@ -741,7 +724,7 @@ class Searches:
             if conv is None:
                 cid = secrets.token_hex(8)
                 conv = {"id": cid, "created_at": now, "updated_at": now, "asks": [entry]}
-                kept = [conv] + self.conversations[:CONVERSATIONS_MAX - 1]
+                kept = [conv] + self.conversations
             else:
                 cid = conv["id"]
                 conv = dict(conv, updated_at=now, asks=conv["asks"] + [entry])
@@ -792,12 +775,12 @@ class Searches:
     def conversations_list(self) -> dict:
         with self.lock:
             if self.conv_error:
-                return {"conversations": [], "kept": CONVERSATIONS_MAX, "error": self.conv_error}
+                return {"conversations": [], "error": self.conv_error}
             return {"conversations": [
                 {"id": c["id"], "title": c["asks"][0]["question"][:LIST_QUESTION_MAX_CHARS],
                  "updated_at": c["updated_at"], "asks": len(c["asks"]),
                  "last_state": self._ask_state(c["asks"][-1])}
-                for c in self.conversations], "kept": CONVERSATIONS_MAX, "error": None}
+                for c in self.conversations], "error": None}
 
     def conversation(self, cid: str) -> dict:
         """One conversation, its asks oldest first: an ended one as its entry
@@ -859,6 +842,25 @@ class Searches:
         log(f"conversations cleared ({n})")
         return {"cleared": n}
 
+    def conversation_delete(self, cid: str) -> dict:
+        """Delete one conversation: it goes from the store, which is saved
+        (the file is written again; nothing is removed). An ask of it still
+        running keeps running and is collected at its end as any ask is; it
+        is no longer in any conversation. ToolRefusal when it is not kept, the
+        file is damaged, or the save fails (the store is then unchanged)."""
+        with self.lock:
+            if self.conv_error:
+                raise ToolRefusal(self.conv_error)
+            kept = [c for c in self.conversations if c["id"] != cid]
+            if len(kept) == len(self.conversations):
+                raise ToolRefusal(NO_SUCH_CONVERSATION)
+            problem = self._save_conversations(kept)
+            if problem:
+                raise ToolRefusal(problem)
+            self.conversations = kept
+        log(f"conversation {cid} deleted")
+        return {"deleted": cid}
+
     def _find_ask(self, sid: str) -> dict | None:
         """Under the lock: an ended ask's entry in the conversations."""
         for c in self.conversations:
@@ -884,7 +886,7 @@ class Searches:
                                   else a for a in c["asks"]])
             kept.append(c)
         if not found:
-            return                          # cleared, or dropped as the oldest meanwhile
+            return                          # deleted or cleared meanwhile
         self.conversations = kept
         problem = self._save_conversations(kept)
         if problem:
@@ -929,26 +931,10 @@ class Searches:
 
     def _save_conversations(self, convs: list[dict]) -> str | None:
         """Under the lock: write the conversations (fresh temp + rename in
-        their folder; never opens an existing name). Past
-        CONVERSATIONS_MAX_BYTES the oldest conversations go from `convs` (in
-        place) first, then the oldest asks of the last one left. None, or why
-        it could not be written."""
-        def encode() -> bytes:
-            return json.dumps({"version": CONVERSATIONS_VERSION, "conversations": convs},
-                              ensure_ascii=False, separators=(",", ":")).encode()
-        data = encode()
-        while len(data) > CONVERSATIONS_MAX_BYTES:
-            if len(convs) > 1:
-                dropped = convs.pop()
-                log(f"conversation {dropped['id']} dropped: the conversations reached "
-                    f"{CONVERSATIONS_MAX_BYTES} bytes")
-            elif convs and len(convs[0]["asks"]) > 1:
-                convs[0] = dict(convs[0], asks=convs[0]["asks"][1:])
-                log(f"the oldest ask of conversation {convs[0]['id']} dropped: it reached "
-                    f"{CONVERSATIONS_MAX_BYTES} bytes")
-            else:
-                break
-            data = encode()
+        their folder; never opens an existing name), all of them. None, or
+        why it could not be written."""
+        data = json.dumps({"version": CONVERSATIONS_VERSION, "conversations": convs},
+                          ensure_ascii=False, separators=(",", ":")).encode()
         tmp = os.path.join(CONVERSATIONS_DIR, f".{CONVERSATIONS_NAME}.{secrets.token_hex(4)}")
         try:
             os.makedirs(CONVERSATIONS_DIR, mode=0o700, exist_ok=True)
@@ -1375,8 +1361,7 @@ def _conversations_shape(data) -> list | None:
     if not (isinstance(data, dict) and set(data) == {"version", "conversations"}
             and data["version"] == CONVERSATIONS_VERSION
             and not isinstance(data["version"], bool)
-            and isinstance(data["conversations"], list)
-            and len(data["conversations"]) <= CONVERSATIONS_MAX):
+            and isinstance(data["conversations"], list)):
         return None
     seen: set = set()
     for c in data["conversations"]:
@@ -1396,7 +1381,8 @@ def _conversations_shape(data) -> list | None:
 def _read_conversations() -> tuple[list, str | None]:
     """(the kept conversations, None), or ([], why the file is not one the
     service wrote). No file is no conversations. Opened without following a
-    link and never blocking on a FIFO, read with its cap."""
+    link and never blocking on a FIFO, read whole (the service writes it,
+    with no size cap)."""
     try:
         dfd = os.open(CONVERSATIONS_DIR, os.O_RDONLY | os.O_DIRECTORY)
     except FileNotFoundError:
@@ -1413,16 +1399,12 @@ def _read_conversations() -> tuple[list, str | None]:
                 return [], "the file is not a regular file"
             return [], f"the file cannot be read: {e.strerror or 'read failed'}"
         try:
-            if st.st_size > CONVERSATIONS_MAX_BYTES:
-                return [], (f"the file is larger than {CONVERSATIONS_MAX_BYTES // (1024 * 1024)} "
-                            "MiB, more than the service ever writes")
-            pieces, size = [], 0
-            while size <= CONVERSATIONS_MAX_BYTES:
+            pieces = []
+            while True:
                 piece = os.read(fd, PIECE)
                 if not piece:
                     break
                 pieces.append(piece)
-                size += len(piece)
             raw = b"".join(pieces)
         finally:
             os.close(fd)
@@ -1430,9 +1412,6 @@ def _read_conversations() -> tuple[list, str | None]:
         return [], f"the file cannot be read: {e.strerror or 'read failed'}"
     finally:
         os.close(dfd)
-    if len(raw) > CONVERSATIONS_MAX_BYTES:
-        return [], (f"the file is larger than {CONVERSATIONS_MAX_BYTES // (1024 * 1024)} "
-                    "MiB, more than the service ever writes")
     try:
         data = json.loads(raw)
     except (ValueError, RecursionError):
@@ -2029,6 +2008,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, SEARCHES.conversations_clear())
             except ToolRefusal as e:
                 return self._json(422, {"error": str(e)})
+        if (path.startswith("/admin/conversation/") and path.endswith("/delete")
+                and post):
+            cid = path[len("/admin/conversation/"):-len("/delete")]
+            if not ID_RE.match(cid):
+                return self._json(404, {"error": NO_SUCH_CONVERSATION})
+            try:
+                return self._json(200, SEARCHES.conversation_delete(cid))
+            except ToolRefusal as e:
+                return self._json(404 if str(e) == NO_SUCH_CONVERSATION else 422,
+                                  {"error": str(e)})
         if path.startswith("/admin/conversation/") and not post:
             cid = path[len("/admin/conversation/"):]
             if not ID_RE.match(cid):
@@ -2099,7 +2088,7 @@ def drop(name: str) -> int:
 
 # The exit code of `admin` when the service answered with a refusal (its JSON
 # error on stdout): no such search for view / report / stop, no such
-# conversation, or an ask or a clear refused (its text in `error`).
+# conversation, or an ask, a delete or a clear refused (its text in `error`).
 ADMIN_REFUSED_EXIT = 3
 # Each admin request: its route and whether it is a GET. `ask` sends its
 # stdin as the body.
@@ -2108,8 +2097,11 @@ _ADMIN_ROUTES = {"status": ("status", True), "ensure": ("ensure", False),
                  "view": ("view", True), "report": ("report", True), "stop": ("stop", False),
                  "ask": ("ask", False), "conversations": ("conversations", True),
                  "conversations-clear": ("conversations/clear", False),
-                 "conversation": ("conversation", True)}
-_ADMIN_WITH_ID = ("view", "report", "stop", "conversation")
+                 "conversation": ("conversation", True),
+                 "conversation-delete": ("conversation", False)}
+_ADMIN_WITH_ID = ("view", "report", "stop", "conversation", "conversation-delete")
+# What follows the id in a request's route (none for the others).
+_ADMIN_ID_SUFFIX = {"conversation-delete": "/delete"}
 
 
 def admin(what: str, sid: str | None = None) -> int:
@@ -2125,7 +2117,8 @@ def admin(what: str, sid: str | None = None) -> int:
             sys.stderr.write("too large\n")
             return 2
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}/admin/{route}"
-                                 + (f"/{sid}" if sid else ""),
+                                 + (f"/{sid}" if sid else "")
+                                 + _ADMIN_ID_SUFFIX.get(what, ""),
                                  method="GET" if get else "POST",
                                  data=None if get else body,
                                  headers={} if get else {"Content-Type": "application/json"})
@@ -2156,7 +2149,8 @@ def main(argv: list) -> int:
         return admin(*argv[1:])
     sys.stderr.write("usage: service.py serve | put NAME | drop NAME | admin "
                      "status|ensure|clear|list|test|conversations|conversations-clear | "
-                     "admin ask (the body on stdin) | admin view|report|stop|conversation ID\n")
+                     "admin ask (the body on stdin) | "
+                     "admin view|report|stop|conversation|conversation-delete ID\n")
     return 2
 
 

@@ -2662,35 +2662,90 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
    no bare textarea rule). */
 .searchsvc-ask-problem { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 10px 10px; }
 .searchsvc-ask-problem[hidden] { display: none; }
+/* The page body while Quick Ask is on screen fills the page under the top
+   strip, like the Gitea and Aldine tabs (LOCKSTEP with .dev-gitea-body's
+   height: the strip and the host view's padding); what sits above the chat
+   (Services' sub-tabs, the error line, a flash) keeps its height and the
+   chat takes the rest, so the side list and the conversation stay in place
+   and scroll on their own. The phone twin is under html.mobile. */
+.searchsvc-ask-view { height: calc(100dvh - 69px); display: flex; flex-direction: column; }
+.searchsvc-ask-view > * { flex-shrink: 0; }
+.searchsvc-ask-view > .searchsvc-chat { flex: 1 1 0; min-height: 0; }
 .searchsvc-chat {
     display: flex;
-    min-height: 60vh;
     border: 1px solid var(--border);
     border-radius: 6px;
     overflow: hidden;
 }
+/* Its width is dragged by the handle on its edge (app.js sets the variable). */
 .searchsvc-side {
-    flex: 0 0 250px;
+    flex: 0 0 var(--searchsvc-side-width, 250px);
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: 4px;
     padding: 10px;
-    border-right: 1px solid var(--border);
     background: var(--bg-input);
-    overflow-y: auto;
+    overflow: hidden;
 }
-.searchsvc-side > .btn-small { align-self: flex-start; }
+.searchsvc-side-acts { display: flex; flex-wrap: wrap; gap: 6px; flex-shrink: 0; }
+.searchsvc-side-acts > .btn { padding: 5px 10px; font-size: 12px; }
 .searchsvc-side .searchsvc-flash { margin: 6px 4px; }
-.searchsvc-side-items { display: flex; flex-direction: column; gap: 4px; }
-.searchsvc-side-item { padding: 8px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+.searchsvc-side-err { margin: 4px; flex-shrink: 0; }
+.searchsvc-side-err:empty { display: none; }
+.searchsvc-side-items {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.searchsvc-side-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 8px;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+}
 .searchsvc-side-item:hover { background: var(--border); }
 .searchsvc-side-item.active { background: var(--bg-card); box-shadow: 2px 0 0 var(--fg-accent) inset; }
+.searchsvc-side-text { flex: 1 1 auto; min-width: 0; }
 .searchsvc-side-title { color: var(--fg-base); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .searchsvc-side-meta { margin-top: 2px; font-size: 11px; color: var(--fg-faint); }
-.searchsvc-side-kept { margin: 8px 4px 4px; font-size: 11px; color: var(--fg-faint); }
-.searchsvc-conv { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
-.searchsvc-msgs { flex: 1 1 auto; overflow-y: auto; padding: 14px 16px; }
+/* An item's delete: shown on hover and on the selected item. */
+.searchsvc-side-del {
+    flex: 0 0 auto;
+    visibility: hidden;
+    padding: 0 4px;
+    border: none;
+    border-radius: 4px;
+    background: none;
+    color: var(--fg-faint);
+    font-size: 12px;
+    line-height: 18px;
+    cursor: pointer;
+}
+.searchsvc-side-item:hover .searchsvc-side-del,
+.searchsvc-side-item.active .searchsvc-side-del,
+.searchsvc-side-del:focus-visible { visibility: visible; }
+.searchsvc-side-del:hover:not(:disabled) { color: var(--error-fg); background: var(--bg-input); }
+.searchsvc-side-del:disabled { opacity: 0.5; cursor: default; }
+/* The side list's edge, dragged to resize it (the splitter's look). */
+.searchsvc-side-handle {
+    flex: 0 0 5px;
+    cursor: col-resize;
+    border-left: 1px solid var(--border);
+    background: var(--bg-input);
+    touch-action: none;
+}
+.searchsvc-side-handle:hover,
+.searchsvc-side-handle.dragging { background: var(--fg-accent); }
+.searchsvc-conv { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.searchsvc-msgs { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 14px 16px; }
 .searchsvc-msg { max-width: 78%; margin-bottom: 14px; }
 .searchsvc-msg-me { margin-left: auto; }
 .searchsvc-msg-who {
@@ -2728,15 +2783,21 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-ask-work > summary { cursor: pointer; }
 .searchsvc-ask-work .searchsvc-work { margin: 6px 0 0; max-height: 40vh; }
 .searchsvc-ask-acts { display: flex; gap: 6px; margin-top: 8px; }
-.searchsvc-composer { padding: 10px 14px; border-top: 1px solid var(--border); background: var(--bg-input); }
+.searchsvc-composer { flex-shrink: 0; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--bg-input); }
 .searchsvc-composer-row { display: flex; gap: 8px; align-items: flex-end; }
 .searchsvc-input.searchsvc-ask-text { flex: 1 1 auto; width: auto; min-width: 0; resize: vertical; font-family: inherit; }
 .searchsvc-composer-hint { margin-top: 6px; font-size: 12px; color: var(--fg-faint); }
 .searchsvc-include { margin-top: 4px; font-size: 12px; color: var(--fg-muted); }
 .searchsvc-ask-err { margin-top: 6px; }
-/* A phone: the side list goes above the conversation. */
-html.mobile .searchsvc-chat { flex-direction: column; }
-html.mobile .searchsvc-side { flex: 0 0 auto; max-height: 30vh; border-right: none; border-bottom: 1px solid var(--border); }
+/* A phone: the side list goes above the conversation, and the page scrolls
+   as a whole (no fixed height, no drag; every item's delete shows). */
+html.mobile .searchsvc-ask-view { height: auto; display: block; }
+html.mobile .searchsvc-chat { flex-direction: column; min-height: 60vh; }
+html.mobile .searchsvc-side { flex: 0 0 auto; max-height: 30vh; overflow-y: auto; border-bottom: 1px solid var(--border); }
+html.mobile .searchsvc-side-items { flex: 0 0 auto; overflow: visible; }
+html.mobile .searchsvc-side-handle { display: none; }
+html.mobile .searchsvc-side-del { visibility: visible; }
+html.mobile .searchsvc-msgs { flex: 1 1 auto; }
 html.mobile .searchsvc-msg { max-width: 92%; }
 
 /* Services → MCP (the gateway's server list). Self-scoped classes only. */

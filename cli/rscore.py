@@ -24235,7 +24235,7 @@ def search_conversations(deadline: float | None = None) -> dict:
                       "updated_at": _search_reply_ts(c.get("updated_at")),
                       "asks": _search_reply_int(c.get("asks")),
                       "last_state": _search_reply_choice(c.get("last_state"), _SEARCH_STATES)})
-    return {"conversations": convs, "kept": _search_reply_int(reply.get("kept")),
+    return {"conversations": convs,
             "error": None if error is None else _search_reply_str(error, _SEARCH_REASON_MAX)}
 
 
@@ -24282,6 +24282,20 @@ def search_conversation(req: SearchConversationRequest, deadline: float | None =
     return {"id": req.id,
             "title": _search_reply_str(c.get("title"), _SEARCH_LIST_QUESTION_MAX),
             "asks": [_search_ask_row(a) for a in c["asks"]]}
+
+
+def search_conversation_delete(req: SearchConversationRequest,
+                               deadline: float | None = None) -> dict:
+    """Delete one kept conversation: it goes from the service's store (an
+    ask of it still running keeps running and is collected at its end, in no
+    conversation any more). {"deleted": its id}."""
+    deadline = _mcp_deadline() if deadline is None else deadline
+    how, out = _search_ask(["conversation-delete", req.id], deadline)
+    if how == "refused":
+        raise _search_refusal(out, SEARCH_NO_CONVERSATION)
+    if _search_reply_dict(out).get("deleted") != req.id:
+        raise ValidationError(SEARCH_BAD_ANSWER)
+    return {"deleted": req.id}
 
 
 def search_conversations_clear(deadline: float | None = None) -> dict:

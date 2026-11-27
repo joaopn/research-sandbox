@@ -725,6 +725,15 @@ def _verb_search_conversation(args: dict, _progress=None) -> dict:
     return rscore.search_conversation(req, deadline)
 
 
+def _verb_search_conversation_delete(args: dict, _progress=None) -> dict:
+    """Delete one kept conversation (field `id`)."""
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    safe = {k: v for k, v in args.items() if k in SEARCH_ID_WEBUI_FIELDS}
+    req = rscore.SearchConversationRequest.from_kwargs(**safe)
+    return rscore.search_conversation_delete(req, deadline)
+
+
 def _verb_search_conversations_clear(_args: dict, _progress=None) -> dict:
     """Clear conversations (a damaged file too)."""
     deadline = rscore._mcp_deadline()
@@ -1862,6 +1871,7 @@ VERBS = {
     "search_ask": _verb_search_ask,
     "search_conversations": _verb_search_conversations,
     "search_conversation": _verb_search_conversation,
+    "search_conversation_delete": _verb_search_conversation_delete,
     "search_conversations_clear": _verb_search_conversations_clear,
     "mcp_server_add": _verb_mcp_server_add,
     "mcp_server_draft": _verb_mcp_server_draft,

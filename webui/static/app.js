@@ -8878,6 +8878,7 @@ async function searchTurnOn(view, btn, errEl) {
 // section.
 async function renderSearchInto(view) {
     view.innerHTML = "";
+    view.classList.remove("searchsvc-ask-view");
     view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading the search service…"]));
     const landing = view.__rsRender || renderSearchInto;
     let res, body;
@@ -9739,6 +9740,23 @@ const SEARCH_ASK_ACTIVE = ["queued", "starting", "running"];
 // The conversation on screen (its id; null = a new one), kept across renders
 // so a sub-tab switch comes back to it.
 let searchAskSelected = null;
+// The side list's width, dragged by its edge and remembered in this browser.
+// The default is the width it had before it could be dragged. At the minimum
+// a title still shows its first words and its line under it ("running ·
+// 2026-11-27 14:05", about 140px at its 11px) and the two buttons (one under
+// the other) still fit; narrower, that line is cut. The maximum leaves the
+// conversation more than half of a 1280px screen with the projects rail
+// pinned (the chat is about 1000px wide there); wider, the answers shrink to
+// a narrow column while the titles gain nothing they need.
+const SEARCH_SIDE_WIDTH_DEFAULT = 250;
+const SEARCH_SIDE_WIDTH_MIN = 170;
+const SEARCH_SIDE_WIDTH_MAX = 480;
+const SEARCH_SIDE_WIDTH_KEY = "rs-webui-search-side-width";
+// How close to its bottom the conversation counts as being at the bottom when
+// it is re-read (it then stays at the bottom): under one line of its 13px
+// text, so a position rounded on a zoomed screen still counts while one wheel
+// step up (several lines) does not.
+const SEARCH_PIN_SLACK_PX = 8;
 
 // A moment the service gave (epoch seconds, or an ISO date) the way the
 // Recent table shows one: HH:MM today, the date before it on another day.
@@ -9756,13 +9774,84 @@ function searchWorkSorted(r) {
         .sort((x, y) => (Number(x && x.ts) || 0) - (Number(y && y.ts) || 0));
 }
 
-// Quick Ask: the conversations on the side (New conversation on top, Clear
-// conversations under them), the selected conversation, and the composer.
-// The side list is read when the tab opens and after each ask (and once more
-// when the conversation on screen has nothing left running, so its state
-// there is current); the conversation is read when selected and re-read every
-// SEARCH_LIST_POLL_MS only while one of its asks waits or runs and the tab is
-// on screen.
+// The side list's remembered width: the default when none is kept, storage
+// refuses, or what is kept is not a whole width within the bounds.
+function searchSideWidthRead() {
+    let raw = null;
+    try { raw = localStorage.getItem(SEARCH_SIDE_WIDTH_KEY); } catch (e) { raw = null; }
+    const v = typeof raw === "string" && /^[0-9]+$/.test(raw) ? Number(raw) : NaN;
+    return Number.isSafeInteger(v) && v >= SEARCH_SIDE_WIDTH_MIN && v <= SEARCH_SIDE_WIDTH_MAX
+        ? v : SEARCH_SIDE_WIDTH_DEFAULT;
+}
+
+function searchSideWidthStore(px) {
+    try { localStorage.setItem(SEARCH_SIDE_WIDTH_KEY, String(px)); } catch (e) { /* not kept */ }
+}
+
+function searchSideWidthApply(chat, px) {
+    chat.style.setProperty("--searchsvc-side-width", `${px}px`);
+}
+
+// The side list's edge: drag it to resize the list, like a chatbot's sidebar
+// (the rail splitter's pattern). Pointer capture on the handle; the width is
+// the pointer's x against the chat's left edge, within the bounds, and is
+// kept in this browser when the drag ends. A re-render replaces the pane
+// mid-drag and capture is lost: lostpointercapture (at the handle, or at the
+// document for a detached one, filtered by this press's pointerId) ends the
+// drag; the release handler removes both listeners FIRST, before
+// releasePointerCapture fires it again. Desktop only: a phone stacks the
+// list above the conversation.
+function installSearchSideDrag(handle, chat) {
+    let pointerId = null;
+    let width = null;
+    const onMove = (ev) => {
+        if (pointerId === null) return;
+        const rect = chat.getBoundingClientRect();
+        width = Math.round(Math.max(SEARCH_SIDE_WIDTH_MIN,
+                                    Math.min(SEARCH_SIDE_WIDTH_MAX, ev.clientX - rect.left)));
+        searchSideWidthApply(chat, width);
+    };
+    const onLost = (ev) => { if (ev.pointerId === pointerId) onUp(); };
+    const onUp = () => {
+        if (pointerId === null) return;
+        const id = pointerId;
+        pointerId = null;
+        handle.removeEventListener("lostpointercapture", onLost);
+        document.removeEventListener("lostpointercapture", onLost);
+        handle.removeEventListener("pointermove", onMove);
+        handle.removeEventListener("pointerup", onUp);
+        handle.removeEventListener("pointercancel", onUp);
+        try { handle.releasePointerCapture(id); } catch (_) {}
+        handle.classList.remove("dragging");
+        document.body.style.userSelect = "";
+        if (width !== null) searchSideWidthStore(width);
+    };
+    handle.onpointerdown = (ev) => {
+        if (mobileModeActive() || pointerId !== null) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        pointerId = ev.pointerId;
+        width = null;
+        handle.classList.add("dragging");
+        try { handle.setPointerCapture(ev.pointerId); } catch (_) {}
+        handle.addEventListener("pointermove", onMove);
+        handle.addEventListener("pointerup", onUp);
+        handle.addEventListener("pointercancel", onUp);
+        handle.addEventListener("lostpointercapture", onLost);
+        document.addEventListener("lostpointercapture", onLost);
+        document.body.style.userSelect = "none";
+    };
+}
+
+// Quick Ask: the conversations on the side (New conversation and Clear
+// conversations on top, a delete button on each, the list scrolling on its
+// own and resized by its edge), the selected conversation (scrolling on its
+// own, opened at its bottom), and the composer under it. Quick Ask fills the
+// page under the strips. The side list is read when the tab opens, after each
+// ask and each delete (and once more when the conversation on screen has
+// nothing left running, so its state there is current); the conversation is
+// read when selected and re-read every SEARCH_LIST_POLL_MS only while one of
+// its asks waits or runs and the tab is on screen.
 function searchAskPane(view, settings, flash) {
     const landing = view.__rsRender || renderSearchInto;
     const cur = settings ? (settings.settings || settings.defaults || {}) : {};
@@ -9773,10 +9862,14 @@ function searchAskPane(view, settings, flash) {
     problem.hidden = true;
     const listNote = el("div", { class: "searchsvc-flash" }, ["Reading the conversations…"]);
     const items = el("div", { class: "searchsvc-side-items" }, []);
-    const newBtn = el("button", { class: "btn-small" }, ["New conversation"]);
-    const clearBtn = el("button", { class: "btn-small" }, ["Clear conversations"]);
-    const keptNote = el("div", { class: "searchsvc-side-kept" }, []);
-    const side = el("div", { class: "searchsvc-side" }, [newBtn, listNote, items, keptNote, clearBtn]);
+    const newBtn = el("button", { class: "btn" }, ["New conversation"]);
+    const clearBtn = el("button", { class: "btn btn-danger" }, ["Clear conversations"]);
+    // A refused delete's text.
+    const sideErr = el("div", { class: "mgmt-reviewer-err searchsvc-side-err" }, []);
+    const side = el("div", { class: "searchsvc-side" }, [
+        el("div", { class: "searchsvc-side-acts" }, [newBtn, clearBtn]),
+        sideErr, listNote, items]);
+    const handle = el("div", { class: "searchsvc-side-handle", title: "Drag to resize the list" }, []);
     const msgs = el("div", { class: "searchsvc-msgs" }, []);
     const convNote = el("div", { class: "searchsvc-flash mcp-test-bad" }, []);
     const question = el("textarea", {
@@ -9798,7 +9891,11 @@ function searchAskPane(view, settings, flash) {
             askErr,
         ]),
     ]);
-    const chat = el("div", { class: "searchsvc-chat" }, [side, conv]);
+    const chat = el("div", { class: "searchsvc-chat" }, [side, handle, conv]);
+    searchSideWidthApply(chat, searchSideWidthRead());
+    installSearchSideDrag(handle, chat);
+    // The page body fills the height under the strips (the chat takes the rest).
+    view.classList.add("searchsvc-ask-view");
     view.appendChild(problem);
     const saidFlash = searchFlashEl("ask", flash);
     if (saidFlash) view.appendChild(saidFlash);
@@ -9810,6 +9907,8 @@ function searchAskPane(view, settings, flash) {
     let clocks = [];
     const stopping = new Set();    // ask ids whose Stop was sent
     const stopErr = new Map();     // ask id → the text of a refused Stop
+    const deleting = new Set();    // conversation ids whose delete was sent
+    let pinBottom = true;          // the next conversation painted shows its bottom
     const live = () => view.isConnected && chat.isConnected;
     // A host page left for a project tab stays in the document, hidden: no
     // reads then (an element under a display:none ancestor has no boxes).
@@ -9819,7 +9918,11 @@ function searchAskPane(view, settings, flash) {
         clearInterval(poll); clearInterval(tick);
         poll = null; tick = null;
     };
-    const login = () => { halt(); return renderMgmtLogin(view, landing); };
+    const login = () => {
+        halt();
+        view.classList.remove("searchsvc-ask-view");
+        return renderMgmtLogin(view, landing);
+    };
 
     const confirmClear = () => mcpConfirmDialog(view, {
         title: "Clear conversations",
@@ -9841,11 +9944,24 @@ function searchAskPane(view, settings, flash) {
         items.replaceChildren(...list.map((c) => {
             const meta = [SEARCH_RUN_STATE_TEXT[c.last_state] || String(c.last_state || ""),
                           searchWhen(c.updated_at)].filter((p) => p).join(" · ");
+            const del = el("button", {
+                class: "searchsvc-side-del", type: "button",
+                title: "Delete this conversation", "aria-label": "Delete this conversation",
+            }, ["✕"]);
+            del.disabled = deleting.has(c.id);
+            del.onclick = (ev) => {
+                // The item's own click opens the conversation; this does not.
+                if (ev) ev.stopPropagation();
+                return deleteOne(c.id);
+            };
             const item = el("div", {
                 class: "searchsvc-side-item" + (c.id === searchAskSelected ? " active" : ""),
             }, [
-                el("div", { class: "searchsvc-side-title" }, [String(c.title || "")]),
-                el("div", { class: "searchsvc-side-meta" }, [meta]),
+                el("div", { class: "searchsvc-side-text" }, [
+                    el("div", { class: "searchsvc-side-title" }, [String(c.title || "")]),
+                    el("div", { class: "searchsvc-side-meta" }, [meta]),
+                ]),
+                del,
             ]);
             item.onclick = () => select(c.id);
             return item;
@@ -9869,8 +9985,6 @@ function searchAskPane(view, settings, flash) {
         const r = body.result;
         list = (Array.isArray(r.conversations) ? r.conversations : []).filter((c) => c && c.id);
         listNote.textContent = list.length ? "" : "No conversations yet.";
-        keptNote.textContent = Number.isSafeInteger(r.kept) && r.kept > 0
-            ? `The newest ${r.kept} are kept until cleared.` : "";
         if (r.error) {
             const clear = el("button", { class: "btn-small" }, ["Clear conversations"]);
             clear.onclick = confirmClear;
@@ -9889,6 +10003,35 @@ function searchAskPane(view, settings, flash) {
         }
         paintList();
         return undefined;
+    };
+
+    // Delete one conversation at once (no question asked), then read the list
+    // again. The one on screen gives way to the next in the list (the one
+    // before it when it was the last), or to a new conversation when none is
+    // left. A refusal shows its text above the list.
+    const deleteOne = async (cid) => {
+        if (deleting.has(cid)) return undefined;
+        deleting.add(cid);
+        sideErr.textContent = "";
+        paintList();
+        const { status, body } = await mcpPost("/broker/search/conversation/delete", { id: cid });
+        deleting.delete(cid);
+        if (!live()) return halt();
+        if (status === 401) return login();
+        if (status !== 200 || !body.ok) {
+            sideErr.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+            paintList();
+            return undefined;
+        }
+        const at = list.findIndex((c) => c.id === cid);
+        list = list.filter((c) => c.id !== cid);
+        if (cid === searchAskSelected) {
+            const next = list.length ? list[Math.min(Math.max(at, 0), list.length - 1)] : null;
+            select(next ? next.id : null);
+        } else {
+            paintList();
+        }
+        return readList();
     };
 
     const stopOne = async (askId) => {
@@ -10005,7 +10148,14 @@ function searchAskPane(view, settings, flash) {
             nodes.push(answer(a, at));
         }
         if (!nodes.length) nodes.push(el("div", { class: "searchsvc-flash" }, ["No questions yet."]));
+        // Pinned to the bottom (the latest message) when it was opened or
+        // asked in, or when the operator was at the bottom; scrolled up, it
+        // stays where it is.
+        const atBottom = msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight
+            <= SEARCH_PIN_SLACK_PX;
         msgs.replaceChildren(...nodes);
+        if (pinBottom || atBottom) msgs.scrollTop = msgs.scrollHeight;
+        pinBottom = false;
     };
 
     // Read the selected conversation (`g` = the selection it was asked for: a
@@ -10064,6 +10214,7 @@ function searchAskPane(view, settings, flash) {
         gen++;
         searchAskSelected = id;
         shownConv = null;
+        pinBottom = true;
         convNote.textContent = "";
         askErr.textContent = "";
         stopping.clear(); stopErr.clear();
@@ -10101,6 +10252,7 @@ function searchAskPane(view, settings, flash) {
         } else {
             halt();
             gen++;
+            pinBottom = true;
             readConv(gen);
         }
         return readList();

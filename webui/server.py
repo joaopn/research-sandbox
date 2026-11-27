@@ -1132,6 +1132,18 @@ async def broker_search_conversation_handler(request: web.Request) -> web.Respon
     return web.json_response(body, status=status)
 
 
+async def broker_search_conversation_delete_handler(request: web.Request) -> web.Response:
+    """POST /broker/search/conversation/delete {id} — delete one kept
+    conversation. The broker validates the id; an absent one is sent as
+    absent, so the broker refuses it cleanly."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _search_body(request)
+    args = {"id": body["id"]} if "id" in body else {}
+    status, reply = await _relay(request, "search_conversation_delete", args)
+    return web.json_response(reply, status=status)
+
+
 def _aldine_tab_listed(project: str, path: Path | None = None) -> bool:
     """Whether `project` gets the Aldine tab by the host-written tab record:
     the record says Aldine is on AND lists the project. Anything else — no
@@ -4914,6 +4926,8 @@ def main() -> None:
     app.router.add_post("/broker/search/ask", broker_search_ask_handler)
     app.router.add_get("/broker/search/conversations", broker_search_conversations_handler)
     app.router.add_get("/broker/search/conversation", broker_search_conversation_handler)
+    app.router.add_post("/broker/search/conversation/delete",
+                        broker_search_conversation_delete_handler)
     app.router.add_post("/broker/search/conversations/clear",
                         _search_plain_post("search_conversations_clear"))
     app.router.add_get("/broker/software", broker_software_handler)
