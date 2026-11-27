@@ -999,7 +999,12 @@ async def broker_aldine_session_handler(request: web.Request) -> web.Response:
 # fourth leg of the request-field ↔ SEARCH_*_WEBUI_FIELDS ↔ app.js payload
 # lockstep. The token is a secret: it travels in this request's body to the
 # broker and nowhere else (no log line, no reply carries it).
-_SEARCH_SETTINGS_FIELDS = ("name", "model", "effort", "at_once", "contact", "recent")
+_SEARCH_SETTINGS_FIELDS = ("name", "model", "effort", "at_once", "contact", "recent",
+                           "sidebar")
+# The operator's own ask (Services → Search → Quick Ask): the question, the
+# conversation it belongs to (null = a new one) and whether the conversation's
+# earlier questions and answers go with it.
+_SEARCH_ASK_FIELDS = ("question", "conversation", "include")
 
 
 async def _search_body(request: web.Request) -> dict:
@@ -1026,8 +1031,9 @@ async def broker_search_settings_handler(request: web.Request) -> web.Response:
 
 async def broker_search_settings_set_handler(request: web.Request) -> web.Response:
     """POST /broker/search/settings {name, model, effort, at_once, contact,
-    recent} — save the searcher, the contact address and how many ended
-    searches the page lists (all six; saving replaces the file). An absent
+    recent, sidebar} — save the searcher, the contact address, how many ended
+    searches the page lists and whether the sidebar shows Search (all seven;
+    saving replaces the file). An absent
     key is sent as absent, so the broker refuses it cleanly."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
@@ -1049,7 +1055,8 @@ async def broker_search_token_handler(request: web.Request) -> web.Response:
 
 
 def _search_plain_post(verb: str):
-    """A POST that carries no field (token-clear, off, clear, test)."""
+    """A POST that carries no field (token-clear, off, clear, test, the
+    conversations' clear)."""
     async def handler(request: web.Request) -> web.Response:
         if not origin_ok(request):
             return web.Response(status=403, text="origin rejected")
@@ -1093,6 +1100,36 @@ async def broker_search_stop_handler(request: web.Request) -> web.Response:
     args = {"id": body["id"]} if "id" in body else {}
     status, reply = await _relay(request, "search_stop", args)
     return web.json_response(reply, status=status)
+
+
+async def broker_search_ask_handler(request: web.Request) -> web.Response:
+    """POST /broker/search/ask {question, conversation, include} — the
+    operator's own question to the searcher, queued like an agent's. The
+    answer names the conversation and the ask; an absent field is sent as
+    absent, so the broker refuses it cleanly."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _search_body(request)
+    args = {k: body[k] for k in _SEARCH_ASK_FIELDS if k in body}
+    status, reply = await _relay(request, "search_ask", args)
+    return web.json_response(reply, status=status)
+
+
+async def broker_search_conversations_handler(request: web.Request) -> web.Response:
+    """GET /broker/search/conversations — the operator's kept conversations,
+    newest first (title, last change, asks, the last ask's state)."""
+    status, body = await _relay(request, "search_conversations")
+    return web.json_response(body, status=status)
+
+
+async def broker_search_conversation_handler(request: web.Request) -> web.Response:
+    """GET /broker/search/conversation?id=<id> — one conversation's asks,
+    oldest first, each with its state, counts and, once ended, its answer
+    (read-only). The broker validates the id; an absent one is sent as absent."""
+    cid = request.query.get("id")
+    args = {"id": cid} if cid is not None else {}
+    status, body = await _relay(request, "search_conversation", args)
+    return web.json_response(body, status=status)
 
 
 def _aldine_tab_listed(project: str, path: Path | None = None) -> bool:
@@ -4874,6 +4911,11 @@ def main() -> None:
     app.router.add_get("/broker/search/report", broker_search_report_handler)
     app.router.add_post("/broker/search/stop", broker_search_stop_handler)
     app.router.add_post("/broker/search/test", _search_plain_post("search_test"))
+    app.router.add_post("/broker/search/ask", broker_search_ask_handler)
+    app.router.add_get("/broker/search/conversations", broker_search_conversations_handler)
+    app.router.add_get("/broker/search/conversation", broker_search_conversation_handler)
+    app.router.add_post("/broker/search/conversations/clear",
+                        _search_plain_post("search_conversations_clear"))
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)

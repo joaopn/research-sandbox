@@ -7,7 +7,13 @@ nav_order: 9
 
 RS can run one search service for the whole installation. An agent hands it a question and goes on working; the search runs elsewhere, and the agent later collects a written summary with every source, the files the search downloaded (reports, PDFs) and an account of what was tried and what failed. Any agent can use it, under Claude Code and pi alike: a project's agent, a box, or a research project's analysis workers.
 
-It is off until the operator turns it on, in the Search tab of the Services page. Turn on builds the service's images, starts its container and stages the search images into it (minutes the first time), and lists it on the [MCP gateway](MCP-servers.md) as the server `search`. The same tab signs the service in (a long-lived token, below), sets the one searcher (its name, model and effort, and how many searches run at once), an optional contact address and how many ended searches its Recent searches list keeps, shows how many searches are waiting, running or ended and not collected, lists the waiting and running ones with their work so far and a Stop button (below), clears the ended ones, and turns the service off. `research search on | off | status | token | token-clear | settings | clear` does the same from the host.
+It is off until the operator turns it on, in the Search tab of the Services page. That tab has three sub-tabs, in a second strip drawn like the main tabs; the page opens on the one last used in this browser, and on Settings while the service is not running, since nothing else works then:
+
+- **Quick Ask** asks the searcher a question directly, in a chat with its own list of conversations (below).
+- **Activity** lists the waiting and running searches with their work so far and a Stop button, and the recent ones with their reports (below).
+- **Settings** turns the service on and off, clears the ended searches nobody collected, signs the service in (a long-lived token, below) with **Test**, sets the one searcher (its name, model and effort, and how many searches run at once), an optional contact address and how many ended searches Activity's Recent searches list keeps, and holds the switch **Show Search in the sidebar** (below).
+
+Turn on builds the service's images, starts its container and stages the search images into it (minutes the first time), and lists it on the [MCP gateway](MCP-servers.md) as the server `search`. `research search on | off | status | token | token-clear | settings | clear` does the same from the host.
 
 An agent gets the service when the operator ticks `search` for it on Services → MCP, like any MCP server. It then has three tools: submit a question (the answer is a search id, at once), check a search (waiting, running and what it is doing, or ended with its files), and collect the result. Files are downloaded through the gateway, from the server's own address plus `/files/<search id>/<name>`, with the agent's usual token. Collecting ends the search and removes everything it left, unless the agent asks to keep it.
 
@@ -18,7 +24,7 @@ flowchart LR
   agent["Agent, box or workers"] -->|"token"| gateway["MCP gateway"]
   gateway -->|"server search, with the caller"| service["Search service"]
   page["Services → Search"] --> broker["Broker (host)"]
-  broker -->|"sign-in, searcher, on and off"| service
+  broker -->|"sign-in, searcher, on and off, the operator's asks"| service
   subgraph inner["The service's own Docker"]
     service --> search1["One search: private network, search agent, volume"]
     search1 --> searxng["SearXNG"]
@@ -30,7 +36,7 @@ flowchart LR
 
 | Who | How | Needs |
 |---|---|---|
-| The operator | Services → Search | The webui's Management sign-in |
+| The operator | Services → Search (Quick Ask, Activity, Settings), or the sidebar's Search | The webui's Management sign-in |
 | An agent, a box or a research project's workers | The MCP server `search`, ticked for them on Services → MCP | A wiring like any other MCP server |
 | A search agent | The internet through the router, and SearXNG on its own network | Nothing else: it cannot reach the service, another search or a private address |
 
@@ -62,9 +68,19 @@ Every search uses the service's one Claude sign-in, whichever project asked. It 
 
 While a sign-in is stored and the service is running, **Test** checks it: the service makes one tiny model call with the stored token (it costs a fraction of a cent) and the page says whether the sign-in works or why it was refused.
 
+## Quick Ask
+
+Quick Ask is how the operator asks the searcher something without going through an agent. It is a chat: the conversations on the side (newest first, each with its title, the state of its last question and when it last changed, **New conversation** on top and **Clear conversations** under them), the selected conversation in the middle, and a box to write the next question at the bottom.
+
+Each message is one search, run by the same searcher the agents use, on the same sign-in, and it waits for a slot in the same queue as theirs. It shows everywhere as asked by "operator", a name no project can have, so Activity lists it with the agents' searches, with Stop, its work and its report. In the conversation, your question is on the right and the searcher's answer on the left: while it waits, how many searches are ahead of it; while it runs, its time, its tokens, its last few tool calls and **Stop**; once it ended, the summary with its numbered sources, a fold-out of what it did, **Copy** (the whole report as text, as the report box copies it) and **Report** (the report box). A search that failed or was stopped says why. The conversation is re-read every few seconds only while one of its questions waits or runs and the tab is on screen.
+
+Every message is a new, independent search: the searcher knows nothing of the earlier ones. The tick **include this conversation's earlier questions and answers** (off by default) sends every earlier question of the conversation with its answer (its summary and sources, as text) along with the new one. With it on, each message costs more tokens than the one before, because it carries the whole conversation so far, and a conversation too long for one question (32,000 characters) is refused in plain words: start a new conversation or untick the box. An ask ends like any search, and the service collects it itself once it ended (no agent will): its files go, its answer stays in its conversation.
+
+The conversations are kept on the search service's own disk, so they survive a restart, an update and turning the service off and on, until **Clear conversations** removes them all (it asks first). The service keeps up to 20 and drops the oldest. If the stored conversations ever cannot be read, Quick Ask says so, with Clear conversations beside it as the remedy.
+
 ## Watching and stopping searches
 
-While the service is running, the Search tab has a table of the searches that are waiting or running, one row each: who asked (the project and its agent, box or workers), the question (shortened; the whole of it on hover), the searcher, the state, the time and the tokens. The time is how long the search has run, or how long it has waited while it waits for its turn; it counts up every second. The tokens are the input, output and cache tokens the search agent has used so far. The page re-reads the table every few seconds while it is on screen, and stops when you leave it.
+While the service is running, the Search tab's Activity sub-tab has a table of the searches that are waiting or running, one row each: who asked (the project and its agent, box or workers, or "operator" for a question from Quick Ask), the question (shortened; the whole of it on hover), the searcher, the state, the time and the tokens. The time is how long the search has run, or how long it has waited while it waits for its turn; it counts up every second. The tokens are the input, output and cache tokens the search agent has used so far. Activity reads the table when it opens and re-reads it every few seconds while it is on screen; it stops when you leave it, and nothing reads while it is closed.
 
 Clicking a row opens the search's work, read-only: its whole question, its state, time and tokens, then the last few things it did, oldest first: enough to see how it goes and what broke, not a record of the whole search. A tool call is one line (when, the tier and the tool, what it was aimed at, and what came of it); what the search agent wrote between calls shows as a paragraph, up to its last 2,000 characters. The box follows the search while it runs; once the search has ended it shows why and stops. The work carries text from the pages the search read, so the page shows all of it as plain text and never as part of the page itself. When there was earlier work, the box says only the latest is shown.
 
@@ -83,6 +99,10 @@ Under the table, **Recent searches** lists the searches that have ended, newest 
 | `research stop` | Stops it with the rest of the shared services |
 | A change of the sign-in or the searcher | Saved on the host and handed to a running service at once; a stopped one gets it when it starts |
 
+## Search in the sidebar
+
+Settings → **Show Search in the sidebar** adds a **Search** entry to the group at the bottom of the sidebar, directly above Services, with the same kind of line icon. Opening it shows Quick Ask, Activity and Settings as the main strip's tabs, the way Services and Host show theirs; Services → Search stays where it is, and both share the last tab used. The entry carries no count, so nothing reads in the background for it. The switch saves at once and is kept on the host with the searcher, so every browser that signs in shows the same sidebar; a browser learns it when it signs in to the broker, so another browser's change shows at its next load.
+
 Browser tiers (an ordinary automated browser, then one built to look like a person's), a searcher that goes out through a VPN, and tips on getting past a site's walls are planned to follow; they are not built yet.
 
 ## Design decisions
@@ -93,6 +113,9 @@ Browser tiers (an ordinary automated browser, then one built to look like a pers
 - **Disposable searches.** A private network, a container and a volume per search, removed by name when collected. A page that fools a search agent finds no project data and no notes to poison for later searches. The cost: a search's files are gone once it is collected, so the caller downloads them first.
 - **SearXNG for the plain web search, with measured engines.** It runs inside the service, needs no key, and reports which engines did not answer. The cost: every search leaves from the host's one address, where engines throttle a caller that asks too often.
 - **The gateway names the caller, for RS's own service only.** The service trusts the header because only the gateway can set it; any other server never sees who called. A project collects only its own searches.
+- **Quick Ask is one search per message, in the agents' queue.** The operator's questions use the same searcher, sign-in and queue as the agents', under a reserved name no project can have, so nothing about a search changes with who asked. Follow-ups see earlier answers only when the operator ticks the box; the cost is a question that grows with the conversation, until its length limit stops it.
+- **Conversations live on the service's disk, not in the browser.** They survive restarts and are the same in every browser, up to 20, until the operator clears them. The cost: they stay there until cleared or dropped as the oldest.
+- **The sidebar switch is a host setting.** It sits with the searcher's settings, so every browser shows the same sidebar; the entry carries no count, so it costs no background reads.
 - **The operator watches searches as plain text.** The table and the work view are read-only and carry page text, so the browser shows every value as text, never as markup.
 - **One long-lived token for every search.** One sign-in, set once by the operator. The cost: no billing per project, the account's rate limit caps all searches together, and the search agent holds the token while it reads hostile pages with internet access.
 - **The Claude search agent first; a pi search agent later, with an API key.** The service's tools are built so that a pi search agent gets the same ones; callers are Claude Code and pi from the start.

@@ -1101,6 +1101,8 @@ async function renderDashboard(opts = {}) {
             // completion notices come back.
             seedLifecycleFromBroker();
             seedSoftwareFromBroker();
+            // Whether the sidebar shows Search (the search service's settings).
+            learnSearchSidebar();
         });
     }
 }
@@ -1892,9 +1894,16 @@ function makeBottomNav() {
     };
     // Explain docs are ephemeral floating popovers now (dismissed on outside
     // click), not persistent rail tabs — so the bottom nav has no doc entries.
+    // Search sits directly above Services when the search service's settings
+    // say so (state.searchSidebar, learned at sign-in and after a save of the
+    // switch); it carries no count, so nothing reads in the background for it.
     return el("div", { class: "rail-nav-group" }, [
         mk("workflows-entry", "newProject", "New Project",
            "New Project — pick a workflow, or import an existing project", openWorkflows),
+        state.searchSidebar === true
+            ? mk("search-entry", "search", "Search",
+                 "Search — ask the searcher, its activity and its settings", openSearchPage)
+            : null,
         mk("services-entry", "services", "Services",
            "Services — Gitea, repos, fetch, reviews, MCP, Aldine, Search", () => openServices()),
         mk("host-entry", "host", "Host",
@@ -1908,7 +1917,7 @@ function makeBottomNav() {
 // states (style.css .nav-icon). Settings is sliders, not a gear, so it cannot
 // be mistaken for a project row's ⚙.
 //
-// Icon geometry from Lucide (https://lucide.dev): folder-plus, layers,
+// Icon geometry from Lucide (https://lucide.dev): folder-plus, search, layers,
 // server, sliders-horizontal, lock.
 //   ISC License. Copyright (c) for portions of Lucide are held by Cole Bemis
 //   2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are
@@ -1948,6 +1957,7 @@ const NAV_ICON_SVG = (() => {
         newProject: svg(
             '<path d="M12 10v6"/><path d="M9 13h6"/>' +
             '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
+        search: svg('<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>'),
         services: svg(
             '<polygon points="12 2 2 7 12 12 22 7 12 2"/>' +
             '<polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>'),
@@ -2267,6 +2277,15 @@ function mobileLandingService(name, visible, enabled) {
 // when nothing valid is remembered for it (hostTabRemembered).
 let servicesActiveTab = "gitea";
 let hostActiveTab = "projects";
+// The search service's three tabs — a second strip under Services → Search,
+// and the main strip of the Search page when the sidebar shows it — share one
+// choice (searchActiveTab) and one remembered key (rs.hostTab.search). Quick
+// Ask and Activity need the service running: while it is not, they are left
+// out of both strips and the page shows Settings (searchRunning, learned from
+// every status read; null until the first, and then every tab shows).
+let searchActiveTab = "ask";
+let searchRunning = null;
+const SEARCH_RUNNING_TABS = ["ask", "activity"];
 const HOST_TAB_DIVIDER = "divider";
 
 // The Services tabs that act on Gitea: the strip hides them while Gitea is not
@@ -2287,7 +2306,16 @@ const HOST_PAGES = {
                ["mcp", "MCP"], ["aldine", "Aldine"], ["search", "Search"]],
         shown: (k) => servicesGiteaRunning !== false || !SERVICES_GITEA_TABS.includes(k),
         get: () => servicesActiveTab,
-        set: (k) => { servicesActiveTab = k; },
+        // Entering Search (a strip click or the page opening on it) picks its
+        // remembered sub-tab, whatever the service was doing at the last look
+        // (its status read decides again); re-renders keep the one on screen.
+        set: (k) => {
+            if (k === "search") {
+                searchRunning = null;
+                searchActiveTab = hostTabRemembered("search");
+            }
+            servicesActiveTab = k;
+        },
     },
     host: {
         title: "Host",
@@ -2297,11 +2325,22 @@ const HOST_PAGES = {
         get: () => hostActiveTab,
         set: (k) => { hostActiveTab = k; },
     },
+    // The sidebar's Search entry (settings.sidebar): the same three tabs as
+    // Services → Search's sub-tabs, as the page's own strip.
+    search: {
+        title: "Search",
+        get landing() { return searchRunning === false ? "settings" : "ask"; },
+        tabs: [["ask", "Quick Ask"], ["activity", "Activity"], ["settings", "Settings"]],
+        shown: (k) => searchRunning !== false || !SEARCH_RUNNING_TABS.includes(k),
+        get: () => searchActiveTab,
+        set: (k) => { searchActiveTab = k; },
+    },
 };
 
 function hostPageRenderer(page) {
     if (page === "services") return renderServicesInto;
     if (page === "host") return renderHostInto;
+    if (page === "search") return renderSearchPageInto;
     return null;
 }
 
@@ -2530,6 +2569,13 @@ function openHostPage(page, tab) {
 }
 
 function openHost(tab) { openHostPage("host", tab); }
+// The Search page (the sidebar entry that settings.sidebar adds). It opens on
+// its remembered tab whatever the service was doing at the last look: the
+// page's status read decides again.
+function openSearchPage(tab) {
+    if (state.hostPage !== "search") searchRunning = null;
+    openHostPage("search", tab);
+}
 
 // ---- floating boxes: New Project, Settings and a project's ⚙ window ----------
 // A panel centred over whatever is open, on a dimmed backdrop; opening one
@@ -8860,14 +8906,80 @@ async function renderSearchInto(view) {
         }
     } catch (e) { /* the section's "unavailable" line */ }
     if (!view.isConnected) return undefined;
+    searchNoteRunning(body.result);
     renderSearchScreen(view, body.result, settings, settingsErr);
     return undefined;
 }
 
+// The Search page of the sidebar (HOST_PAGES.search): its strip is the main
+// one, its content the same three tabs as Services → Search.
+function renderSearchPageInto(view) {
+    if (state.hostPage === "search") mountHostStrip();
+    // Its Settings bar is a build-lane target, as on Services → Search.
+    seedSoftwareFromBroker();
+    return renderSearchInto(view);
+}
+
+// Record what a status read said about the service: Quick Ask and Activity
+// show only while it runs, so a page on one of them moves to Settings (not
+// remembered: the next open, with the service running, comes back to it).
+function searchNoteRunning(a) {
+    searchRunning = a.container === "running";
+    if (!hostTabKeys("search").includes(searchActiveTab)) searchActiveTab = HOST_PAGES.search.landing;
+    if (state.hostPage === "search") mountHostStrip();
+}
+
+// A sub-tab click: remembered in this browser, then the page renders afresh
+// (on the Search page the strip's own click does the same).
+function searchSelectTab(key) {
+    if (state.hostPage === "search") return selectHostTab("search", key);
+    HOST_PAGES.search.set(key);
+    hostTabRemember("search", key);
+    if (state.hostPage === "services" && servicesActiveTab === "search") return renderHostPage();
+    return undefined;
+}
+
+// Services → Search's second strip: Quick Ask, Activity, Settings, drawn like
+// the main strip's tabs (never .tab or .host-tab, which the strip code walks).
+function searchSubStrip() {
+    const keys = hostTabKeys("search");
+    return el("div", { class: "searchsvc-subtabs" }, HOST_PAGES.search.tabs
+        .filter(([key]) => keys.includes(key))
+        .map(([key, label]) => {
+            const tab = el("div", {
+                class: "searchsvc-subtab" + (searchActiveTab === key ? " active" : ""),
+                "data-search-tab": key,
+            }, [label]);
+            tab.onclick = () => (searchActiveTab === key ? undefined : searchSelectTab(key));
+            return tab;
+        }));
+}
+
+// The tab on screen: Quick Ask (the operator's own questions), Activity (every
+// waiting, running and recent search) or Settings (the service itself). Under
+// Services the sub-tab strip comes first; on the Search page the main strip
+// carries the tabs.
 function renderSearchScreen(view, a, settings, settingsErr) {
     const flash = searchFlash;
     searchFlash = null;
     view.innerHTML = "";
+    if (state.hostPage !== "search") view.appendChild(searchSubStrip());
+    if (searchActiveTab === "ask" && a.container === "running") {
+        searchAskPane(view, settings, flash);
+        return;
+    }
+    if (searchActiveTab === "activity" && a.container === "running") {
+        const runs = searchRunsSection(view);
+        view.appendChild(runs.wrap);
+        runs.start();
+        return;
+    }
+    searchSettingsPane(view, a, settings, settingsErr, flash);
+}
+
+// Settings: the bar (on/off, Clear ended), what the service is, the sign-in
+// with Test, the searcher and the sidebar switch.
+function searchSettingsPane(view, a, settings, settingsErr, flash) {
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => rerenderView(view);
     view.appendChild(el("div", {
@@ -8876,14 +8988,28 @@ function renderSearchScreen(view, a, settings, settingsErr) {
     const barFlash = searchFlashEl("bar", flash);
     if (barFlash) view.appendChild(barFlash);
     view.appendChild(el("div", { class: "hint searchsvc-hint" }, [SEARCH_HINT]));
-    if (a.container === "running") {
-        const runs = searchRunsSection(view);
-        view.appendChild(runs.wrap);
-        runs.start();
-    }
     view.appendChild(searchSignInSection(view, a, flash));
     view.appendChild(searchSearcherSection(view, settings, settingsErr, flash));
+    if (settings) view.appendChild(searchLayoutSection(view, settings, flash));
     paintSoftwareLabels();
+}
+
+// Whether the sidebar shows Search: read once when the sidebar is built after
+// the broker sign-in (and set again by a save of the switch). A failed read
+// means no entry. The rail is rebuilt only when the answer changes it.
+async function learnSearchSidebar() {
+    let on = false;
+    try {
+        const res = await fetch("/broker/search/settings");
+        if (res.status === 200) {
+            const b = await res.json();
+            on = !!(b && b.ok && b.result && b.result.settings
+                    && b.result.settings.sidebar === true);
+        }
+    } catch (e) { on = false; }
+    if (on === (state.searchSidebar === true)) { state.searchSidebar = on; return; }
+    state.searchSidebar = on;
+    refreshProjectRail();
 }
 
 // Sign-in: whether a credential is stored (never its value), a field to paste
@@ -8994,7 +9120,8 @@ function searchCell(caption, control, help) {
 }
 
 // Searcher: the one searcher's name, model and effort, searches at once, and
-// the contact address, saved together (the broker replaces the whole file).
+// the contact address, saved together (the broker replaces the whole file,
+// so the saved sidebar switch goes with them).
 function searchSearcherSection(view, cfg, cfgErr, flash) {
     const landing = view.__rsRender || renderSearchInto;
     const wrap = el("div", { class: "mgmt-infra" }, [
@@ -9054,6 +9181,8 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         const { status, body } = await mcpPost("/broker/search/settings", {
             name: name.value.trim(), model: v.model, effort: v.effort,
             at_once: n, contact: contact.value.trim(), recent: kept,
+            // The switch below saves at once, so the saved value is its state.
+            sidebar: cur.sidebar === true,
         });
         busy = false;
         save.disabled = false;
@@ -9082,6 +9211,59 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         "Agents name the searcher when they submit a question; with one searcher "
         + "they can leave it out. More searches than this wait their turn."]));
     return wrap;
+}
+
+const SEARCH_SIDEBAR_HINT =
+    "Adds Search to the sidebar, above Services. Opening it shows Quick Ask, "
+    + "Activity and Settings as its tabs, the way a project shows its terminal and "
+    + "editor. Services → Search stays where it is. Kept on the host with the "
+    + "searcher, so every browser shows the same.";
+
+// Layout: the switch that shows Search in the sidebar. It saves by itself, at
+// once, with the searcher as it is saved (the broker replaces the whole file;
+// unsaved edits in the form above are not sent), then rebuilds the sidebar.
+function searchLayoutSection(view, cfg, flash) {
+    const landing = view.__rsRender || renderSearchInto;
+    const cur = cfg.settings || cfg.defaults || {};
+    const s = cur.searcher || {};
+    const box = el("input", { type: "checkbox" });
+    box.checked = cur.sidebar === true;
+    const errEl = el("span", { class: "mgmt-reviewer-err" }, []);
+    let busy = false;
+    box.onchange = async () => {
+        if (busy) return;
+        const want = box.checked;
+        busy = true;
+        box.disabled = true;
+        errEl.textContent = "";
+        const { status, body } = await mcpPost("/broker/search/settings", {
+            name: s.name, model: s.model, effort: s.effort, at_once: s.at_once,
+            contact: cur.contact || "", recent: cur.recent, sidebar: want,
+        });
+        busy = false;
+        box.disabled = false;
+        const redirect = mgmtStatusRedirect(view, status, landing);
+        if (redirect) return redirect();
+        if (status !== 200 || !body.ok) {
+            box.checked = !want;
+            errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+            return undefined;
+        }
+        state.searchSidebar = want;
+        refreshProjectRail();
+        searchFlash = { where: "layout", text: searchSavedText("Saved.", body.result) };
+        return rerenderView(view);
+    };
+    return el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Layout"]),
+        el("div", { class: "mgmt-row mgmt-infra-row searchsvc-switch-row" }, [
+            el("label", { class: "mgmt-check searchsvc-switch" }, [
+                box, el("span", {}, ["Show Search in the sidebar"])]),
+            errEl,
+        ]),
+        searchFlashEl("layout", flash),
+        el("div", { class: "mgmt-settings-hint" }, [SEARCH_SIDEBAR_HINT]),
+    ]);
 }
 
 // Seconds as m:ss ("—" when the broker gave none).
@@ -9125,6 +9307,18 @@ function searchEndedAt(ts) {
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
 }
 
+// Who asked a search: "project/consumer", or "operator" for the operator's own
+// asks from Quick Ask (the reserved identity -operator-/webui, a name no
+// project can have).
+const SEARCH_OPERATOR = { project: "-operator-", consumer: "webui" };
+
+function searchAsker(s) {
+    if (s.project === SEARCH_OPERATOR.project && s.consumer === SEARCH_OPERATOR.consumer) {
+        return el("span", { class: "type-badge searchsvc-operator" }, ["operator"]);
+    }
+    return `${String(s.project || "")}/${String(s.consumer || "")}`;
+}
+
 // The recent searches table: the searches that ended since the service
 // started, newest first, as the list read gave them (`kept` = how many the
 // service keeps; 0 = the list is off). Plain text only; the reason is the
@@ -9155,7 +9349,7 @@ function searchRecentTable(view, list, kept) {
         const as = reason.includes(SEARCH_STOPPED_MARK) ? "stopped"
             : (SEARCH_RUN_STATE_TEXT[s.state] || String(s.state || ""));
         const tr = el("tr", { class: "searchsvc-run" }, [
-            el("td", {}, [`${String(s.project || "")}/${String(s.consumer || "")}`]),
+            el("td", {}, [searchAsker(s)]),
             el("td", { class: "searchsvc-q", title: q }, [q]),
             el("td", {}, [String(s.searcher || "")]),
             el("td", { title: reason }, [as]),
@@ -9265,7 +9459,7 @@ function searchRunsSection(view) {
             return stopOne(s);
         };
         const tr = el("tr", { class: "searchsvc-run" }, [
-            el("td", {}, [`${String(s.project || "")}/${String(s.consumer || "")}`]),
+            el("td", {}, [searchAsker(s)]),
             el("td", { class: "searchsvc-q", title: q }, [q]),
             el("td", {}, [String(s.searcher || "")]),
             el("td", {}, [SEARCH_RUN_STATE_TEXT[s.state] || String(s.state || "")]),
@@ -9417,6 +9611,33 @@ function searchReportLines(prefix, item, first, second) {
         .filter((l, i) => i === 0 || l);
 }
 
+// A report's sources (numbered as the agent listed them) and tiers, as lines.
+function searchSourceLines(r) {
+    return (Array.isArray(r.sources) ? r.sources : []).map((s, i) =>
+        searchReportLines(`[${s && s.n ? s.n : i + 1}] `, s,
+                          (o) => [o.title, o.address, o.doi && "DOI " + o.doi,
+                                  o.file && "file " + o.file],
+                          (o) => [o.contributed, o.other]));
+}
+
+function searchTierLines(r) {
+    return (Array.isArray(r.tiers) ? r.tiers : []).map((t) =>
+        searchReportLines("", t, (o) => [o.tier, o.asked], (o) => [o.result, o.other]));
+}
+
+// A whole report as plain text, the way the report box shows it (its Copy,
+// and Quick Ask's): the question, the summary, the sources, what was tried.
+function searchReportText(r) {
+    const sourceLines = searchSourceLines(r);
+    const tierLines = searchTierLines(r);
+    const indent = (lines) => lines.map((l, i) => (i ? "    " + l : l)).join("\n");
+    return [String(r.question || ""), "",
+            "Summary", String(r.summary || "No summary."), "",
+            "Sources", ...(sourceLines.length ? sourceLines.map(indent) : ["No sources."]), "",
+            "What was tried", ...(tierLines.length ? tierLines.map(indent) : ["Nothing listed."]),
+           ].join("\n") + "\n";
+}
+
 function searchReportItem(lines) {
     return el("div", { class: "searchsvc-report-item" },
               lines.map((l) => el("div", {}, [l])));
@@ -9464,21 +9685,11 @@ function searchReportBox(view, id) {
             el("div", { class: "searchsvc-flash" }, [
                 (SEARCH_RUN_STATE_TEXT[r.state] || String(r.state || ""))
                 + " · searcher " + String(r.searcher || "")]));
-        const sourceLines = (Array.isArray(r.sources) ? r.sources : []).map((s, i) =>
-            searchReportLines(`[${s && s.n ? s.n : i + 1}] `, s,
-                              (o) => [o.title, o.address, o.doi && "DOI " + o.doi,
-                                      o.file && "file " + o.file],
-                              (o) => [o.contributed, o.other]));
-        const tierLines = (Array.isArray(r.tiers) ? r.tiers : []).map((t) =>
-            searchReportLines("", t, (o) => [o.tier, o.asked], (o) => [o.result, o.other]));
+        const sourceLines = searchSourceLines(r);
+        const tierLines = searchTierLines(r);
         const sources = sourceLines.map(searchReportItem);
         const tiers = tierLines.map(searchReportItem);
-        const indent = (lines) => lines.map((l, i) => (i ? "    " + l : l)).join("\n");
-        copyText = [String(r.question || ""), "",
-                    "Summary", String(r.summary || "No summary."), "",
-                    "Sources", ...(sourceLines.length ? sourceLines.map(indent) : ["No sources."]), "",
-                    "What was tried", ...(tierLines.length ? tierLines.map(indent) : ["Nothing listed."]),
-                   ].join("\n") + "\n";
+        copyText = searchReportText(r);
         copy.disabled = false;
         body.replaceChildren(
             ...section("Summary", r.summary ? [el("div", { class: "searchsvc-work-text" },
@@ -9510,6 +9721,401 @@ function searchReportBox(view, id) {
     };
     read();
     return backdrop;
+}
+
+// ---- Quick Ask: the operator's own questions to the searcher ---------------
+// Each message is one search, queued like an agent's on the same searcher and
+// shown everywhere as asked by "operator". The service keeps the conversations
+// on its own disk until they are cleared. Every value a reply carries is shown
+// as text (text nodes only; an address is not a link).
+
+// How many of a running ask's latest work entries show under it: enough to
+// see what it is doing now (one tool call a line), few enough that a long run
+// does not push the conversation off the screen. Once it ended, the whole work
+// is in its fold-out; meanwhile, in Activity's work box.
+const SEARCH_ASK_LIVE_LINES = 3;
+// An ask that has not ended (its message shows live and is re-read).
+const SEARCH_ASK_ACTIVE = ["queued", "starting", "running"];
+// The conversation on screen (its id; null = a new one), kept across renders
+// so a sub-tab switch comes back to it.
+let searchAskSelected = null;
+
+// A moment the service gave (epoch seconds, or an ISO date) the way the
+// Recent table shows one: HH:MM today, the date before it on another day.
+function searchWhen(ts) {
+    if (typeof ts === "string" && ts) {
+        const ms = Date.parse(ts);
+        return Number.isNaN(ms) ? "—" : searchEndedAt(ms / 1000);
+    }
+    return searchEndedAt(ts);
+}
+
+// The work entries of an ask or a view, oldest first.
+function searchWorkSorted(r) {
+    return (Array.isArray(r && r.work) ? r.work : []).slice()
+        .sort((x, y) => (Number(x && x.ts) || 0) - (Number(y && y.ts) || 0));
+}
+
+// Quick Ask: the conversations on the side (New conversation on top, Clear
+// conversations under them), the selected conversation, and the composer.
+// The side list is read when the tab opens and after each ask (and once more
+// when the conversation on screen has nothing left running, so its state
+// there is current); the conversation is read when selected and re-read every
+// SEARCH_LIST_POLL_MS only while one of its asks waits or runs and the tab is
+// on screen.
+function searchAskPane(view, settings, flash) {
+    const landing = view.__rsRender || renderSearchInto;
+    const cur = settings ? (settings.settings || settings.defaults || {}) : {};
+    const searcherName = cur.searcher && cur.searcher.name ? String(cur.searcher.name) : "";
+    // The conversations read's own error (its stored conversations cannot be
+    // read): its text, with Clear conversations as the remedy.
+    const problem = el("div", { class: "searchsvc-ask-problem" }, []);
+    problem.hidden = true;
+    const listNote = el("div", { class: "searchsvc-flash" }, ["Reading the conversations…"]);
+    const items = el("div", { class: "searchsvc-side-items" }, []);
+    const newBtn = el("button", { class: "btn-small" }, ["New conversation"]);
+    const clearBtn = el("button", { class: "btn-small" }, ["Clear conversations"]);
+    const keptNote = el("div", { class: "searchsvc-side-kept" }, []);
+    const side = el("div", { class: "searchsvc-side" }, [newBtn, listNote, items, keptNote, clearBtn]);
+    const msgs = el("div", { class: "searchsvc-msgs" }, []);
+    const convNote = el("div", { class: "searchsvc-flash mcp-test-bad" }, []);
+    const question = el("textarea", {
+        class: "searchsvc-input searchsvc-ask-text", rows: "3",
+        placeholder: "Ask the searcher a question…",
+    });
+    const askBtn = el("button", { class: "btn" }, ["Ask"]);
+    const include = el("input", { type: "checkbox" });
+    const askErr = el("div", { class: "mgmt-reviewer-err searchsvc-ask-err" }, []);
+    const conv = el("div", { class: "searchsvc-conv" }, [
+        msgs, convNote,
+        el("div", { class: "searchsvc-composer" }, [
+            el("div", { class: "searchsvc-composer-row" }, [question, askBtn]),
+            el("div", { class: "searchsvc-composer-hint" }, [
+                "Each message is a new, independent search"
+                + (searcherName ? ` with searcher ${searcherName}.` : ".")]),
+            el("label", { class: "mgmt-check searchsvc-include" }, [
+                include, el("span", {}, ["include this conversation's earlier questions and answers"])]),
+            askErr,
+        ]),
+    ]);
+    const chat = el("div", { class: "searchsvc-chat" }, [side, conv]);
+    view.appendChild(problem);
+    const saidFlash = searchFlashEl("ask", flash);
+    if (saidFlash) view.appendChild(saidFlash);
+    view.appendChild(chat);
+
+    let list = [];
+    let shownConv = null;          // the last conversation read for searchAskSelected
+    let poll = null, tick = null, reading = false, gen = 0, readSeq = 0;
+    let clocks = [];
+    const stopping = new Set();    // ask ids whose Stop was sent
+    const stopErr = new Map();     // ask id → the text of a refused Stop
+    const live = () => view.isConnected && chat.isConnected;
+    // A host page left for a project tab stays in the document, hidden: no
+    // reads then (an element under a display:none ancestor has no boxes).
+    const shown = () => !document.hidden
+        && !(typeof chat.getClientRects === "function" && !chat.getClientRects().length);
+    const halt = () => {
+        clearInterval(poll); clearInterval(tick);
+        poll = null; tick = null;
+    };
+    const login = () => { halt(); return renderMgmtLogin(view, landing); };
+
+    const confirmClear = () => mcpConfirmDialog(view, {
+        title: "Clear conversations",
+        text: "Every conversation kept on the search service is deleted, with its "
+            + "questions and answers. Searches still waiting or running go on, and "
+            + "their lines in Activity stay.",
+        confirmLabel: "Clear",
+        path: "/broker/search/conversations/clear",
+        payload: {},
+        onOk: (body) => {
+            const r = body.result || {};
+            searchAskSelected = null;
+            searchFlash = { where: "ask", text: `Cleared ${Number(r.cleared) || 0}.` };
+        },
+    });
+    clearBtn.onclick = confirmClear;
+
+    const paintList = () => {
+        items.replaceChildren(...list.map((c) => {
+            const meta = [SEARCH_RUN_STATE_TEXT[c.last_state] || String(c.last_state || ""),
+                          searchWhen(c.updated_at)].filter((p) => p).join(" · ");
+            const item = el("div", {
+                class: "searchsvc-side-item" + (c.id === searchAskSelected ? " active" : ""),
+            }, [
+                el("div", { class: "searchsvc-side-title" }, [String(c.title || "")]),
+                el("div", { class: "searchsvc-side-meta" }, [meta]),
+            ]);
+            item.onclick = () => select(c.id);
+            return item;
+        }));
+        include.disabled = searchAskSelected === null;
+        if (include.disabled) include.checked = false;
+    };
+
+    const readList = async () => {
+        const { status, body } = await searchGet("/broker/search/conversations");
+        if (!live()) return halt();
+        if (status === 401) return login();
+        if (status !== 200) {
+            listNote.textContent = "Could not read the conversations: the host did not answer.";
+            return undefined;
+        }
+        if (!body.ok || !body.result) {
+            listNote.textContent = "Could not read the conversations: " + mgmtErrText(body);
+            return undefined;
+        }
+        const r = body.result;
+        list = (Array.isArray(r.conversations) ? r.conversations : []).filter((c) => c && c.id);
+        listNote.textContent = list.length ? "" : "No conversations yet.";
+        keptNote.textContent = Number.isSafeInteger(r.kept) && r.kept > 0
+            ? `The newest ${r.kept} are kept until cleared.` : "";
+        if (r.error) {
+            const clear = el("button", { class: "btn-small" }, ["Clear conversations"]);
+            clear.onclick = confirmClear;
+            problem.replaceChildren(
+                el("span", { class: "mgmt-reviewer-err" }, [String(r.error)]), clear);
+            problem.hidden = false;
+        } else {
+            problem.replaceChildren();
+            problem.hidden = true;
+        }
+        const ids = list.map((c) => c.id);
+        if (searchAskSelected !== null && !ids.includes(searchAskSelected)) {
+            searchAskSelected = null;
+            shownConv = null;
+            paintConv();
+        }
+        paintList();
+        return undefined;
+    };
+
+    const stopOne = async (askId) => {
+        if (stopping.has(askId)) return undefined;
+        stopping.add(askId);
+        stopErr.delete(askId);
+        paintConv();
+        const { status, body } = await mcpPost("/broker/search/stop", { id: askId });
+        if (!live()) return halt();
+        if (status === 401) return login();
+        if (status !== 200 || !body.ok) {
+            stopping.delete(askId);
+            stopErr.set(askId, status === 200 ? mgmtErrText(body) : "Connection failed.");
+            paintConv();
+            return undefined;
+        }
+        return readConv(gen);
+    };
+
+    // One ask's answer: its state line, then what it has to show so far.
+    const answer = (a, at) => {
+        const st = String(a.state || "");
+        const reason = String(a.reason || "");
+        const active = SEARCH_ASK_ACTIVE.includes(st);
+        const parts = [];
+        // "waiting, 2 ahead" | "running · 0:38 · 21,406 tokens" |
+        // "done in 0:11 · 12,776 tokens" | "stopped · 0:13 · …" | "failed · …"
+        const head = [];
+        if (st === "queued") {
+            head.push(Number.isSafeInteger(a.ahead) ? `waiting, ${a.ahead} ahead` : "waiting");
+        } else {
+            let label = SEARCH_RUN_STATE_TEXT[st] || st;
+            if (!active && reason.includes(SEARCH_STOPPED_MARK)) label = "stopped";
+            const base = searchElapsed(a);
+            const time = el("span", {}, [searchClock(base)]);
+            if (active && typeof base === "number") clocks.push({ node: time, base, at });
+            head.push(st === "done" ? "done in " : label + " · ", time,
+                      ` · ${searchTokens(a.tokens)} tokens`);
+        }
+        const who = el("div", { class: "searchsvc-msg-who" }, [
+            "searcher" + (a.searcher ? " " + String(a.searcher) : "") + " · ", ...head]);
+        if (active) {
+            const busy = stopping.has(a.id);
+            const stop = el("button", { class: "btn-small" }, [busy ? "Stopping…" : "Stop"]);
+            stop.disabled = busy;
+            stop.onclick = () => stopOne(a.id);
+            who.appendChild(stop);
+            const err = stopErr.get(a.id);
+            if (err) who.appendChild(el("span", { class: "mgmt-reviewer-err" }, [err]));
+        }
+        const work = searchWorkSorted(a);
+        if (active) {
+            parts.push(el("div", { class: "searchsvc-flash" },
+                          [st === "queued" ? "Waiting for a slot…" : "Searching…"]));
+            const last = work.slice(-SEARCH_ASK_LIVE_LINES);
+            if (last.length) {
+                parts.push(el("div", { class: "searchsvc-ask-live" }, last.map(searchWorkEntry)));
+            }
+        } else {
+            if (st !== "done" && reason) {
+                parts.push(el("div", { class: "searchsvc-ask-reason" }, [reason]));
+            }
+            const sourceLines = searchSourceLines(a);
+            if (a.summary) {
+                parts.push(el("div", { class: "searchsvc-work-text" }, [String(a.summary)]));
+            }
+            if (sourceLines.length) {
+                parts.push(el("div", { class: "searchsvc-ask-sources" },
+                              sourceLines.map(searchReportItem)));
+            }
+            const acts = [];
+            if (a.summary || sourceLines.length) {
+                const copy = el("button", { class: "btn-small" }, ["Copy"]);
+                copy.onclick = async () => {
+                    let ok = true;
+                    try { await navigator.clipboard.writeText(searchReportText(a)); } catch (e) { ok = false; }
+                    copy.textContent = ok ? "Copied" : "Copy failed";
+                    setTimeout(() => { copy.textContent = "Copy"; }, SEARCH_COPY_NOTE_MS);
+                };
+                const report = el("button", { class: "btn-small" }, ["Report"]);
+                report.onclick = () => searchReportBox(view, a.id);
+                acts.push(copy, report);
+            }
+            if (work.length) {
+                parts.push(el("details", { class: "searchsvc-ask-work" }, [
+                    el("summary", {}, [`What it did (${work.length})`]),
+                    el("div", { class: "searchsvc-work" }, work.map(searchWorkEntry)),
+                ]));
+            }
+            if (acts.length) parts.push(el("div", { class: "searchsvc-ask-acts" }, acts));
+        }
+        return el("div", { class: "searchsvc-msg searchsvc-msg-them" }, [
+            who, el("div", { class: "searchsvc-bubble" }, parts)]);
+    };
+
+    const paintConv = () => {
+        clocks = [];
+        const c = searchAskSelected !== null && shownConv && shownConv.id === searchAskSelected
+            ? shownConv : null;
+        if (!c) {
+            msgs.replaceChildren(el("div", { class: "searchsvc-flash" }, [
+                searchAskSelected === null
+                    ? "A new conversation: ask a question below."
+                    : "Reading the conversation…"]));
+            return;
+        }
+        const asks = (Array.isArray(c.asks) ? c.asks : []).filter((a) => a && typeof a === "object");
+        const at = Date.now();
+        const nodes = [];
+        for (const a of asks) {
+            nodes.push(el("div", { class: "searchsvc-msg searchsvc-msg-me" }, [
+                el("div", { class: "searchsvc-msg-who" }, ["you"]),
+                el("div", { class: "searchsvc-bubble" }, [String(a.question || "")])]));
+            nodes.push(answer(a, at));
+        }
+        if (!nodes.length) nodes.push(el("div", { class: "searchsvc-flash" }, ["No questions yet."]));
+        msgs.replaceChildren(...nodes);
+    };
+
+    // Read the selected conversation (`g` = the selection it was asked for: a
+    // reply for an earlier selection, or older than a later read, is dropped).
+    // The poll skips a beat while a read is out; an ask or a Stop reads anyway.
+    // Polls while an ask is active.
+    const readConv = async (g, fromPoll) => {
+        if (!live()) return halt();
+        if (searchAskSelected === null || g !== gen || (fromPoll && reading)) return undefined;
+        reading = true;
+        const seq = ++readSeq;
+        const { status, body } = await searchGet(
+            "/broker/search/conversation?id=" + encodeURIComponent(searchAskSelected));
+        if (seq !== readSeq) return undefined;
+        reading = false;
+        if (!live()) return halt();
+        if (g !== gen) return undefined;
+        if (status === 401) return login();
+        if (status !== 200) {
+            convNote.textContent = "Could not read the conversation: the host did not answer.";
+            return undefined;
+        }
+        if (!body.ok || !body.result) {
+            halt();
+            convNote.textContent = "Could not read the conversation: " + mgmtErrText(body);
+            return undefined;
+        }
+        convNote.textContent = "";
+        const wasActive = !!poll;
+        shownConv = body.result;
+        const asks = Array.isArray(shownConv.asks) ? shownConv.asks : [];
+        const ids = new Set(asks.map((a) => a && a.id));
+        for (const id of [...stopping]) if (!ids.has(id)) stopping.delete(id);
+        const active = asks.some((a) => a && SEARCH_ASK_ACTIVE.includes(a.state));
+        for (const a of asks) if (a && !SEARCH_ASK_ACTIVE.includes(a.state)) stopping.delete(a.id);
+        paintConv();
+        if (active && !poll) {
+            poll = setInterval(() => (shown() ? readConv(g, true) : undefined), SEARCH_LIST_POLL_MS);
+            tick = setInterval(() => {
+                if (!live()) return halt();
+                if (!shown()) return undefined;
+                const now = Date.now();
+                for (const k of clocks) k.node.textContent = searchClock(k.base + (now - k.at) / 1000);
+                return undefined;
+            }, SEARCH_CLOCK_TICK_MS);
+        } else if (!active && poll) {
+            halt();
+            // Its last ask ended: the side list's state line follows.
+            if (wasActive) readList();
+        }
+        return undefined;
+    };
+
+    const select = (id) => {
+        halt();
+        gen++;
+        searchAskSelected = id;
+        shownConv = null;
+        convNote.textContent = "";
+        askErr.textContent = "";
+        stopping.clear(); stopErr.clear();
+        paintList();
+        paintConv();
+        if (id !== null) readConv(gen);
+    };
+    newBtn.onclick = () => select(null);
+
+    let sending = false;
+    askBtn.onclick = async () => {
+        if (sending) return undefined;
+        const q = question.value.trim();
+        if (!q) { askErr.textContent = "Write a question first."; return undefined; }
+        sending = true;
+        askBtn.disabled = true;
+        askErr.textContent = "";
+        const { status, body } = await mcpPost("/broker/search/ask", {
+            question: q, conversation: searchAskSelected, include: include.checked,
+        });
+        sending = false;
+        askBtn.disabled = false;
+        if (!live()) return halt();
+        if (status === 401) return login();
+        if (status !== 200 || !body.ok || !body.result) {
+            // The service's refusal (a conversation too long to include, …)
+            // as it said it.
+            askErr.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+            return undefined;
+        }
+        question.value = "";
+        const id = String(body.result.conversation || "");
+        if (id && id !== searchAskSelected) {
+            select(id);
+        } else {
+            halt();
+            gen++;
+            readConv(gen);
+        }
+        return readList();
+    };
+
+    paintConv();
+    readList().then(() => {
+        if (!live()) return;
+        // Opened with nothing chosen yet: the newest conversation.
+        if (searchAskSelected === null && list.length) {
+            select(list[0].id);
+        } else if (searchAskSelected !== null) {
+            select(searchAskSelected);
+        }
+    });
 }
 
 // True when dotted-number version a is older than b ("1.25.1" < "28.2.0").
@@ -11071,6 +11677,12 @@ const SW_PAGE_TARGETS = {
 
 // The tab body of such a target, when that tab is on screen.
 function swPageView(target) {
+    // Search's bar is on its Settings tab, under Services or on its own page.
+    if (target === "search") {
+        const onPage = state.hostPage === "search"
+            || (state.hostPage === "services" && servicesActiveTab === "search");
+        return onPage && searchActiveTab === "settings" ? hostBody() : null;
+    }
     if (state.hostPage !== "services" || servicesActiveTab !== target) return null;
     return hostBody();
 }
@@ -15244,6 +15856,7 @@ function lockVault() {
     // The fold empties, and a sidebar sync still in flight can't refill it.
     state.stoppedProjects = [];
     railWorkflowLabels.clear();
+    state.searchSidebar = false;
     sidebarSyncApplied = sidebarSyncSeq = sidebarSyncSeq + 1;
     // a locked vault shows no project: close the browser notifications that name one
     if (state.pingNotes) {
