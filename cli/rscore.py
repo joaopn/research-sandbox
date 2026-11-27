@@ -19351,35 +19351,77 @@ WORK_PACKAGE_STATUS_MAX_BYTES = 256 * 1024
 WORK_PACKAGES_SHOWN = "/workspace/packages"
 
 
+# The ⚙ window's read of a project's packages (project_packages) reads at
+# most this many entries of its packages folder, and says when there are
+# more. A planner splits an agenda into a few to some tens of packages, each
+# worked on in a tab of its own, so 200 is past any agenda one person works
+# through; a folder the project filled with entries by the thousand then
+# costs the host at most 200 small reads per window opened, and the reply at
+# most 200 rows. The save's own check (_refuse_open_work_packages) reads
+# every entry.
+WORK_PACKAGES_READ_MAX = 200
+# A package name longer than this is cut, ending in "…", in that read's
+# reply: the browser names the open packages in one sentence beside the
+# Planner switch, where a name past 64 characters no longer reads as a name
+# (the filesystem would allow 255 bytes per entry). The save's refusal names
+# it whole.
+WORK_PACKAGE_NAME_SHOWN_MAX = 64
+
+
 def _open_work_packages(workspace_path: "Path") -> "tuple[list[str], list[str]]":
     """Read-only, host-side: the names of the work packages whose status says
     `open`, and what RS could not read there (each a sentence in project
-    terms). The tree is project-writable, so it is read through descriptors,
-    each level relative to its parent and never following a link; a status
-    file is opened without blocking and read only when it is a plain,
-    singly-linked file within WORK_PACKAGE_STATUS_MAX_BYTES (enforced again
-    by a cap+1 read). No packages folder: none open."""
+    terms); _read_work_packages over every entry. No packages folder: none
+    open."""
+    found, problems, _more = _read_work_packages(workspace_path)
+    return [name for name, state, _held in found if state == "open"], problems
+
+
+def _read_work_packages(workspace_path: "Path", limit: "int | None" = None
+                        ) -> "tuple[list[tuple[str, str, bool]], list[str], bool]":
+    """Read-only, host-side: each work package readable as one, sorted by
+    name, as (name, state, held: whether its status records a holder), what
+    RS could not read there (each a sentence in project terms), and whether
+    the folder holds more than `limit` entries (None: every entry is read;
+    else only the first `limit` the folder lists). The tree is
+    project-writable, so it is read through descriptors, each level relative
+    to its parent and never following a link; a status file is opened
+    without blocking and read only when it is a plain, singly-linked file
+    within WORK_PACKAGE_STATUS_MAX_BYTES (enforced again by a cap+1 read).
+    No packages folder: none. A holder is only recorded: whether its session
+    still runs is not visible from the host."""
     path_flags = _role_job_path_flags()
     cap = WORK_PACKAGE_STATUS_MAX_BYTES
-    open_names: "list[str]" = []
+    found: "list[tuple[str, str, bool]]" = []
     problems: "list[str]" = []
+    more = False
     fds: "list[int]" = []
     try:
         try:
             fds.append(os.open(workspace_path, path_flags))
         except OSError as e:
-            return [], [f"the project's folder cannot be read ({e.strerror or e})"]
+            return [], [f"the project's folder cannot be read ({e.strerror or e})"], False
         try:
             fds.append(os.open(WORK_PACKAGES_DIR, _ROLE_JOB_DIR_FLAGS, dir_fd=fds[0]))
         except FileNotFoundError:
-            return [], []
+            return [], [], False
         except OSError as e:
             return [], [f"{WORK_PACKAGES_SHOWN} is not a folder RS can read "
-                        f"({e.strerror or e})"]
+                        f"({e.strerror or e})"], False
         try:
-            names = sorted(os.listdir(fds[1]))
+            if limit is None:
+                names = sorted(os.listdir(fds[1]))
+            else:
+                names = []
+                with os.scandir(fds[1]) as it:
+                    for entry in it:
+                        if len(names) == limit:
+                            more = True
+                            break
+                        names.append(entry.name)
+                names.sort()
         except OSError as e:
-            return [], [f"{WORK_PACKAGES_SHOWN} cannot be listed ({e.strerror or e})"]
+            return [], [f"{WORK_PACKAGES_SHOWN} cannot be listed ({e.strerror or e})"], False
         for name in names:
             if not _PROJECT_NAME_RE.match(name):
                 problems.append(f"{WORK_PACKAGES_SHOWN} holds an entry that is no package name")
@@ -19412,6 +19454,7 @@ def _open_work_packages(workspace_path: "Path") -> "tuple[list[str], list[str]]"
                     state = status.get("state") if isinstance(status, dict) else None
                     if state not in WORK_PACKAGE_STATES:
                         raise ValueError("it names no state rs-memory writes")
+                    held = isinstance(status.get("holder"), dict)
                 except (OSError, ValueError, RecursionError) as e:
                     problems.append(f"{where}/{WORK_PACKAGE_STATUS} cannot be read ({e})")
                     continue
@@ -19419,9 +19462,8 @@ def _open_work_packages(workspace_path: "Path") -> "tuple[list[str], list[str]]"
                     os.close(fd)
             finally:
                 os.close(dfd)
-            if state == "open":
-                open_names.append(name)
-        return open_names, problems
+            found.append((name, state, held))
+        return found, problems, more
     finally:
         for d in reversed(fds):
             os.close(d)
@@ -19894,6 +19936,42 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
     out["boxes"], out["boxes_state"] = ([], "none") if docker else \
         _project_agent_boxes(container, running, research, ws)
     return out
+
+
+@dataclass(frozen=True)
+class ProjectPackagesRequest:
+    """Read a researcher-subagents project's work packages, for the planner
+    lock in its ⚙ Workflow section."""
+    project: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "ProjectPackagesRequest":
+        return cls(project=_require_name(kw.get("project")))
+
+
+def project_packages(req: ProjectPackagesRequest, _progress=None) -> dict:
+    """The ⚙ Workflow section's read, running or stopped (from the project's
+    folder on the host, through _read_work_packages): each package's name
+    (cut past WORK_PACKAGE_NAME_SHOWN_MAX), its state, and whether its status
+    records a holder; what RS could not read there; and whether the folder
+    holds more than WORK_PACKAGES_READ_MAX entries, of which only that many
+    were read. Refused for a project that is not researcher-subagents."""
+    cfg = load_config()
+    if not container_exists(container_name_for(req.project)):
+        raise ValidationError(f"no project named {req.project!r}")
+    ws = workspace_path_for(req.project, cfg)
+    if _read_marker_dict(ws).get(SUBAGENTS_RECORD_KEY) is not True:
+        raise ValidationError("work packages apply only to a researcher-subagents project; "
+                              f"{req.project!r} is not one")
+    found, problems, more = _read_work_packages(ws, WORK_PACKAGES_READ_MAX)
+
+    def shown(name: str) -> str:
+        cut = WORK_PACKAGE_NAME_SHOWN_MAX
+        return name if len(name) <= cut else name[:cut - 1] + "…"
+    return {"project": req.project,
+            "packages": [{"name": shown(n), "state": st, "held": held}
+                         for n, st, held in found],
+            "problems": problems, "more": more, "read_max": WORK_PACKAGES_READ_MAX}
 
 
 def _project_agent_boxes(container: str, running: bool, research: bool,

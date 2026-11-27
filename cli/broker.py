@@ -1322,6 +1322,10 @@ BOX_REMOVE_WEBUI_FIELDS = BOX_TARGET_WEBUI_FIELDS | {"keep_workspace"}
 PROJECT_FOLDERS_WEBUI_FIELDS = frozenset({"project"})
 # The ⚙ Agents box's read (I33 slice 3): the project only; read-only.
 PROJECT_AGENTS_WEBUI_FIELDS = frozenset({"project"})
+# The ⚙ Workflow section's read of a researcher-subagents project's work
+# packages (the planner lock): the project only; read-only, from the
+# project's folder on the host, bounded by rscore.WORK_PACKAGES_READ_MAX.
+PROJECT_PACKAGES_WEBUI_FIELDS = frozenset({"project"})
 PROJECT_FOLDERS_SET_WEBUI_FIELDS = frozenset({"project", "folders"})
 
 
@@ -1353,6 +1357,12 @@ def _verb_project_agents(args: dict, _progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in PROJECT_AGENTS_WEBUI_FIELDS}
     req = rscore.ProjectAgentsRequest.from_kwargs(**safe)  # may raise ValidationError
     return rscore.project_agents(req)
+
+
+def _verb_project_packages(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in PROJECT_PACKAGES_WEBUI_FIELDS}
+    req = rscore.ProjectPackagesRequest.from_kwargs(**safe)  # may raise ValidationError
+    return rscore.project_packages(req)
 
 
 def _verb_project_folders(args: dict, _progress=None) -> dict:
@@ -1931,6 +1941,7 @@ VERBS = {
     "box_settings": _verb_box_settings,
     "project_folders": _verb_project_folders,
     "project_agents": _verb_project_agents,
+    "project_packages": _verb_project_packages,
     "project_folders_set": _verb_project_folders_set,
     "port_add": _verb_port_add,
     "port_remove": _verb_port_remove,

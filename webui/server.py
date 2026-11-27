@@ -1783,6 +1783,16 @@ async def broker_project_agents_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_project_packages_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/packages — a researcher-subagents project's
+    work packages, for the planner lock in its ⚙ Workflow section (gated,
+    read-only, running or stopped). Synchronous relay; the broker's
+    PROJECT_PACKAGES_WEBUI_FIELDS is the input boundary."""
+    project = request.match_info.get("name", "")
+    status, reply = await _relay(request, "project_packages", {"project": project})
+    return web.json_response(reply, status=status)
+
+
 async def broker_boxes_handler(request: web.Request) -> web.Response:
     """GET /broker/project/{name}/boxes — the project's sandbox boxes with live
     container state (gated). A fast read (no op log); relayed synchronously."""
@@ -4974,6 +4984,9 @@ def main() -> None:
     # The ⚙ Agents box's read (I33 slice 3).
     app.router.add_get(
         "/broker/project/{name}/agents", broker_project_agents_handler)
+    # The ⚙ Workflow section's read of the work packages (the planner lock).
+    app.router.add_get(
+        "/broker/project/{name}/packages", broker_project_packages_handler)
     # Dev-box provision (webui-first B) — a fixed segment that MUST precede the
     # {action} catch-all below (first-match-wins, else "dev-box" is swallowed
     # as an action).
