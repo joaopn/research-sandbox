@@ -13446,6 +13446,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         statusBarCard.classList.toggle("selected", statusBarCb.checked);
     };
     let activeAgentTab = "";
+    // The researcher workflow's switches (researcher-subagents only): its own
+    // box under Agents, on the defaults; the planner's start line names the
+    // agents ticked (syncAgents keeps it level).
+    const switchBox = isSubagents
+        ? researchSwitchBox({ initial: RESEARCH_SWITCH_DEFAULTS, agents: [] }) : null;
     const syncAgents = () => {
         if (claudeHeld()) agentChecks.forEach((c) => { if (c.name === "claude") c.cb.checked = true; });
         agentChecks.forEach((c) => {
@@ -13476,6 +13481,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             : "No agent: the project starts without one.";
         agentsHint.style.display = agentsHint.textContent ? "" : "none";
         statusBarCard.style.display = on.length ? "" : "none";
+        if (switchBox) switchBox.setAgents(AGENTS_BOX_ORDER.filter((n) => agentOn(n)));
     };
     agentChecks.forEach((c) => {
         c.card.onclick = () => {
@@ -13498,6 +13504,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         agentsHint,
     ], "agents-section");
     setCollapsibleOpen(agentsSection, true);
+    const switchSection = switchBox
+        ? collapsibleBox("Workflow", [switchBox.node], "research-switch-section") : null;
+    if (switchSection) setCollapsibleOpen(switchSection, true);
     syncAgents();
     // The model halves of the payload, by agent: Claude's pairs only while
     // Claude is on (a project without Claude has no Claude to configure), pi's
@@ -13770,6 +13779,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             ...(isDev ? [devGroup] : []),
             el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
             agentsSection,
+            switchSection,
             enableField,
             extensionsBox,
             ...(showClone ? [cloneToggle, cloneGroup] : []),
@@ -13927,6 +13937,16 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 // CREATE_WEBUI_FIELDS.
                 ...agentModelPayload(),
             };
+            // The researcher workflow's switches: only those that differ from
+            // the defaults (a create left on them writes no switches, as one
+            // made before the box; from_kwargs refuses them on any other
+            // workflow). Lockstep: the three fields are in CREATE_WEBUI_FIELDS.
+            if (switchBox) {
+                const sw = switchBox.value();
+                Object.entries(RESEARCH_SWITCH_FIELDS).forEach(([k, f]) => {
+                    if (sw[k] !== RESEARCH_SWITCH_DEFAULTS[k]) payload[f] = sw[k];
+                });
+            }
             // Editor on by default; unchecking disables the code-server service.
             if (!editorCb.checked) payload.disable = ["code-server"];
             // RS's status bar: sent while an agent is on (its card shows).
@@ -17022,9 +17042,10 @@ function openProjectConfigBox(project) {
 }
 
 // The window's content: the section list and one pane per section, Tabs,
-// Extensions, Agents, Sharing, Ports, Alerts and Project in that order (the
-// short form, for a project whose tabs never loaded or that is stopped: Tabs,
-// Sharing, Ports, Alerts, Project). It opens on Tabs; which section was
+// Extensions, Agents, Workflow, Sharing, Ports, Alerts and Project in that
+// order (the short form, for a project whose tabs never loaded or that is
+// stopped: Tabs, Workflow, Sharing, Ports, Alerts, Project). Workflow's tab
+// shows only on a researcher-subagents project, once the agents read says so. It opens on Tabs; which section was
 // picked is not remembered.
 // Every pane is built at open (the hidden ones are display:none), so each
 // section loads as it did when it was a folded box. Every section builder
@@ -17052,6 +17073,7 @@ function makeProjectConfigBox(project) {
         return p;
     };
     const layout = el("div", { class: "config-layout" }, [tabs, panes]);
+    const tabOf = (name) => sections.find((s) => s.name === name).tab;
 
     const section = el("div", { class: "config-section" });
     const tabsBox = pane("Tabs", "tabs");
@@ -17067,6 +17089,9 @@ function makeProjectConfigBox(project) {
                     : "No tabs yet — open this project once to load its services.",
         ]));
         tabsBox.appendChild(section);
+        // A stopped project's switches change too (applied at its next start).
+        appendResearchSwitchSection(pane("Workflow", "workflow"), tabOf("workflow"), project,
+                                    readProjectAgents(project.name));
         appendSharingSection(pane("Sharing", "sharing"), project, null);
         // Ports render even with no tabs loaded — register before you start serving.
         const portsBox = pane("Ports", "ports");
@@ -17116,6 +17141,8 @@ function makeProjectConfigBox(project) {
     // the project's agents (one read per window), so they are filled after it.
     const extensionsBox = pane("Extensions", "extensions");
     const agentsRead = appendAgentsBox(pane("Agents", "agents"), project, enabled);
+    appendResearchSwitchSection(pane("Workflow", "workflow"), tabOf("workflow"), project,
+                                agentsRead);
     appendEditorExtensionSection(extensionsBox, project, enabled, agentsRead);
     appendSharingSection(pane("Sharing", "sharing"), project, enabled);
     const portsBox = pane("Ports", "ports");
@@ -17125,6 +17152,346 @@ function makeProjectConfigBox(project) {
     appendProjectSection(pane("Project", "project"), project, false);
     select("tabs");
     return layout;
+}
+
+// ---- the researcher workflow's switches (researcher-subagents projects) ----
+// One settings box, in the New Project window and in the project's ⚙ Workflow
+// section, for Claude and pi projects alike: the Planner, Subagents and
+// Checks switches, the workflow they make drawn beside them, what that
+// setting is good for under the drawing, and (⚙ only) the line about running
+// sessions. MIRROR of rscore.RESEARCH_SWITCHES (values, in the box's order),
+// RESEARCH_SWITCH_DEFAULTS (a record without a switch reads as its default)
+// and RESEARCH_SWITCH_FIELDS (the create/update request fields, in
+// CREATE_WEBUI_FIELDS, UPDATE_WEBUI_FIELDS and the webui's update forward list).
+const RESEARCH_SWITCH_SPECS = [
+    ["planner", "Planner", [["off", "Off"], ["on", "On"]]],
+    ["subagents", "Subagents", [["off", "Off"], ["on", "On"]]],
+    ["checks", "Checks", [["off", "Off"], ["staged", "Staged"], ["all", "All"]]],
+];
+const RESEARCH_SWITCH_DEFAULTS = { planner: "off", subagents: "on", checks: "staged" };
+const RESEARCH_SWITCH_FIELDS = { planner: "planner_switch", subagents: "subagents_switch",
+                                 checks: "checks_switch" };
+// What each subagents × checks setting is good for (the plan's table, verbatim).
+const RESEARCH_GOOD_FOR = {
+    "off|off": "Hands-on work where you steer each step: quick looks, getting to know the " +
+               "data. Cheapest. Nothing is checked independently: you are the check.",
+    "off|staged": "One careful line of inquiry where only the conclusions must hold. Each " +
+                  "finding the agent stages is re-run and refereed before you accept it " +
+                  "(about $0.04 per finding plus the re-run's time).",
+    "off|all": "Step-by-step work where a wrong intermediate result would carry into " +
+               "everything after it: a pipeline, or data you do not know yet. Every result " +
+               "is checked, so each step is slower.",
+    "on|off": "Broad first sweeps of many simple questions, where you pick leads later. " +
+              "Fast and cheap per result. Results are leads, not findings.",
+    "on|staged": "Breadth with a checked record: analysts run in parallel, and only what " +
+                 "the agent promotes is checked. A sensible default.",
+    "on|all": "Large sweeps where you choose from a list and want every item verified " +
+              "before you choose: parallel exploratory analysis. About $0.04 per result " +
+              "plus the re-run compute.",
+};
+const RESEARCH_PLANNER_GOOD_FOR = {
+    off: "One session.",
+    on: "A planning session splits the work into packages, one work session per package " +
+        "in its own tab with its own memory, and a top page over all packages. Good when " +
+        "a question has become an agenda with independent parts, or more than one " +
+        "session's worth of work. It costs you several tabs, and connecting results " +
+        "across packages is yours, from the top page.",
+};
+const RESEARCH_RUNNING_SESSIONS_LINE = "Running sessions keep their own subagents and checks " +
+    "until switched with /rs-mode (pi: /skill:rs-mode).";
+
+// How sessions start with the planner on, naming only the agents the project
+// carries ("" when it carries neither): each agent's shortcuts in the
+// project's terminal, and its role skills inside a running agent (pi's skills
+// are invoked as /skill:<name>).
+function researchStartLine(agents) {
+    const on = ["claude", "pi"].filter((a) => (agents || []).includes(a));
+    if (!on.length) return "";
+    const first = on[0], other = on[1];
+    const skill = (a, s) => (a === "pi" ? "/skill:" : "/") + s;
+    return "Sessions start in the project's terminal: " + first + "-plan plans, " + first +
+        "-work <package> works in one package" +
+        (other ? ` (${other}: ${other}-plan, ${other}-work <package>)` : "") +
+        "; inside " + first + ", " + skill(first, "rs-plan") + " and " +
+        skill(first, "rs-work") + " <package> do the same" +
+        (other ? ` (${other}: ${skill(other, "rs-plan")}, ${skill(other, "rs-work")} <package>)`
+               : "") + ".";
+}
+
+// The drawing's geometry, in its own units (the SVG is drawn at that size
+// and shrinks to a narrower box): padding, the gaps between columns and
+// rows, node heights, each column's width, how many work sessions stand for
+// "one per package" and how many analysts fan out from a working session.
+const RESEARCH_FLOW = {
+    pad: 6, hGap: 22, vGap: 10, nodeH: 22, analystH: 16, analystGap: 4, checkH: 30,
+    youW: 44, sessionW: 104, analystW: 58, resultsW: 58, checkW: 96,
+    packages: 3, analystsOne: 3, analystsEach: 2,
+};
+
+// The workflow the switches make, as an SVG string (set through innerHTML by
+// the caller: an el()-built <svg> is an inert HTML element). Composed from
+// parts per switch, left to right: you; the session (planner off) or a
+// planning session over one work session per package (planner on); with
+// subagents on, analysts fanning out from each working session; its results;
+// with checks on, a re-run + referee step after them, on the staged findings
+// (dashed: only some results) or on every result. Each part carries
+// data-part (you, session, planning, work, analyst, results, check); the
+// colours are the theme's (style.css .rs-flow).
+function researchFlowSvg(sw) {
+    const G = RESEARCH_FLOW;
+    const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    const planner = sw.planner === "on";
+    const subagents = sw.subagents === "on";
+    const checks = sw.checks === "staged" || sw.checks === "all";
+    const nodes = [], edges = [];
+    const node = (part, x, y, w, h, label, sub) => {
+        nodes.push(`<g class="rs-flow-node rs-flow-${part}" data-part="${part}">` +
+            `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="5"/>` +
+            (sub
+                ? `<text x="${x + w / 2}" y="${y + h / 2 - 5}" text-anchor="middle" ` +
+                  `dominant-baseline="central">${esc(label)}</text>` +
+                  `<text class="rs-flow-sub" x="${x + w / 2}" y="${y + h / 2 + 7}" ` +
+                  `text-anchor="middle" dominant-baseline="central">${esc(sub)}</text>`
+                : `<text x="${x + w / 2}" y="${y + h / 2}" text-anchor="middle" ` +
+                  `dominant-baseline="central">${esc(label)}</text>`) + "</g>");
+        return { left: x, right: x + w, mid: y + h / 2, cx: x + w / 2, top: y, bottom: y + h };
+    };
+    const edge = (x1, y1, x2, y2, dashed) => edges.push(
+        `<line class="rs-flow-edge${dashed ? " rs-flow-dashed" : ""}" x1="${x1}" y1="${y1}" ` +
+        `x2="${x2}" y2="${y2}"/>`);
+    const youX = G.pad;
+    const sessX = youX + G.youW + G.hGap;
+    const anX = sessX + G.sessionW + G.hGap;
+    const resX = subagents ? anX + G.analystW + G.hGap : anX;
+    const chkX = resX + G.resultsW + G.hGap;
+    const width = (checks ? chkX + G.checkW : resX + G.resultsW) + G.pad;
+    const k = subagents ? (planner ? G.analystsEach : G.analystsOne) : 0;
+    const fan = k ? k * G.analystH + (k - 1) * G.analystGap : 0;
+    const rowH = Math.max(G.nodeH, fan, checks ? G.checkH : 0);
+    const sessions = [];
+    let y = G.pad;
+    let planning = null;
+    if (planner) {
+        planning = node("planning", sessX, y, G.sessionW, G.nodeH, "Planning session");
+        sessions.push(planning);
+        y += G.nodeH + G.vGap;
+    }
+    const rows = planner ? G.packages : 1;
+    for (let i = 0; i < rows; i++) {
+        const mid = y + rowH / 2;
+        const s = planner
+            ? node("work", sessX, mid - G.nodeH / 2, G.sessionW, G.nodeH, "Work: package " + (i + 1))
+            : node("session", sessX, mid - G.nodeH / 2, G.sessionW, G.nodeH, "Session");
+        sessions.push(s);
+        const res = node("results", resX, mid - G.nodeH / 2, G.resultsW, G.nodeH, "Results");
+        if (k) {
+            for (let j = 0; j < k; j++) {
+                const a = node("analyst", anX, mid - fan / 2 + j * (G.analystH + G.analystGap),
+                               G.analystW, G.analystH, "Analyst");
+                edge(s.right, s.mid, a.left, a.mid);
+                edge(a.right, a.mid, res.left, res.mid);
+            }
+        } else {
+            edge(s.right, s.mid, res.left, res.mid);
+        }
+        if (checks) {
+            const c = node("check", chkX, mid - G.checkH / 2, G.checkW, G.checkH, "Re-run + referee",
+                           sw.checks === "all" ? "every result" : "staged findings");
+            edge(res.right, res.mid, c.left, c.mid, sw.checks !== "all");
+        }
+        y += rowH + G.vGap;
+    }
+    const height = y - G.vGap + G.pad;
+    const you = node("you", youX, height / 2 - G.nodeH / 2, G.youW, G.nodeH, "You");
+    sessions.forEach((s) => edge(you.right, you.mid, s.left, s.mid));
+    // The planning session splits the work: a dashed spine from it down the
+    // work sessions' column, drawn under them (the nodes are opaque).
+    if (planning) {
+        const last = sessions[sessions.length - 1];
+        edge(planning.cx, planning.bottom, last.cx, last.top, true);
+    }
+    return `<svg class="rs-flow" viewBox="0 0 ${width} ${height}" width="${width}" ` +
+        `height="${height}" role="img" aria-label="The workflow these settings make" ` +
+        `xmlns="http://www.w3.org/2000/svg">${edges.join("")}${nodes.join("")}</svg>`;
+}
+
+// The planner lock's reason from a packages read (rscore.project_packages):
+// "" when the planner may be turned off, else why not. A holder is only
+// recorded: whether its session still runs is not visible from the host.
+function researchPlannerLock(r) {
+    const pk = Array.isArray(r && r.packages) ? r.packages : [];
+    const open = pk.filter((p) => p && p.state === "open");
+    const more = r && r.more
+        ? ` The project has more than ${r.read_max} packages; only ${r.read_max} were read here.`
+        : "";
+    if (open.length) {
+        const each = open.map((p) => p.name + (p.held ? ", being worked on in a session"
+                                                      : ", no session holds it"));
+        return `Can't turn off: ${open.length} package${open.length === 1 ? " is" : "s are"} ` +
+               `open (${each.join("; ")}). Close or finish them first.` + more;
+    }
+    const problems = Array.isArray(r && r.problems) ? r.problems : [];
+    if (problems.length) {
+        return "Can't turn off: RS cannot tell whether every work package is done or closed (" +
+               problems.join("; ") + "). Tell the project's agent, or fix it in the project's " +
+               "terminal.";
+    }
+    return more ? more.trim() + " Saving checks them all." : "";
+}
+
+// The box. opts: initial (the switches now; a create passes the defaults),
+// agents (the agents the project carries: the planner's start line names
+// theirs), sessionsLine (⚙: true adds the line about running sessions), onChange
+// (after every pick). Returns {node, value() → {planner, subagents, checks},
+// setAgents(list), lockPlannerOff(reason: "" unlocks)}. "Off" of a planner
+// that is on is disabled while a reason is set; a planner already off
+// stays pickable.
+function researchSwitchBox(opts) {
+    const now = { ...RESEARCH_SWITCH_DEFAULTS, ...(opts.initial || {}) };
+    let agents = opts.agents || [];
+    let lock = "";
+    const lockHint = el("div", { class: "hint research-lock" });
+    const rows = RESEARCH_SWITCH_SPECS.map(([key, label, values]) => {
+        const cards = values.map(([v, text]) => {
+            const card = el("div", { class: "box-opt-card harness-mode-card" },
+                            [el("span", { class: "box-opt-name" }, [text])]);
+            card.onclick = () => {
+                if (card.classList.contains("disabled")) return;
+                now[key] = v;
+                sync();
+                if (opts.onChange) opts.onChange({ ...now });
+            };
+            return { v, card };
+        });
+        const node = el("div", { class: "field harness-mode research-switch" }, [
+            el("label", {}, [label]),
+            el("div", { class: "box-opt-cards" }, cards.map((c) => c.card)),
+            key === "planner" ? lockHint : null,
+        ]);
+        return { key, cards, node };
+    });
+    const drawing = el("div", { class: "research-flow" });
+    const goodFor = el("div", { class: "hint research-good-for" });
+    const plannerFor = el("div", { class: "hint research-planner-for" });
+    const startLine = el("div", { class: "hint research-start" });
+    const sync = () => {
+        rows.forEach((r) => r.cards.forEach((c) => {
+            c.card.classList.toggle("selected", now[r.key] === c.v);
+            const off = r.key === "planner" && c.v === "off" && !!lock && now.planner === "on";
+            c.card.classList.toggle("disabled", off);
+            c.card.title = off ? lock : "";
+        }));
+        lockHint.textContent = lock;
+        lockHint.style.display = lock ? "" : "none";
+        drawing.innerHTML = researchFlowSvg(now);
+        goodFor.textContent = RESEARCH_GOOD_FOR[now.subagents + "|" + now.checks] || "";
+        plannerFor.textContent = RESEARCH_PLANNER_GOOD_FOR[now.planner] || "";
+        startLine.textContent = now.planner === "on" ? researchStartLine(agents) : "";
+        startLine.style.display = startLine.textContent ? "" : "none";
+    };
+    const node = el("div", { class: "research-switch-box" }, [
+        el("div", { class: "research-switches" }, [
+            ...rows.map((r) => r.node),
+            opts.sessionsLine ? el("div", { class: "hint research-running" },
+                              [RESEARCH_RUNNING_SESSIONS_LINE]) : null,
+        ]),
+        el("div", { class: "research-flow-col" }, [drawing, goodFor, plannerFor, startLine]),
+    ]);
+    sync();
+    return {
+        node,
+        value: () => ({ ...now }),
+        setAgents: (list) => { agents = list || []; sync(); },
+        lockPlannerOff: (reason) => { lock = reason || ""; sync(); },
+    };
+}
+
+// The ⚙ Workflow section of a researcher-subagents project: the box on the
+// recorded switches, an Apply that sends only the switches that changed. With
+// the planner on, the project's packages are read once as the window opens
+// (no polling): an open package, or one RS cannot read, locks the planner's
+// "Off" with the reason; the save re-checks on the server, so a package opened
+// since is refused there, in the op dialog. `tab` is the section's tab, shown
+// only once the read says the project is of this type. `read` is the
+// window's read of the project's agents ({res, b}, appendAgentsBox's, or this
+// section's own on a window without an Agents section).
+function appendResearchSwitchSection(box, tab, project, read) {
+    tab.style.display = "none";
+    const content = el("div", {}, [el("div", { class: "config-empty" }, ["Loading…"])]);
+    box.appendChild(content);
+    (async () => {
+        const { res, b } = await read;
+        if (!b || !res || !res.ok || !b.ok || !b.result || b.result.subagents !== true) return;
+        const d = b.result;
+        tab.style.display = "";
+        if (d.research_switches_error) {
+            content.replaceChildren(el("div", { class: "config-empty" }, [d.research_switches_error]));
+            return;
+        }
+        const initial = { ...RESEARCH_SWITCH_DEFAULTS, ...(d.research_switches || {}) };
+        const agents = Array.isArray(d.agents_local) ? d.agents_local : [];
+        const sw = researchSwitchBox({ initial, agents, sessionsLine: true });
+        const apply = el("button", { class: "btn btn-secondary" }, ["Apply"]);
+        const applyMsg = el("div", { class: "config-empty" });
+        apply.onclick = () => {
+            applyMsg.textContent = researchSwitchApply(project.name, initial, sw.value(),
+                                                       !!d.running) || "";
+        };
+        content.replaceChildren(sw.node, el("div", { class: "config-box-row" }, [apply]), applyMsg);
+        if (initial.planner !== "on") return;
+        let reason = "";
+        try {
+            const pres = await fetch(`/broker/project/${encodeURIComponent(project.name)}/packages`);
+            let pb = null;
+            try { pb = await pres.json(); } catch (e) { pb = null; }
+            reason = pres.ok && pb && pb.ok && pb.result
+                ? researchPlannerLock(pb.result)
+                : "Can't turn off: the project's work packages could not be read" +
+                  (pb && pb.error ? " (" + mgmtErrText(pb) + ")" : "") + ".";
+        } catch (e) {
+            reason = "Can't turn off: the project's work packages could not be read.";
+        }
+        sw.lockPlannerOff(reason);
+    })();
+}
+
+// The Workflow section's Apply: the switches that changed, alone in their
+// update (the server changes them on their own, never with other settings),
+// through the op dialog; nothing restarts. Returns a line for the section
+// when there is nothing to send.
+function researchSwitchApply(name, initial, now, running) {
+    const payload = {};
+    const lines = [];
+    RESEARCH_SWITCH_SPECS.forEach(([key, label, values]) => {
+        if (now[key] === initial[key]) return;
+        payload[RESEARCH_SWITCH_FIELDS[key]] = now[key];
+        const word = (values.find((v) => v[0] === now[key]) || [])[1] || now[key];
+        lines.push(`${label}: ${word}.`);
+    });
+    if (!lines.length) return "Nothing to change.";
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `Change the workflow of ${name}`,
+        tailTitle: `Changing the workflow of ${name}`,
+        verb: "update",
+        project: name,
+        confirmLabel: "Apply",
+        body: [
+            el("ul", {}, lines.map((t) => el("li", {}, [t]))),
+            el("div", { class: "hint" }, [
+                running
+                    ? "RS writes the agent's instructions again; nothing is restarted. New " +
+                      "sessions start with this setting. " + RESEARCH_RUNNING_SESSIONS_LINE
+                    : "The project is stopped: the change is saved and written into the " +
+                      "agent's instructions at its next start; nothing is started.",
+            ]),
+        ],
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        }),
+        onDone: (ok) => { if (ok) closeProjectConfigBox(name); },
+    });
+    return "";
 }
 
 // The ⚙ Agents box (I33 slice 3): what the create dialog's Agents box chose,
@@ -17144,6 +17511,19 @@ const AGENTS_BOX_CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const AGENTS_BOX_CLAUDE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$/;
 let agentsBoxSeq = 0;
 
+// The window's read of a project's agents (GET /broker/project/<name>/agents):
+// a promise of {res, b}, b null when the fetch itself failed.
+function readProjectAgents(name) {
+    return (async () => {
+        let res = null, b = null;
+        try {
+            res = await fetch(`/broker/project/${encodeURIComponent(name)}/agents`);
+            try { b = await res.json(); } catch (e) { b = {}; }
+        } catch (e) { b = null; }
+        return { res, b };
+    })();
+}
+
 function appendAgentsBox(box, project, enabled) {
     // `box` is the window's Agents pane (makeProjectConfigBox). Returns its
     // read of the project's agents, {res, b} (b null: the fetch itself failed),
@@ -17153,14 +17533,7 @@ function appendAgentsBox(box, project, enabled) {
     // The Box agents section's place (filled from the same read below).
     const boxesHolder = el("div", {});
     box.appendChild(boxesHolder);
-    const read = (async () => {
-        let res = null, b = null;
-        try {
-            res = await fetch(`/broker/project/${encodeURIComponent(project.name)}/agents`);
-            try { b = await res.json(); } catch (e) { b = {}; }
-        } catch (e) { b = null; }
-        return { res, b };
-    })();
+    const read = readProjectAgents(project.name);
     (async () => {
         const { res, b } = await read;
         if (!b || !res.ok || !b.ok || !b.result) {

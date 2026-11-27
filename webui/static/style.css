@@ -2174,6 +2174,23 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
 .agent-tab-panel > .field:has(+ .harness-rows) { margin-bottom: 0; }
 .box-harness { margin-top: 10px; }
 .box-harness .harness-mode { margin-bottom: 0; }
+/* The researcher workflow's switches (New Project window, ⚙ Workflow): the
+   three switches in a column, the drawn workflow and what it is good for
+   beside them, wrapping under them in a narrow box. The drawing takes the
+   theme's colours: cards for nodes, the accent for the checks. */
+.research-switch-box { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: flex-start; }
+.research-switches { flex: 0 1 220px; min-width: 0; }
+.research-flow-col { flex: 1 1 280px; min-width: 0; }
+.research-flow svg { display: block; max-width: 100%; height: auto; }
+.research-flow-col .hint + .hint { margin-top: 6px; }
+.research-lock { color: var(--warn-fg); }
+.rs-flow rect { fill: var(--bg-card); stroke: var(--border-strong); stroke-width: 1; }
+.rs-flow text { fill: var(--fg-base); font-size: 10px; font-family: inherit; }
+.rs-flow .rs-flow-analyst text, .rs-flow .rs-flow-results text { font-size: 9px; }
+.rs-flow .rs-flow-check rect, .rs-flow .rs-flow-you rect { stroke: var(--fg-accent); }
+.rs-flow text.rs-flow-sub { fill: var(--fg-muted); font-size: 8.5px; }
+.rs-flow .rs-flow-edge { stroke: var(--fg-faint); stroke-width: 1; }
+.rs-flow .rs-flow-dashed { stroke-dasharray: 3 3; }
 
 /* Box window: the agent cards and the model/effort row sit on one line — "which
    agent, and which model it runs on" is one decision. The row hides itself when no
