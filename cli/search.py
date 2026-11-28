@@ -49,11 +49,13 @@ contents of the files.
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -512,13 +514,37 @@ def exits_per_site_problem(value: Any) -> str | None:
     return None
 
 
+# The characters an exit's name never holds: the controls (C0, DEL and C1, a
+# line break and a tab among them) and Unicode's line and paragraph
+# separators, which would break the one-line places the name is written in (a
+# log line, a docker label read back line by line, the searcher's
+# instructions). The search service's record reader applies the same rule
+# (service.py _EXIT_NAME_REFUSED, which holds the lone surrogate as well —
+# MIRROR).
+_EXIT_NAME_REFUSED = ("Cc", "Zl", "Zp")
+
+
 def exit_name_problem(name: Any) -> str | None:
-    """An exit's name follows the searcher's rule (it becomes part of the
-    names of its MCP servers, containers and networks)."""
-    if searcher_name_problem(name):
-        return ("an exit's name starts with a lowercase letter and holds only "
-                "lowercase letters, digits and dashes")
+    """An exit's name is any text the operator chooses (the exit is known by
+    it, exactly as given), not empty and on one line. Nothing on the search
+    service is named after it: exit_fingerprint names its gateway."""
+    if not isinstance(name, str) or not name:
+        return "an exit needs a name"
+    if any(unicodedata.category(c) in _EXIT_NAME_REFUSED for c in name):
+        return ("an exit's name holds no line break, tab or other control "
+                "character")
+    # A lone surrogate (JSON can carry one) is no character: it has no UTF-8
+    # form to fingerprint or to write.
+    if any(unicodedata.category(c) == "Cs" for c in name):
+        return "an exit's name holds a character that is not text"
     return None
+
+
+def exit_fingerprint(name: str) -> str:
+    """The exit's name as the search service's names and command lines carry
+    it: the SHA-256 of its UTF-8 bytes, in hex (service.py exit_fingerprint —
+    MIRROR)."""
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
 def contact_problem(value: Any) -> str | None:

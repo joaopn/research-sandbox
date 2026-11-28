@@ -44,8 +44,8 @@ once the inner Docker answers), and does two things:
 `service.py put NAME` / `drop NAME` (the host, over `docker exec -i`) write or
 remove one of the files the host hands over (settings, token, VPN
 configuration) in RUN_DIR;
-`service.py admin status|clear|ensure|vpn|vpn-apply|list|test`, `admin vpn-renew EXIT` and `admin
-view|stop ID` ask
+`service.py admin status|clear|ensure|vpn|vpn-apply|list|test`, `admin
+vpn-renew FINGERPRINT` (an exit's, exit_fingerprint) and `admin view|stop ID` ask
 the running server from inside the container (the admin routes answer
 127.0.0.1 only): the operator's list of waiting and running searches, a
 read-only view of one search's work, stopping one, and testing the sign-in.
@@ -74,6 +74,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -157,9 +158,10 @@ PLAIN_SIDECAR_CMD = ["python3", "/opt/rs-search-agent/tools.py", "--http"]
 # The VPN is an ordered list of exits (the host delivers them only while the
 # VPN version is ticked), each a name and a WireGuard configuration. Each
 # exit has one gateway container inside this service, named
-# VPN_GATEWAY_PREFIX + the exit's name and labelled with VPN_LABEL and
-# EXIT_LABEL: kernel WireGuard with NET_ADMIN and IPv4 forwarding only
-# (vpn/up.sh). The gateways share one network, their way to their VPN
+# VPN_GATEWAY_PREFIX + the exit's fingerprint (exit_fingerprint: its name
+# has no length or character bound a container name could carry) and
+# labelled with VPN_LABEL and EXIT_LABEL (the exit's name): kernel WireGuard
+# with NET_ADMIN and IPv4 forwarding only (vpn/up.sh). The gateways share one network, their way to their VPN
 # servers (through this container's egress and RS's router, which lets each
 # server's UDP port out; each gateway takes nothing in there but its own
 # server's answers and forwards nothing from there); each joins its exit's
@@ -174,9 +176,19 @@ VPN_WAN_NETWORK = "rs-search-vpn-wan"
 VPN_LABEL = "research.search.vpn"
 # The exit a gateway, or a VPN search's sidecar or network, belongs to.
 EXIT_LABEL = "research.search.exit"
-# An exit's name (search.SEARCHER_NAME_RE, the rule cli/search.py
-# exit_name_problem applies — MIRROR).
-EXIT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+# What an exit's name never holds (Unicode categories): the controls and the
+# line and paragraph separators (it is written on one line: a log line, a
+# docker label read back line by line, the searcher's instructions), and a
+# lone surrogate (no text; it has no UTF-8 form). The rule cli/search.py
+# exit_name_problem applies (its _EXIT_NAME_REFUSED and its lone-surrogate
+# check — MIRROR).
+_EXIT_NAME_REFUSED = ("Cc", "Zl", "Zp", "Cs")
+# An exit's fingerprint (exit_fingerprint): the SHA-256 of its name, in hex.
+FINGERPRINT_RE = re.compile(r"^[0-9a-f]{%d}$" % (2 * hashlib.sha256().digest_size))
+# The names exits had before any name was allowed: an earlier run's gateway
+# is named VPN_GATEWAY_PREFIX + such a name (and carries it as its
+# EXIT_LABEL); gateways_present finds it and the sweep removes it by name.
+OLD_EXIT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 VPN_SCRIPTS = "/opt/rs-search-vpn"        # Dockerfile.vpn — MIRROR
 # How many exits a VPN search tries on one site, when the host sent none
 # (search.DEFAULT_EXITS_PER_SITE — MIRROR).
@@ -762,7 +774,7 @@ def _u16(v, low: int) -> bool:
 def _exit_ok(d) -> bool:
     """One delivered exit as the host writes it (search.vpn_service_record)."""
     return (isinstance(d, dict)
-            and isinstance(d["name"], str) and EXIT_NAME_RE.match(d["name"]) is not None
+            and exit_name_ok(d["name"])
             and all(isinstance(d[k], str) and _WG_KEY_RE.match(d[k])
                     for k in ("private_key", "public_key"))
             and (d["preshared_key"] is None
@@ -808,15 +820,31 @@ def exit_names() -> list[str]:
     return [e["name"] for e in read_vpn() or []]
 
 
+def exit_name_ok(name) -> bool:
+    """An exit's name as the host allows it: text, not empty, on one line
+    (search.exit_name_problem — MIRROR)."""
+    return (isinstance(name, str) and bool(name)
+            and not any(unicodedata.category(c) in _EXIT_NAME_REFUSED for c in name))
+
+
+def exit_fingerprint(name: str) -> str:
+    """The exit as this service's names and command lines carry it: the
+    SHA-256 of its name's UTF-8 bytes, in hex (search.exit_fingerprint —
+    MIRROR)."""
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
+
+
 def gateway_name(exit_name: str) -> str:
-    return VPN_GATEWAY_PREFIX + exit_name
+    return VPN_GATEWAY_PREFIX + exit_fingerprint(exit_name)
 
 
 def is_gateway(cname: str) -> bool:
-    """Whether a container's name is one of an exit's gateways (or the
-    release before exits' one gateway)."""
-    return cname == V1_GATEWAY or (cname.startswith(VPN_GATEWAY_PREFIX) and EXIT_NAME_RE.match(
-        cname[len(VPN_GATEWAY_PREFIX):]) is not None)
+    """Whether a container's name is one of an exit's gateways (named by its
+    fingerprint, or after the exit's name by an earlier run), or the release
+    before exits' one gateway."""
+    rest = cname[len(VPN_GATEWAY_PREFIX):] if cname.startswith(VPN_GATEWAY_PREFIX) else None
+    return cname == V1_GATEWAY or (rest is not None and (
+        FINGERPRINT_RE.match(rest) is not None or OLD_EXIT_NAME_RE.match(rest) is not None))
 
 
 def vpn_stdin(cfg: dict) -> bytes:
@@ -876,21 +904,33 @@ def _vpn_network(name: str, internal: bool) -> str | None:
     return None if r.returncode == 0 else f"the VPN's network could not be created ({first_line(r)})"
 
 
-def gateways_present() -> list[str]:
-    """The exits' gateway containers there are (by their label), each named
-    as its exit's: [exit name]. One labelled but not named so is left alone
-    (and logged)."""
+def gateways_present() -> tuple[list[str], list[str]]:
+    """The exits' gateway containers there are (by their label): ([the exit
+    name of each named as its exit's gateway], [the container name of each an
+    earlier run named after its exit's name, OLD_EXIT_NAME_RE]). One labelled
+    but named neither way is left alone (and logged). The name is the rest of
+    the line as it is (it may begin or end with a space; it holds no line
+    break)."""
     r = docker("ps", "-a", "--filter", f"label={VPN_LABEL}", "--filter", f"label={EXIT_LABEL}",
                "--format", "{{.Names}} {{.Label \"" + EXIT_LABEL + "\"}}")
-    out = []
+    out: tuple[list[str], list[str]] = ([], [])
     for line in r.stdout.decode("utf-8", "replace").splitlines():
-        cname, _, name = line.strip().partition(" ")
-        if EXIT_NAME_RE.match(name) and cname == gateway_name(name):
-            out.append(name)
+        cname, _, name = line.partition(" ")
+        if exit_name_ok(name) and cname == gateway_name(name):
+            out[0].append(name)
+        elif OLD_EXIT_NAME_RE.match(name) and cname == VPN_GATEWAY_PREFIX + name:
+            out[1].append(cname)
         elif cname:
             log(f"vpn: {cname} carries an exit's label but is not named as its gateway; "
                 "left alone")
     return out
+
+
+def remove_old_gateways(cnames: list[str]) -> None:
+    """The gateways an earlier run named after their exits' names, by name."""
+    for cname in cnames:
+        docker("rm", "-f", cname)
+        log(f"vpn: the gateway {cname} of an earlier run removed")
 
 
 def remove_gateway(name: str) -> None:
@@ -908,7 +948,9 @@ def remove_vpn() -> None:
     for c in (SEARXNG_VPN_CONTAINER, V1_GATEWAY):
         if container_state(c)[0] != "absent":
             docker("rm", "-f", c)
-    for name in gateways_present():
+    present, old = gateways_present()
+    remove_old_gateways(old)
+    for name in present:
         remove_gateway(name)
     for t in list(TUNNELS.values()):
         t.forget()
@@ -928,11 +970,12 @@ def ensure_vpn(renew: str | None = None) -> str | None:
     every gateway and the VPN's SearXNG go; else the gateway of an exit no
     longer delivered goes (by name), each delivered exit's gateway runs
     (re-created when its image changed) and is set up again when its
-    configuration changed, its gateway is new or it is `renew` (the exit the
-    operator just saved; every other unchanged exit is left as it is), then
-    the VPN's SearXNG runs on the first exit's route, and a check of each
-    tunnel set up again starts in the background. None, or why the exits
-    could not be used at all (each exit's own failure is its status)."""
+    configuration changed, its gateway is new or it is `renew` (the
+    fingerprint of the exit the operator just saved, exit_fingerprint; every
+    other unchanged exit is left as it is), then the VPN's SearXNG runs on
+    the first exit's route, and a check of each tunnel set up again starts in
+    the background. None, or why the exits could not be used at all (each
+    exit's own failure is its status)."""
     global _vpn_error
     with _vpn_lock:
         exits = read_vpn()
@@ -958,7 +1001,9 @@ def ensure_vpn(renew: str | None = None) -> str | None:
 def _ensure_vpn(exits: list, renew: str | None) -> str | None:
     """Under _vpn_lock. None, or why no exit could be set up."""
     names = [e["name"] for e in exits]
-    for name in gateways_present():
+    present, old = gateways_present()
+    remove_old_gateways(old)
+    for name in present:
         if name not in names:
             remove_gateway(name)
             log(f"vpn: the gateway of exit {name} removed")
@@ -980,7 +1025,7 @@ def _ensure_vpn(exits: list, renew: str | None) -> str | None:
     first_fresh = False
     for i, e in enumerate(exits):
         t = TUNNELS[e["name"]]
-        fresh, t.error = _ensure_gateway(e, image_id, t, e["name"] == renew)
+        fresh, t.error = _ensure_gateway(e, image_id, t, exit_fingerprint(e["name"]) == renew)
         if i == 0:
             first_fresh = fresh
         if t.error:
@@ -2786,6 +2831,14 @@ def agent_tools(up: dict, vpn: bool) -> str:
     return json.dumps({"mcpServers": servers}, separators=(",", ":"))
 
 
+def exit_text(name: str) -> str:
+    """An exit's name as the searcher's instructions write it: a JSON string
+    (its quotes and backslashes escaped), its backticks written as \\u0060, so
+    no name can close or open a code span or a quote there (it holds no line
+    break, exit_name_ok); the agent gives it back exactly as JSON reads it."""
+    return json.dumps(name, ensure_ascii=False).replace("`", "\\u0060")
+
+
 def exits_instructions(ran: list[dict], left_out: list[tuple[str, str]], per_site: int,
                        web: bool) -> str:
     """The part of a VPN search agent's instructions about its exits (the
@@ -2795,23 +2848,25 @@ def exits_instructions(ran: list[dict], left_out: list[tuple[str, str]], per_sit
     why; and how to use them: every site starts on the first exit, a page
     refused by the search's address is tried again through the next exit, at
     most `per_site` exits per site (by the page's host name), and every source
-    names its exit (by its name). `ran`: [{"exit", "n", "servers"}] in order;
-    `web`: the first exit's plain server has the web search."""
-    first, first_n = ran[0]["exit"], ran[0]["n"]
+    names its exit (by its name, each written by exit_text). `ran`: [{"exit",
+    "n", "servers"}] in order; `web`: the first exit's plain server has the web
+    search."""
+    first, first_n = exit_text(ran[0]["exit"]), ran[0]["n"]
     lines = ["## The exits", "",
              "This search reaches every site through a VPN, from one of its exits, never "
              "from the address of the computer it runs on. Each exit has its own tool "
              "servers with the same tools; a tool is called by the exit's server's name, "
-             "`mcp__<server>__` and the tool's own name. The tools named above are the "
-             f"first exit's (`{first}`). The exits, in their order:", ""]
+             "`mcp__<server>__` and the tool's own name. Each exit's name is written as a "
+             "JSON string. The tools named above are the "
+             f"first exit's ({first}). The exits, in their order:", ""]
     for i, r in enumerate(ran, 1):
         names = ", ".join(f"`{s}`" for s in r["servers"])
         plain = server_name(PLAIN_TIER, r["n"])
-        lines.append(f"{i}. `{r['exit']}`" + (" (the first exit)" if i == 1 else "")
+        lines.append(f"{i}. {exit_text(r['exit'])}" + (" (the first exit)" if i == 1 else "")
                      + f": its servers {names} (as in `mcp__{plain}__fetch_page`).")
     if left_out:
         lines += ["", "Left out of this search: "
-                  + "; ".join(f"`{n}` ({why})" for n, why in left_out) + "."]
+                  + "; ".join(f"{exit_text(n)} ({why})" for n, why in left_out) + "."]
     signs = ("refused because of where the request comes from (the signs under Your "
              "report: a page or an error that names your address or your network, \"not "
              "available in your region\", a block that names the address)")
@@ -2827,7 +2882,7 @@ def exits_instructions(ran: list[dict], left_out: list[tuple[str, str]], per_sit
                f"page's address (the first exit counts as one): once {per_site} exits were "
                "refused there, stop trying that site and report it as blocked."]
     lines += ["", "How to use them:", "",
-              f"- Start every site on the first exit (`{first}`).",
+              f"- Start every site on the first exit ({first}).",
               *how,
               (f"- The web search runs only on the first exit (`mcp__"
                f"{server_name(PLAIN_TIER, first_n)}__web_search`); the other exits' "
@@ -2836,9 +2891,9 @@ def exits_instructions(ran: list[dict], left_out: list[tuple[str, str]], per_sit
                "through the VPN's first exit, which this search does not have, or it is "
                "not running): `web_search` answers that it is unavailable."),
               "- Report which exit each source came from: give each source an `exit`, "
-              "the NAME of the exit whose server fetched or opened it (as listed above, "
-              "not its servers' number); and name the exit on every line of `tiers` you "
-              "tried through one."]
+              "the NAME of the exit whose server fetched or opened it (the string listed "
+              "above, exactly as JSON reads it; not its servers' number); and name the "
+              "exit on every line of `tiers` you tried through one."]
     return "\n".join(lines) + "\n"
 
 
@@ -3561,10 +3616,11 @@ class Handler(BaseHTTPRequestHandler):
             ensure_vpn()                # the gateways in line; checks start
             return self._json(200, vpn_status())
         if path.startswith("/admin/vpn/apply/") and post:
-            name = path[len("/admin/vpn/apply/"):]
-            if not EXIT_NAME_RE.match(name):
+            # The exit by its fingerprint (exit_fingerprint): no name in a route.
+            fingerprint = path[len("/admin/vpn/apply/"):]
+            if not FINGERPRINT_RE.match(fingerprint):
                 return self._json(404, {"error": "not found"})
-            ensure_vpn(renew=name)      # that exit set up again; a check of it starts
+            ensure_vpn(renew=fingerprint)   # that exit set up again; a check of it starts
             return self._json(200, vpn_status())
         if path == "/admin/clear" and post:
             return self._json(200, SEARCHES.clear_ended())
@@ -3684,10 +3740,11 @@ _ADMIN_ID_SUFFIX = {"conversation-delete": "/delete"}
 
 
 def admin(what: str, sid: str | None = None) -> int:
-    # `vpn-renew` takes an exit's name where the others take a search's id.
+    # `vpn-renew` takes an exit's fingerprint (exit_fingerprint: never its
+    # name, on this command line) where the others take a search's id.
     takes = _ADMIN_WITH_ID + ("vpn-renew",)
     if what not in _ADMIN_ROUTES or (what in takes) != (sid is not None) \
-            or (sid is not None and not (EXIT_NAME_RE if what == "vpn-renew"
+            or (sid is not None and not (FINGERPRINT_RE if what == "vpn-renew"
                                          else ID_RE).match(sid)):
         sys.stderr.write("unknown admin request\n")
         return 2
@@ -3731,7 +3788,7 @@ def main(argv: list) -> int:
         return admin(*argv[1:])
     sys.stderr.write("usage: service.py serve | put NAME | drop NAME | admin "
                      "status|ensure|vpn|vpn-apply|clear|list|test|conversations|"
-                     "conversations-clear | admin vpn-renew EXIT | "
+                     "conversations-clear | admin vpn-renew FINGERPRINT | "
                      "admin ask (the body on stdin) | "
                      "admin view|report|stop|conversation|conversation-delete ID\n")
     return 2

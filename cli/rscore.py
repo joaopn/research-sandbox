@@ -24765,8 +24765,10 @@ def _search_tunnels(deadline: float | None, apply: bool,
     state, labels = _search_container(deadline)
     if state != "running" or labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
         return {}, off
-    out = (_search_admin("vpn-renew", deadline, renew) if apply and renew
-           else _search_admin("vpn-apply" if apply else "vpn", deadline))
+    # The exit to set up again goes by its fingerprint: no exit's name is on
+    # a command line.
+    out = (_search_admin("vpn-renew", deadline, search.exit_fingerprint(renew))
+           if apply and renew else _search_admin("vpn-apply" if apply else "vpn", deadline))
     if out is None:
         return {}, dict(off, error=SEARCH_NO_ANSWER)
     tunnels = out.get("exits")

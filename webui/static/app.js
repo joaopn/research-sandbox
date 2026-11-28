@@ -8749,11 +8749,6 @@ const SEARCH_VPN_ORDER_HINT =
     + "site blocks it.";
 // The exit list when nothing is stored.
 const SEARCH_VPN_NO_EXIT = "no VPN exit is stored";
-// An exit's name: the service's rule, checked on the page before a Save.
-const SEARCH_VPN_EXIT_NAME_RE = /^[a-z][a-z0-9-]*$/;
-const SEARCH_VPN_EXIT_NAME_RULE =
-    "An exit's name starts with a lowercase letter and holds only lowercase "
-    + "letters, digits and dashes.";
 // Shown on Exits tried per site's question mark (a mouseover title).
 const SEARCH_EXITS_PER_SITE_HINT =
     "How many exits a VPN search may try on one site before it gives up on it: "
@@ -9641,9 +9636,14 @@ function searchVpnSection(view, vpn, vpnErr, flash) {
 // read from a local file into the box by "Choose file…": nothing leaves the
 // browser until Save) or its fields typed by hand — and one Save. A new name
 // is added at the end of the list. Replace configuration (an exit's row)
-// fills the name in and fixes it; Cancel goes back to adding. The keys are
-// secrets like the sign-in token: password fields (the file's box is emptied
-// too) cleared once a save is answered, never filled from a reply.
+// fills the name in and fixes it; Cancel goes back to adding. Adding, a
+// chosen file names the exit after itself (its name without a trailing
+// .conf) while the name field is empty or still holds the previous file's
+// name: never over a name the operator typed. The name is sent trimmed (the
+// page refuses only an empty one; the broker's refusal says what else is
+// refused). The keys are secrets like the sign-in token: password fields
+// (the file's box is emptied too) cleared once a save is answered, never
+// filled from a reply.
 // Returns {node, replace(name)}.
 function searchVpnExitForm(view, landing) {
     const title = el("div", { class: "searchsvc-vpn-add-title" }, []);
@@ -9671,9 +9671,16 @@ function searchVpnExitForm(view, landing) {
     const choose = el("button", { class: "btn-small", type: "button" }, ["Choose file…"]);
     choose.onclick = () => fileIn.click();
     const errEl = el("span", { class: "mgmt-reviewer-err" }, []);
+    // The name the last chosen file put in the field (null: none yet), so a
+    // second file replaces it. Replacing, the name is fixed: no file changes it.
+    let fileDefault = null;
     fileIn.onchange = () => {
         const f = fileIn.files && fileIn.files[0];
         if (!f) return;
+        if (replacing === null && (!nameIn.value.trim() || nameIn.value === fileDefault)) {
+            fileDefault = String(f.name || "").trim().replace(/\.conf$/i, "").trim();
+            nameIn.value = fileDefault;
+        }
         const reader = new FileReader();
         reader.onload = () => { conf.value = String(reader.result || ""); errEl.textContent = ""; };
         reader.onerror = () => { errEl.textContent = "The file could not be read."; };
@@ -9735,7 +9742,6 @@ function searchVpnExitForm(view, landing) {
         // Replacing: the exit's own name, whatever the field holds.
         const name = replacing !== null ? replacing : nameIn.value.trim();
         if (!name) { errEl.textContent = "Name the exit first."; return; }
-        if (!SEARCH_VPN_EXIT_NAME_RE.test(name)) { errEl.textContent = SEARCH_VPN_EXIT_NAME_RULE; return; }
         let payload;
         if (mode === "file") {
             if (!conf.value.trim()) {

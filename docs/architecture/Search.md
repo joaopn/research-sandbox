@@ -99,7 +99,7 @@ The box saves at once, with the settings as they are saved. Ticking it shows the
 
 ## The VPN exits
 
-Settings → **VPN**, shown while the VPN version is on, holds the list of **exits** that searches asked through `search-vpn` use. An exit is one WireGuard VPN, the kind most VPN providers offer as a small configuration file from their account page, stored under a name of your choice (a lowercase letter first, then lowercase letters, digits and dashes). When no exit is stored, the section says so. When the stored exits cannot be used (their file on the host is damaged), it says why instead; adding an exit replaces the file.
+Settings → **VPN**, shown while the VPN version is on, holds the list of **exits** that searches asked through `search-vpn` use. An exit is one WireGuard VPN, the kind most VPN providers offer as a small configuration file from their account page, stored under a name of your choice. When no exit is stored, the section says so. When the stored exits cannot be used (their file on the host is damaged), it says why instead; adding an exit replaces the file.
 
 Each exit has its row: its name, its status line, **Up** and **Down** to move it in the list, **Replace configuration** and **Remove**. The status line shows the tunnel up, with the exit's endpoint (the name and the address it was resolved to), the address the VPN gave this side, its DNS and how long ago the last handshake was; the tunnel down, with what went wrong; or off while the search service is not running. The page never waits for a tunnel: the service checks each one in the background (a check waits a few seconds for the VPN server's handshake) and the page shows the last result at once, with **checking…** beside it while a check runs; right after a Save the exit says **connecting…** until the first check of its new configuration ends. While any exit is being checked, the page re-reads the lines every few seconds, and leaves what you are typing alone.
 
@@ -109,7 +109,7 @@ Each exit has its row: its name, its status line, **Up** and **Down** to move it
 
 Under the list, **Add exit** takes a name and the configuration; there are two ways in, switched by a pair of buttons, and both are stored as the same configuration:
 
-- **Configuration file:** paste the file into the box, or press **Choose file…** to read a `.conf` file from this computer into the box (it is read in the browser; nothing is sent until Save).
+- **Configuration file:** paste the file into the box, or press **Choose file…** to read a `.conf` file from this computer into the box (it is read in the browser; nothing is sent until Save). A chosen file also fills in the exit's name with the file's name without `.conf`, unless you typed a name yourself.
 - **By hand:** the private key, the address, the DNS, the server's public key, its endpoint (`host:port`), the allowed addresses (`0.0.0.0/0` to start with), and the optional preshared key and keepalive.
 
 **Save** sends it to the host, where RS checks it and stores it; a new name goes at the end of the list, and a configuration it cannot use is refused in plain words. **Replace configuration** opens the same form with that exit's name filled in and fixed, so its configuration is replaced in place and it keeps its place in the list. **Remove** deletes one exit, after a confirmation that names it; when the last one goes, `search-vpn` leaves the gateway until another is stored.
