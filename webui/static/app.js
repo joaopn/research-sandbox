@@ -8743,12 +8743,16 @@ const SEARCH_VPN_BOX_HINT =
 const SEARCH_VPN_HINT =
     "VPN searches reach sites from the VPN's address; their model traffic stays on "
     + "this machine's. WireGuard only; the keys are never shown again.";
-// The tunnel's state (the VPN status' `tunnel`), for a stored configuration.
+// The tunnel's state (the VPN status' `tunnel`), for a stored configuration;
+// "checking": no check has finished since the configuration was applied.
 const SEARCH_VPN_TUNNEL_TEXT = {
     up: "tunnel up",
     down: "tunnel down: VPN searches reach no site",
     off: "tunnel off while the search service is not running",
+    checking: "connecting…",
 };
+// Beside the last result while the service checks the tunnel again.
+const SEARCH_VPN_CHECKING_MARK = "checking…";
 // The VPN entered by hand: [the key the service takes, the caption, secret
 // (a password field, cleared after a save), optional (left out when empty)].
 const SEARCH_VPN_FIELDS = [
@@ -8797,10 +8801,16 @@ const SEARCH_STOPPED_MARK = "stopped by the operator";
 // so a read every five seconds shows each move soon after it happens: half
 // the value doubles the broker calls for no change anyone sees, ten times
 // makes the count look stuck between turns. The time column does not wait
-// for it: it counts up locally (SEARCH_CLOCK_TICK_MS).
+// for it: it counts up locally (SEARCH_CLOCK_TICK_MS). The VPN section re-reads
+// its status line at the same pace while the service checks the tunnel (a
+// check takes a few seconds, so the line moves at the first or second read).
 const SEARCH_LIST_POLL_MS = 5000;
 // The time column shows whole seconds, so it moves once a second.
 const SEARCH_CLOCK_TICK_MS = 1000;
+// The one re-read of the VPN status line on the page (searchVpnWatch): a new
+// VPN section (a fresh render, a Save's re-render) replaces it, so two never
+// run at once.
+let searchVpnPoll = null;
 // What the last change on the page reported, shown once by the render that
 // follows it (every change re-reads the page). {where: "bar" | "token" |
 // "searcher" | "vpnbox" | "vpn" | "layout" | "ask", text, bad}.
@@ -9418,8 +9428,12 @@ function searchVpnStatusParts(v) {
         return [el("span", { class: "state-stopped" }, ["no VPN configuration is stored"])];
     }
     const tunnel = String(v.tunnel || "");
-    const parts = [el("span", { class: tunnel === "up" ? "state-running" : "state-stopped" },
-                      [SEARCH_VPN_TUNNEL_TEXT[tunnel] || "tunnel " + tunnel])];
+    const cls = tunnel === "up" ? "state-running" : tunnel === "checking" ? "state-inflight" : "state-stopped";
+    const parts = [el("span", { class: cls }, [SEARCH_VPN_TUNNEL_TEXT[tunnel] || "tunnel " + tunnel])];
+    // A fresh check under way: the last result stays, marked.
+    if (v.checking === true && (tunnel === "up" || tunnel === "down")) {
+        parts.push(el("span", { class: "state-inflight" }, [SEARCH_VPN_CHECKING_MARK]));
+    }
     if (v.endpoint) {
         const ip = v.endpoint_ip && v.endpoint_ip !== v.endpoint ? ` (${String(v.endpoint_ip)})` : "";
         parts.push(el("span", { class: "type-badge" }, ["endpoint " + String(v.endpoint) + ip]));
@@ -9434,6 +9448,46 @@ function searchVpnStatusParts(v) {
     return parts;
 }
 
+// Whether a VPN status read says the service is checking the tunnel: a check
+// running now (`checking`), or none finished since a Save (`tunnel` checking).
+// A reply without `checking` (an older service) never is.
+function searchVpnChecking(v) {
+    return !!v && (v.checking === true || v.tunnel === "checking");
+}
+
+// While the last read says the tunnel is being checked, re-read the VPN status
+// every SEARCH_LIST_POLL_MS and repaint just the status line (the form below it
+// keeps what the operator is typing); stop at the first read that says the
+// check is over, when the line has left the page, or when a read fails (the
+// line keeps the last answer). A session that ended lands on the sign-in.
+function searchVpnWatch(view, status, vpn, paint, landing) {
+    clearInterval(searchVpnPoll);
+    searchVpnPoll = null;
+    if (!searchVpnChecking(vpn)) return;
+    let reading = false;
+    const timer = setInterval(async () => {
+        const halt = () => {
+            clearInterval(timer);
+            if (searchVpnPoll === timer) searchVpnPoll = null;
+        };
+        if (searchVpnPoll !== timer || !view.isConnected || !status.isConnected) return halt();
+        if (reading) return undefined;
+        reading = true;
+        const { status: code, body } = await searchGet("/broker/search/vpn");
+        reading = false;
+        if (searchVpnPoll !== timer || !view.isConnected || !status.isConnected) return halt();
+        if (code === 401) {
+            halt();
+            return renderMgmtLogin(view, landing);
+        }
+        if (code !== 200 || !body.ok || !body.result) return halt();
+        paint(body.result, null);
+        if (!searchVpnChecking(body.result)) halt();
+        return undefined;
+    }, SEARCH_LIST_POLL_MS);
+    searchVpnPoll = timer;
+}
+
 // VPN: the status first, Remove beside it; then the two ways in, switched by
 // a pair of radio buttons — the WireGuard configuration file (pasted, or read
 // from a local file into the box by "Choose file…": nothing leaves the
@@ -9442,11 +9496,14 @@ function searchVpnStatusParts(v) {
 // emptied too) cleared once a save is answered, never filled from a reply.
 function searchVpnSection(view, vpn, vpnErr, flash) {
     const landing = view.__rsRender || renderSearchInto;
-    const status = el("div", { class: "mgmt-row mgmt-infra-row searchsvc-vpn-status" },
-        vpn ? searchVpnStatusParts(vpn)
-            : [vpnErr ? el("span", { class: "mgmt-reviewer-err" }, [vpnErr])
-                      : el("span", { class: "type-badge" }, ["unavailable"])]);
-    if (vpn && vpn.configured) {
+    const status = el("div", { class: "mgmt-row mgmt-infra-row searchsvc-vpn-status" }, []);
+    // The status line from one read (`v` null: `err`, or unavailable), Remove
+    // beside it while a configuration is stored.
+    const paintStatus = (v, err) => {
+        status.replaceChildren(...(v ? searchVpnStatusParts(v)
+            : [err ? el("span", { class: "mgmt-reviewer-err" }, [err])
+                   : el("span", { class: "type-badge" }, ["unavailable"])]));
+        if (!v || !v.configured) return;
         const remove = el("button", { class: "btn-small" }, ["Remove"]);
         remove.onclick = () => mcpConfirmDialog(view, {
             title: "Remove the VPN configuration",
@@ -9459,7 +9516,9 @@ function searchVpnSection(view, vpn, vpnErr, flash) {
             onOk: () => { searchFlash = { where: "vpn", text: "The VPN configuration is removed." }; },
         });
         status.appendChild(remove);
-    }
+    };
+    paintStatus(vpn, vpnErr);
+    searchVpnWatch(view, status, vpn, paintStatus, landing);
     // The way in: the configuration file (the default) or by hand.
     let mode = "file";
     const radio = (key, label) => {
