@@ -45,6 +45,9 @@ TRACE_PATH = os.path.join(OUT_DIR, "trace.jsonl")
 REPORT_PATH = os.path.join(OUT_DIR, "report.json")
 SEARXNG_URL = "http://searxng:8080/search"     # service.py SEARXNG_ALIAS / SEARXNG_PORT
 CONTACT = os.environ.get("RS_SEARCH_CONTACT", "") or "user@example.org"
+# A VPN search's plain-tier sidecar of one exit: the exit's name, written on
+# every trace line (the service shows which exit a call went out through).
+EXIT = os.environ.get("RS_SEARCH_EXIT", "")
 USER_AGENT = f"research-sandbox-search/1 (mailto:{CONTACT})"
 
 # One HTTP request (connect, and each read). The scholarly APIs answer in
@@ -97,6 +100,7 @@ TIER_FETCH = "page-fetch"
 def trace(tool: str, tier: str, target: str, outcome: str, **extra) -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     line = {"ts": round(time.time(), 3), "tool": tool, "tier": tier,
+            **({"exit": EXIT} if EXIT else {}),
             "target": target[:500], "outcome": outcome, **extra}
     with open(TRACE_PATH, "a") as f:
         f.write(json.dumps(line, ensure_ascii=False) + "\n")
@@ -540,7 +544,9 @@ TOOLS = {
                "every source, and every way of searching you tried with what it hit.",
                {"summary": _Q,
                 "sources": {"type": "array", "items": {"type": "object"},
-                            "description": "[{n, title, url, doi?, contributed, saved_as?}]"},
+                            "description": "[{n, title, url, doi?, contributed, saved_as?, "
+                                           "exit?}] — exit: in a search through a VPN, the "
+                                           "name of the exit the source came from"},
                 "tiers": {"type": "array", "items": {"type": "object"},
                           "description": "[{tier, asked, hit, blocked_by_address?}] — every "
                                          "tool tried, what it returned or why it failed, "

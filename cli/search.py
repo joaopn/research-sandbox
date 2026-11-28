@@ -25,20 +25,21 @@ installation, turned on by the operator (Services → Search):
 
 Each search runs inside the service's inner Docker in containers made for it
 alone (container/search/service.py). The service is offered to agents as the
-MCP gateway server ``search`` and, while the VPN version is on and a VPN
-configuration is stored, as a second server ``search-vpn`` (the same tools at
-a second path, whose searches reach sites only through the VPN); each is wired
+MCP gateway server ``search`` and, while the VPN version is on and at least
+one VPN exit is stored, as a second server ``search-vpn`` (the same tools at
+a second path, whose searches reach sites only through the VPN's exits, the
+first one first); each is wired
 to projects on its own. The gateway passes the caller's project and consumer
 on to these two (CALLER_HEADER) and to no other server.
 
 Host state lives under ``~/.research-sandbox/search/`` (never mounted into a
 container): the "on" record, the searcher's settings, the long-lived Claude
-token (0600) and the VPN configuration (0600, it holds the tunnel's private
-key). The settings, the token and (while the VPN version is on) the VPN
-configuration reach the service over a `docker exec` stdin, into a tmpfs only
-root in the service reads, at every start and at every change; the VPN
-configuration goes on from there only to the service's VPN gateway, over
-stdin again.
+token (0600) and the VPN's exits (0600, an ordered list of named WireGuard
+configurations: they hold the tunnels' private keys). The settings, the token
+and (while the VPN version is on) the exits reach the service over a `docker
+exec` stdin, into a tmpfs only root in the service reads, at every start and
+at every change; each exit's configuration goes on from there only to that
+exit's VPN gateway, over stdin again.
 
 The lifecycle (on / off / status / resume at `research start`) lives in
 rscore; this module decides names, the container's exact shape, and the
@@ -73,9 +74,9 @@ BROWSER_IMAGE = "rs-search-browser:latest"
 STEALTH_IMAGE = "rs-search-stealth:latest"
 # The VPN gateway's image (container/search/Dockerfile.vpn: WireGuard's tools,
 # iproute2 and iptables on Alpine), built and staged the same way. The service
-# runs one container of it while the VPN version is on with a VPN configuration
-# stored (the gateway VPN searches route through), and one-shot containers of it that set a VPN
-# search's sidecars' route.
+# runs one container of it per stored exit while the VPN version is on (the
+# gateways VPN searches route through), and one-shot containers of it that set
+# a VPN search's sidecars' route.
 VPN_IMAGE = "rs-search-vpn:latest"
 # Every search image the host builds from this tree, with its Dockerfile (in
 # container/search/); the service image is first (the others are staged into
@@ -123,7 +124,7 @@ MCP_URL = f"http://{SERVICE_CONTAINER}:{SERVICE_PORT}{MCP_PATH}"
 MCP_DESCRIPTION = ("RS's search service: hand over a question, collect a "
                    "written answer with its sources and files")
 # The VPN version's entry: listed while the service is on, the VPN version is
-# ticked and a VPN configuration is stored; taken off when any of the three
+# ticked and at least one exit is stored; taken off when any of the three
 # stops holding.
 MCP_VPN_SERVER_NAME = "search-vpn"
 MCP_VPN_URL = f"http://{SERVICE_CONTAINER}:{SERVICE_PORT}{MCP_VPN_PATH}"
@@ -145,9 +146,9 @@ PASS_CALLER_KEY = "pass_caller"
 SERVICE_RUN_DIR = "/run/rs-search"
 SETTINGS_FILE_NAME = "settings.json"
 TOKEN_FILE_NAME = "claude.env"
-# The VPN configuration as the service is handed it (service.py VPN_PATH —
-# MIRROR): over stdin into the same tmpfs, and from there only to the VPN
-# gateway container, over stdin again.
+# The VPN's exits as the service is handed them (service.py VPN_PATH —
+# MIRROR): over stdin into the same tmpfs, and from there each exit's
+# configuration only to its own gateway container, over stdin again.
 VPN_FILE_NAME = "vpn.json"
 # The host's agent bundles, read-only, so each search agent runs the Claude
 # Code the operator pulled (a MIRROR of service.py AGENT_DIST_DIR).
@@ -206,10 +207,11 @@ SETTINGS_PATH = STATE_DIR / "settings.json"
 # search agent through `docker run --env-file`, never on a command line.
 TOKEN_PATH = STATE_DIR / "claude.env"
 TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
-# The VPN configuration (WireGuard), normalized by RS from the provider's file
-# or the fields typed by hand, with the VPN server's address resolved once at
-# save (0600, like the token: it holds the tunnel's private key). Handed to
-# the service over stdin, never mounted, never on a command line.
+# The VPN's exits: an ordered list of named WireGuard configurations, each
+# normalized by RS from the provider's file or the fields typed by hand, with
+# its VPN server's address resolved once at save (0600, like the token: they
+# hold the tunnels' private keys). Handed to the service over stdin, never
+# mounted, never on a command line.
 VPN_PATH = STATE_DIR / "vpn.json"
 # Serializes the writers of the host files (settings, token, VPN) between the
 # broker and the host command. One non-blocking attempt on the broker.
@@ -268,6 +270,13 @@ MAX_AT_ONCE = 32
 #     rows nobody scrolls to.
 DEFAULT_RECENT = 20
 RECENT_MAX = 100
+# How many of the VPN's exits a VPN search tries on one site (counted by the
+# page's host name) before it reports the site blocked: the first exit, then
+# the next one for a page the first was refused, and so on. The maintainer's
+# default: one retry through a second exit. It is said to the searcher in its
+# instructions only (prose: nothing counts or refuses in the service), and
+# has no upper bound of its own (it is never more than the exits there are).
+DEFAULT_EXITS_PER_SITE = 2
 # Unpaywall requires an email address and Crossref's polite pool asks for
 # one. When the operator leaves the contact empty, the requests carry this
 # generic address (a reserved documentation domain: no person behind it).
@@ -452,7 +461,8 @@ def default_settings() -> dict[str, Any]:
             "searcher": {"name": DEFAULT_SEARCHER_NAME, "model": DEFAULT_MODEL,
                          "effort": DEFAULT_EFFORT, "at_once": DEFAULT_AT_ONCE,
                          "tiers": default_tiers()},
-            "contact": "", "recent": DEFAULT_RECENT, "sidebar": False, "vpn": False}
+            "contact": "", "recent": DEFAULT_RECENT, "sidebar": False, "vpn": False,
+            "exits_per_site": DEFAULT_EXITS_PER_SITE}
 
 
 def tiers_problem(value: Any) -> str | None:
@@ -496,6 +506,21 @@ def vpn_problem(value: Any) -> str | None:
     return None
 
 
+def exits_per_site_problem(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return "the exits tried on one site is a whole number of at least 1"
+    return None
+
+
+def exit_name_problem(name: Any) -> str | None:
+    """An exit's name follows the searcher's rule (it becomes part of the
+    names of its MCP servers, containers and networks)."""
+    if searcher_name_problem(name):
+        return ("an exit's name starts with a lowercase letter and holds only "
+                "lowercase letters, digits and dashes")
+    return None
+
+
 def contact_problem(value: Any) -> str | None:
     if not isinstance(value, str):
         return "the contact address must be text"
@@ -508,11 +533,12 @@ def contact_problem(value: Any) -> str | None:
 def settings_problem(data: Any, model_ok) -> str | None:
     """Why `data` is not a valid settings record, or None. `model_ok(model,
     effort)` is the catalog's check (rscore passes it in: this module does
-    not import the model catalog). A record without `recent`, `sidebar` or
-    `vpn`, or a searcher without `tiers`, is valid: it was saved before that
-    setting existed (read_settings fills the default)."""
+    not import the model catalog). A record without `recent`, `sidebar`,
+    `vpn` or `exits_per_site`, or a searcher without `tiers`, is valid: it was
+    saved before that setting existed (read_settings fills the default)."""
     if not isinstance(data, dict) \
-            or set(data) - {"recent", "sidebar", "vpn"} != {"version", "searcher", "contact"}:
+            or set(data) - {"recent", "sidebar", "vpn", "exits_per_site"} \
+            != {"version", "searcher", "contact"}:
         return "it does not have the expected shape"
     if data["version"] != SETTINGS_VERSION or isinstance(data["version"], bool):
         return "it was written by another version of RS"
@@ -524,7 +550,9 @@ def settings_problem(data: Any, model_ok) -> str | None:
                     contact_problem(data["contact"]),
                     recent_problem(data["recent"]) if "recent" in data else None,
                     sidebar_problem(data["sidebar"]) if "sidebar" in data else None,
-                    vpn_problem(data["vpn"]) if "vpn" in data else None):
+                    vpn_problem(data["vpn"]) if "vpn" in data else None,
+                    exits_per_site_problem(data["exits_per_site"])
+                    if "exits_per_site" in data else None):
         if problem:
             return problem
     if not isinstance(s["model"], str) or not isinstance(s["effort"], str):
@@ -557,17 +585,18 @@ def read_settings(model_ok, path: Path | None = None) -> dict[str, Any]:
     data.setdefault("recent", DEFAULT_RECENT)       # saved before the setting existed
     data.setdefault("sidebar", False)               # likewise
     data.setdefault("vpn", False)                   # likewise
+    data.setdefault("exits_per_site", DEFAULT_EXITS_PER_SITE)     # likewise
     data["searcher"].setdefault("tiers", default_tiers())     # likewise
     return data
 
 
 def service_settings(data: dict[str, Any]) -> dict[str, Any]:
     """What the service is handed: the settings with the contact filled (the
-    searcher carries its `tiers`, filled by read_settings) and whether the
-    VPN version is on."""
+    searcher carries its `tiers`, filled by read_settings), whether the
+    VPN version is on and how many exits a VPN search tries on one site."""
     return {"version": SETTINGS_VERSION, "searcher": dict(data["searcher"]),
             "contact": data["contact"] or GENERIC_CONTACT, "recent": data["recent"],
-            "vpn": data["vpn"]}
+            "vpn": data["vpn"], "exits_per_site": data["exits_per_site"]}
 
 
 # --- host files ------------------------------------------------------------------
@@ -660,12 +689,26 @@ def set_on(on: bool, path: Path | None = None) -> None:
 # --- the VPN configuration (WireGuard) ---------------------------------------------
 # The operator pastes the configuration file their VPN provider gives, or
 # types its fields by hand; both become ONE normalized configuration, checked
-# here (pure). The host resolves the VPN server's name once, at save
-# (rscore), and stores the result in VPN_PATH (0600). What RS applies is
-# IPv4 only (the service's networks are IPv4): an IPv6 address, resolver or
-# allowed range is kept out and the status says so.
+# here (pure), which is one exit of the VPN: a name and that configuration.
+# The host resolves the VPN server's name once, at save (rscore), and stores
+# the exits, in their order, in VPN_PATH (0600). What RS applies is IPv4 only
+# (the service's networks are IPv4): an IPv6 address, resolver or allowed
+# range is kept out and the status says so.
 
-VPN_RECORD_VERSION = 1
+# The record RS writes: {"version": EXITS_RECORD_VERSION, "exits": [{"name",
+# <the configuration's keys>}, …]}, the first exit first, never empty (the
+# last exit's removal removes the file). The one-configuration record of the
+# release before exits ({"version": VPN_RECORD_V1, <the configuration's
+# keys>}) reads as one exit named V1_EXIT_NAME, and is left as it is until
+# the operator next changes the exits.
+VPN_RECORD_V1 = 1
+EXITS_RECORD_VERSION = 2
+V1_EXIT_NAME = "vpn-1"
+# A normalized configuration's keys, as stored (its server's address
+# resolved: endpoint_ip).
+_VPN_CONFIG_KEYS = frozenset({"private_key", "addresses", "dns", "listen_port", "mtu",
+                              "public_key", "preshared_key", "endpoint_host", "endpoint_port",
+                              "allowed_ips", "keepalive", "ipv6_ignored", "endpoint_ip"})
 # The lines of a configuration file RS reads, per section (WireGuard reads
 # key names without regard to case), and the ones that may repeat (their
 # values add up, as wg-quick reads them).
@@ -712,8 +755,8 @@ VPN_IPV6_NOTE = ("the configuration's IPv6 parts ({parts}) are not used: the sea
 VPN_NO_DNS = ("the configuration names no IPv4 DNS server; a VPN search resolves names "
               "only through the tunnel, so RS needs one (the DNS line your VPN provider "
               "gives)")
-VPN_DAMAGED = ("the VPN configuration kept on the host is not one RS wrote, so it was "
-               "not used; store it again under VPN")
+VPN_DAMAGED = ("the VPN's exits kept on the host are not a record RS wrote, so none "
+               "was used; add an exit again under VPN (it replaces them)")
 
 
 def _vpn_key_problem(field: str, value: str) -> str | None:
@@ -817,8 +860,7 @@ def _vpn_normalize(fields: dict[str, str]) -> dict[str, Any]:
         keepalive = _vpn_int("PersistentKeepalive", ka, 0, _KEEPALIVE_MAX) or None
     listen = fields.get("ListenPort")
     mtu = fields.get("MTU")
-    return {"version": VPN_RECORD_VERSION,
-            "private_key": fields["PrivateKey"], "addresses": addresses, "dns": dns,
+    return {"private_key": fields["PrivateKey"], "addresses": addresses, "dns": dns,
             "listen_port": _vpn_int("ListenPort", listen, 1, _PORT_MAX) if listen else None,
             "mtu": _vpn_int("MTU", mtu, 1, None) if mtu else None,
             "public_key": fields["PublicKey"], "preshared_key": fields.get("PresharedKey") or None,
@@ -920,14 +962,10 @@ def parse_vpn_manual(value: Any) -> dict[str, Any]:
     return _vpn_normalize(fields)
 
 
-def vpn_record_problem(data: Any) -> str | None:
-    """Why `data` is not a VPN record RS wrote (the normalized configuration
-    with its resolved `endpoint_ip`), or None."""
-    keys = {"version", "private_key", "addresses", "dns", "listen_port", "mtu", "public_key",
-            "preshared_key", "endpoint_host", "endpoint_port", "allowed_ips", "keepalive",
-            "ipv6_ignored", "endpoint_ip"}
-    if not isinstance(data, dict) or set(data) != keys \
-            or data["version"] != VPN_RECORD_VERSION or isinstance(data["version"], bool):
+def _vpn_config_problem(data: Any) -> str | None:
+    """Why `data` is not one exit's configuration as RS stores it (the
+    normalized configuration with its resolved `endpoint_ip`), or None."""
+    if not isinstance(data, dict) or set(data) != _VPN_CONFIG_KEYS:
         return "it does not have the expected shape"
     try:
         fields = {"PrivateKey": data["private_key"], "PublicKey": data["public_key"],
@@ -951,32 +989,61 @@ def vpn_record_problem(data: Any) -> str | None:
     return None
 
 
-def read_vpn_file(path: Path | None = None) -> dict[str, Any] | None:
-    """The stored VPN configuration, or None when none is stored. SearchError
-    when the file is there but not one RS wrote."""
+def exits_from_record(data: Any) -> list[dict[str, Any]] | None:
+    """The exits a stored record holds, in order ({"name", <configuration>}
+    each), or None when it is not a record RS wrote: the exits record, or
+    the one-configuration record of the release before exits (one exit,
+    V1_EXIT_NAME)."""
+    if not isinstance(data, dict) or isinstance(data.get("version"), bool):
+        return None
+    if data.get("version") == VPN_RECORD_V1:
+        config = {k: v for k, v in data.items() if k != "version"}
+        return None if _vpn_config_problem(config) else [dict(config, name=V1_EXIT_NAME)]
+    if data.get("version") != EXITS_RECORD_VERSION or set(data) != {"version", "exits"} \
+            or not isinstance(data["exits"], list) or not data["exits"]:
+        return None
+    names: set = set()
+    for e in data["exits"]:
+        if not isinstance(e, dict) or exit_name_problem(e.get("name")) or e["name"] in names \
+                or _vpn_config_problem({k: v for k, v in e.items() if k != "name"}):
+            return None
+        names.add(e["name"])
+    return [dict(e) for e in data["exits"]]
+
+
+def read_exits_file(path: Path | None = None) -> list[dict[str, Any]]:
+    """The stored exits, the first one first ([] when none is stored).
+    SearchError when the file is there but not one RS wrote."""
     path = VPN_PATH if path is None else path
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return None
+        return []
     except OSError:
         raise SearchError(VPN_DAMAGED) from None
     try:
         data = json.loads(raw)
     except (ValueError, RecursionError):
         raise SearchError(VPN_DAMAGED) from None
-    if vpn_record_problem(data):
+    exits = exits_from_record(data)
+    if exits is None:
         raise SearchError(VPN_DAMAGED)
-    return data
+    return exits
 
 
-def write_vpn_file(record: dict[str, Any], path: Path | None = None) -> None:
-    """Raises OSError (the caller words it). 0600, through a fresh temp."""
-    _write_atomic(VPN_PATH if path is None else path,
-                  json.dumps(record, indent=2, sort_keys=True) + "\n")
+def write_exits_file(exits: list[dict[str, Any]], path: Path | None = None) -> None:
+    """Store the exits in their order (the exits record); none left removes
+    the file. Raises OSError (the caller words it). 0600, through a fresh
+    temp."""
+    path = VPN_PATH if path is None else path
+    if not exits:
+        clear_exits_file(path)
+        return
+    _write_atomic(path, json.dumps({"version": EXITS_RECORD_VERSION, "exits": exits},
+                                   indent=2, sort_keys=True) + "\n")
 
 
-def clear_vpn_file(path: Path | None = None) -> None:
+def clear_exits_file(path: Path | None = None) -> None:
     path = VPN_PATH if path is None else path
     try:
         path.unlink()
@@ -984,27 +1051,30 @@ def clear_vpn_file(path: Path | None = None) -> None:
         pass
 
 
-def vpn_destination(record: dict[str, Any]) -> tuple[str, int]:
-    """The service's router destination for the tunnel: (address, UDP port)."""
-    return record["endpoint_ip"], record["endpoint_port"]
+def vpn_destination(exit_: dict[str, Any]) -> tuple[str, int]:
+    """An exit's router destination for its tunnel: (address, UDP port)."""
+    return exit_["endpoint_ip"], exit_["endpoint_port"]
 
 
-def vpn_public(record: dict[str, Any] | None) -> dict[str, Any]:
-    """What may be shown of a stored configuration (never a key)."""
-    if record is None:
-        return {"configured": False, "endpoint": None, "endpoint_ip": None, "address": None,
-                "dns": [], "note": None}
-    return {"configured": True,
-            "endpoint": f"{record['endpoint_host']}:{record['endpoint_port']}",
-            "endpoint_ip": record["endpoint_ip"], "address": ", ".join(record["addresses"]),
-            "dns": list(record["dns"]),
-            "note": (VPN_IPV6_NOTE.format(parts=", ".join(record["ipv6_ignored"]))
-                     if record["ipv6_ignored"] else None)}
+def vpn_public(exit_: dict[str, Any]) -> dict[str, Any]:
+    """What may be shown of a stored exit (never a key)."""
+    return {"name": exit_["name"], "configured": True,
+            "endpoint": f"{exit_['endpoint_host']}:{exit_['endpoint_port']}",
+            "endpoint_ip": exit_["endpoint_ip"], "address": ", ".join(exit_["addresses"]),
+            "dns": list(exit_["dns"]),
+            "note": (VPN_IPV6_NOTE.format(parts=", ".join(exit_["ipv6_ignored"]))
+                     if exit_["ipv6_ignored"] else None)}
 
 
-def vpn_service_record(record: dict[str, Any]) -> dict[str, Any]:
-    """What the service is handed: what the gateway applies (the server by
-    its resolved address; IPv4 parts only)."""
-    return {k: record[k] for k in ("version", "private_key", "addresses", "dns", "listen_port",
-                                   "mtu", "public_key", "preshared_key", "endpoint_ip",
-                                   "endpoint_port", "allowed_ips", "keepalive")}
+# The keys of an exit the service is handed: what its gateway applies (the
+# server by its resolved address; IPv4 parts only).
+_VPN_SERVICE_KEYS = ("name", "private_key", "addresses", "dns", "listen_port", "mtu",
+                     "public_key", "preshared_key", "endpoint_ip", "endpoint_port",
+                     "allowed_ips", "keepalive")
+
+
+def vpn_service_record(exits: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the service is handed: the exits in their order (service.py
+    read_vpn — MIRROR)."""
+    return {"version": EXITS_RECORD_VERSION,
+            "exits": [{k: e[k] for k in _VPN_SERVICE_KEYS} for e in exits]}

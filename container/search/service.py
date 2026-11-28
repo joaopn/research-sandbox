@@ -26,20 +26,25 @@ once the inner Docker answers), and does two things:
     connected to a second, internal network of each search that only the
     search's agent joins (never to the search's own network, where its
     sidecars are), never the searches to each other;
-  - while a VPN configuration is delivered (the host delivers it only while
-    the VPN version is ticked), the VPN gateway (kernel WireGuard, NET_ADMIN
-    only) and a second SearXNG routed through it. A VPN search (one asked
-    through MCP_VPN_PATH) runs every tool that touches a site in a
-    sidecar on its `--internal` network (the plain tier too, over HTTP),
-    each routed through the gateway by a one-shot helper and resolving
-    through the tunnel; its agent reaches only its sidecars and, by a
-    network of its own, its model provider. With the tunnel down the gateway
-    routes nothing (`unreachable`), and a VPN search fails before it starts.
+  - while the VPN's exits are delivered (the host delivers them only while
+    the VPN version is ticked), one VPN gateway per exit (kernel WireGuard,
+    NET_ADMIN only), each with its own tunnel and its own background check,
+    and a second SearXNG routed through the first exit's gateway. A VPN
+    search (one asked through MCP_VPN_PATH) gets, for every exit whose
+    tunnel is up when it starts, that exit's own sidecars (the plain tier
+    too, over HTTP) on a network of the search and that exit, `--internal`,
+    each routed through that exit's gateway by a one-shot helper and
+    resolving through its tunnel; its tool list names each server after its
+    tier and exit, and its instructions list the exits in order and say how
+    to go from one to the next. Its agent reaches only its sidecars and, by a
+    network of its own, its model provider. With a tunnel down its gateway
+    routes nothing (`unreachable`); with none up, a VPN search fails before
+    it starts.
 
 `service.py put NAME` / `drop NAME` (the host, over `docker exec -i`) write or
 remove one of the files the host hands over (settings, token, VPN
 configuration) in RUN_DIR;
-`service.py admin status|clear|ensure|vpn|vpn-apply|list|test` and `admin
+`service.py admin status|clear|ensure|vpn|vpn-apply|list|test`, `admin vpn-renew EXIT` and `admin
 view|stop ID` ask
 the running server from inside the container (the admin routes answer
 127.0.0.1 only): the operator's list of waiting and running searches, a
@@ -57,6 +62,7 @@ from __future__ import annotations
 
 import collections
 import errno
+import hashlib
 import ipaddress
 import json
 import math
@@ -147,27 +153,60 @@ PLAIN_SERVER = {"type": "stdio", "command": "python3", "args": ["/opt/rs-search-
 PLAIN_TIER = "plain"
 PLAIN_SIDECAR_CMD = ["python3", "/opt/rs-search-agent/tools.py", "--http"]
 
-# --- the VPN gateway -------------------------------------------------------------
-# One container inside this service while a VPN configuration is delivered:
-# kernel WireGuard with NET_ADMIN and IPv4 forwarding only (vpn/up.sh). Its
-# own network is its way to the VPN server (through this container's egress
-# and RS's router, which lets the server's UDP port out); it joins each VPN
-# search's network, which is `--internal` (no way out but the one the helper
-# sets: through the gateway), and the network of the VPN's own SearXNG.
-VPN_CONTAINER = "rs-search-vpn"
+# --- the VPN's exits and their gateways --------------------------------------------
+# The VPN is an ordered list of exits (the host delivers them only while the
+# VPN version is ticked), each a name and a WireGuard configuration. Each
+# exit has one gateway container inside this service, named
+# VPN_GATEWAY_PREFIX + the exit's name and labelled with VPN_LABEL and
+# EXIT_LABEL: kernel WireGuard with NET_ADMIN and IPv4 forwarding only
+# (vpn/up.sh). The gateways share one network, their way to their VPN
+# servers (through this container's egress and RS's router, which lets each
+# server's UDP port out; each gateway takes nothing in there but its own
+# server's answers and forwards nothing from there); each joins its exit's
+# network of every VPN search, which is `--internal` (no way out but the one
+# the helper sets: through that gateway), and the FIRST exit's gateway also
+# the network of the VPN's own SearXNG.
+VPN_GATEWAY_PREFIX = "rs-search-vpn-"
+# The one gateway of the release before exits (no EXIT_LABEL): an earlier
+# run's is removed at start like the others.
+V1_GATEWAY = "rs-search-vpn"
 VPN_WAN_NETWORK = "rs-search-vpn-wan"
 VPN_LABEL = "research.search.vpn"
+# The exit a gateway, or a VPN search's sidecar or network, belongs to.
+EXIT_LABEL = "research.search.exit"
+# An exit's name (search.SEARCHER_NAME_RE, the rule cli/search.py
+# exit_name_problem applies — MIRROR).
+EXIT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 VPN_SCRIPTS = "/opt/rs-search-vpn"        # Dockerfile.vpn — MIRROR
+# How many exits a VPN search tries on one site, when the host sent none
+# (search.DEFAULT_EXITS_PER_SITE — MIRROR).
+DEFAULT_EXITS_PER_SITE = 2
 # The VPN's SearXNG: the web search of VPN searches, routed through the
-# gateway (its own `--internal` network holds it and the gateway), joined to
-# each VPN search's SearXNG network, where only that search's plain-tier
-# sidecar is (whose tool server takes no new connection from there).
+# first exit's gateway (its own `--internal` network holds it and that
+# gateway), joined to each VPN search's SearXNG network, where only that
+# search's first exit's plain-tier sidecar is (whose tool server takes no new
+# connection from there).
 SEARXNG_VPN_CONTAINER = "rs-search-searxng-vpn"
 SEARXNG_VPN_NETWORK = "rs-search-vpn-sx"
 SEARXNG_VPN_DIR = os.path.join(STATE_DIR, "searxng-vpn")
-# A VPN search's third network, named after it with this suffix: its agent's
-# own way out (the model provider), which only the agent is on.
+# A VPN search's agent's own way out (the model provider), named after the
+# search with this suffix, which only the agent is on.
 OUT_NET_SUFFIX = "-out"
+# A VPN search's network of one exit, named after the search with this
+# infix and the exit's position in the search (exit_net_name), `--internal`,
+# labelled with LANE_LABEL: that exit's sidecars, its gateway and the agent
+# are on it.
+EXIT_NET_INFIX = "-x-"
+# A VPN search's per-exit pieces (its sidecars, its networks and its tool
+# servers' names) carry the exit's POSITION in that search (1, 2, …, fixed at
+# its start), never the exit's name: the agent reaches a sidecar by its
+# container name, a DNS label of at most 63 characters, and the server's
+# name is inside every tool name, so an exit's name, which has no length
+# bound, is kept out of both. The search keeps which exit each position is
+# (AgentStream.set_exits). LANE_LABEL carries the position, EXIT_LABEL the
+# exit's name.
+LANE_LABEL = "research.search.lane"
+LANE_RE = re.compile(r"^[1-9][0-9]*$")
 # The one-shot helper that sets a VPN search's sidecar's route, named after
 # the search with this suffix (one at a time) and labelled like its things.
 ROUTE_SUFFIX = "-route"
@@ -183,7 +222,7 @@ VPN_SESSION_MAX_AGE_S = 180
 # the check runs in the background and the page reads its last result.
 VPN_HANDSHAKE_WAIT_S = 6
 # Why a VPN search does not run (its outcome's reason starts so).
-VPN_NOT_UP = "the VPN tunnel is not up: "
+VPN_NOT_UP = "no VPN exit's tunnel is up: "
 # Where a search's volume is mounted in its agent container, and the two
 # folders the agent's tool server writes (agent/tools.py — MIRROR).
 AGENT_VOLUME_MOUNT = "/search"
@@ -447,7 +486,8 @@ def first_line(r: subprocess.CompletedProcess) -> str:
 def read_settings() -> dict | None:
     """The settings the host delivered, or None (not delivered, or unusable:
     the host writes only valid ones). `vpn`: whether the VPN version is
-    ticked (an older host sends none: off)."""
+    ticked (an older host sends none: off); `exits_per_site`: how many exits
+    a VPN search tries on one site (an older host sends none: the default)."""
     try:
         with open(SETTINGS_PATH, "rb") as f:
             data = json.loads(f.read(DELIVERY_MAX_BYTES + 1))
@@ -467,21 +507,24 @@ def read_settings() -> dict | None:
             return None
         if not isinstance(data.setdefault("vpn", False), bool):
             return None
+        n = data.get("exits_per_site")
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            data["exits_per_site"] = DEFAULT_EXITS_PER_SITE  # missing (an older host) or bad
         return data
     except (OSError, ValueError, RecursionError, KeyError, TypeError):
         return None
 
 
 def vpn_on() -> bool:
-    """Whether VPN searches can be asked: the VPN version ticked and a VPN
-    configuration delivered (whether its tunnel is up is checked when a
-    search starts)."""
+    """Whether VPN searches can be asked: the VPN version ticked and at least
+    one exit delivered (whether a tunnel is up is checked when a search
+    starts)."""
     settings = read_settings()
-    return bool(settings and settings["vpn"]) and read_vpn() is not None
+    return bool(settings and settings["vpn"]) and bool(read_vpn())
 
 
 VPN_OFF = ("the VPN version of the search service is off: the operator turns it on and "
-           "stores a VPN configuration on the Search page")
+           "adds a VPN exit on the Search page")
 
 
 def token_present() -> bool:
@@ -659,74 +702,125 @@ def ensure_searxng() -> str | None:
         return None
 
 
-# --- the VPN gateway and the VPN's SearXNG ---------------------------------------------
+# --- the VPN's gateways and the VPN's SearXNG ------------------------------------------
 
-# Held while the gateway is set up, and for a moment by every look at it:
-# never across a wait for a handshake.
+# Held while the gateways are brought in line, and for a moment by every look
+# at one: never across a wait for a handshake.
 _vpn_lock = threading.Lock()
-# Why the last setup of the gateway failed (None when it did not): the
-# status says it until the next setup.
+# Why the delivered exits could not be used at all (None when they could).
 _vpn_error: str | None = None
-# The tunnel's checks (status.sh's renew-and-wait). One runs at a time (it
-# holds _check_run_lock for its whole wait); _check_lock guards the fields
-# below and is held only for a moment, so a read never waits on a check.
-_check_run_lock = threading.Lock()
-_check_lock = threading.Lock()
-# The last finished check since the configuration was last applied
-# ({tunnel, handshake_s, error}, None when none finished) and when it
-# finished (time.monotonic()).
-_check_result: dict | None = None
-_check_at = 0.0
-# Bumped at every setup of the gateway: a check started before it records
-# nothing (it looked at a tunnel that is gone).
-_check_gen = 0
-# Checks running or waiting to run, and whether the background one is out.
-_checks_running = 0
-_check_background = False
 _WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
 # A port and a keepalive interval are 16-bit numbers in WireGuard.
 _U16_MAX = 65535
+
+
+class Tunnel:
+    """One exit's tunnel as the service follows it: why its gateway's last
+    setup failed, what was last applied to it, and its checks (status.sh's
+    renew-and-wait). One check of it runs at a time (it holds run_lock for its
+    whole wait); `lock` guards the fields below it and is held only for a
+    moment, so a read never waits on a check. Each exit's checks are its own:
+    another exit's change or check never touches them."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.error: str | None = None
+        # A digest of the settings last applied to the gateway (in memory
+        # only; None when none were): a change of another exit leaves an
+        # unchanged one as it is.
+        self.applied: str | None = None
+        self.run_lock = threading.Lock()
+        self.lock = threading.Lock()
+        # The last finished check since the configuration was last applied
+        # ({tunnel, handshake_s, error}, None when none finished) and when it
+        # finished (time.monotonic()).
+        self.result: dict | None = None
+        self.at = 0.0
+        # Bumped at every setup of the gateway: a check started before it
+        # records nothing (it looked at a tunnel that is gone).
+        self.gen = 0
+        # Checks running or waiting to run, and whether the background one is out.
+        self.running = 0
+        self.background = False
+
+    def forget(self) -> None:
+        """The gateway was set up again (or removed): no check has finished
+        on it, and a check that runs now records nothing."""
+        with self.lock:
+            self.result = None
+            self.gen += 1
+
+
+# The exits' tunnels by name (under _vpn_lock): one per exit delivered.
+TUNNELS: dict[str, Tunnel] = {}
 
 
 def _u16(v, low: int) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and low <= v <= _U16_MAX
 
 
-def read_vpn() -> dict | None:
-    """The VPN configuration the host delivered, or None (none delivered, or
-    not the shape the host writes: search.vpn_service_record)."""
+def _exit_ok(d) -> bool:
+    """One delivered exit as the host writes it (search.vpn_service_record)."""
+    return (isinstance(d, dict)
+            and isinstance(d["name"], str) and EXIT_NAME_RE.match(d["name"]) is not None
+            and all(isinstance(d[k], str) and _WG_KEY_RE.match(d[k])
+                    for k in ("private_key", "public_key"))
+            and (d["preshared_key"] is None
+                 or (isinstance(d["preshared_key"], str)
+                     and _WG_KEY_RE.match(d["preshared_key"]) is not None))
+            and isinstance(d["addresses"], list) and bool(d["addresses"])
+            and all(isinstance(a, str) and ipaddress.ip_interface(a).version == 4
+                    and "/" in a for a in d["addresses"])
+            and isinstance(d["dns"], list) and bool(d["dns"])
+            and all(isinstance(x, str) and ipaddress.ip_address(x).version == 4
+                    for x in d["dns"])
+            and isinstance(d["allowed_ips"], list) and bool(d["allowed_ips"])
+            and all(isinstance(n, str) and ipaddress.ip_network(n).version == 4
+                    for n in d["allowed_ips"])
+            and isinstance(d["endpoint_ip"], str)
+            and ipaddress.ip_address(d["endpoint_ip"]).version == 4
+            and _u16(d["endpoint_port"], 1)
+            and (d["listen_port"] is None or _u16(d["listen_port"], 1))
+            and (d["keepalive"] is None or _u16(d["keepalive"], 1))
+            and (d["mtu"] is None or (isinstance(d["mtu"], int)
+                                      and not isinstance(d["mtu"], bool) and d["mtu"] >= 1)))
+
+
+def read_vpn() -> list | None:
+    """The exits the host delivered, the first one first, or None (none
+    delivered, or not the shape the host writes: search.vpn_service_record,
+    the exits record with at least one exit, each name once)."""
     try:
         with open(VPN_PATH, "rb") as f:
             d = json.loads(f.read(DELIVERY_MAX_BYTES + 1))
-        ok = (isinstance(d, dict)
-              and all(isinstance(d[k], str) and _WG_KEY_RE.match(d[k])
-                      for k in ("private_key", "public_key"))
-              and (d["preshared_key"] is None
-                   or (isinstance(d["preshared_key"], str)
-                       and _WG_KEY_RE.match(d["preshared_key"])))
-              and isinstance(d["addresses"], list) and d["addresses"]
-              and all(isinstance(a, str) and ipaddress.ip_interface(a).version == 4
-                      and "/" in a for a in d["addresses"])
-              and isinstance(d["dns"], list) and d["dns"]
-              and all(isinstance(x, str) and ipaddress.ip_address(x).version == 4
-                      for x in d["dns"])
-              and isinstance(d["allowed_ips"], list) and d["allowed_ips"]
-              and all(isinstance(n, str) and ipaddress.ip_network(n).version == 4
-                      for n in d["allowed_ips"])
-              and isinstance(d["endpoint_ip"], str)
-              and ipaddress.ip_address(d["endpoint_ip"]).version == 4
-              and _u16(d["endpoint_port"], 1)
-              and (d["listen_port"] is None or _u16(d["listen_port"], 1))
-              and (d["keepalive"] is None or _u16(d["keepalive"], 1))
-              and (d["mtu"] is None or (isinstance(d["mtu"], int)
-                                        and not isinstance(d["mtu"], bool) and d["mtu"] >= 1)))
-        return d if ok else None
+        if not (isinstance(d, dict) and d.get("version") == 2
+                and isinstance(d.get("exits"), list) and d["exits"]
+                and all(_exit_ok(e) for e in d["exits"])):
+            return None
+        names = [e["name"] for e in d["exits"]]
+        return d["exits"] if len(set(names)) == len(names) else None
     except (OSError, ValueError, RecursionError, KeyError, TypeError):
         return None
 
 
+def exit_names() -> list[str]:
+    """The delivered exits' names, in order ([] when none)."""
+    return [e["name"] for e in read_vpn() or []]
+
+
+def gateway_name(exit_name: str) -> str:
+    return VPN_GATEWAY_PREFIX + exit_name
+
+
+def is_gateway(cname: str) -> bool:
+    """Whether a container's name is one of an exit's gateways (or the
+    release before exits' one gateway)."""
+    return cname == V1_GATEWAY or (cname.startswith(VPN_GATEWAY_PREFIX) and EXIT_NAME_RE.match(
+        cname[len(VPN_GATEWAY_PREFIX):]) is not None)
+
+
 def vpn_stdin(cfg: dict) -> bytes:
-    """What the gateway's up.sh reads on its stdin: the header (addresses,
+    """What a gateway's up.sh reads on its stdin: the header (addresses,
     resolvers, MTU, the server's address), then the tunnel's settings in
     WireGuard's format. Built only from values read_vpn checked."""
     lines = [f"ADDRESS={a}" for a in cfg["addresses"]]
@@ -757,7 +851,7 @@ def container_ip(name: str, network: str) -> str | None:
 
 def route_through_gateway(target: str, gateway_ip: str, labels: list[str],
                           helper_name: str, closed_ip: str | None = None) -> str | None:
-    """Set a container's default route through the VPN gateway, from a
+    """Set a container's default route through a VPN gateway, from a
     one-shot helper in its network namespace (the target keeps no
     capability; the helper has NET_ADMIN and nothing else, and is gone when
     it is done). `closed_ip`: the target's address on a network it only calls
@@ -782,11 +876,43 @@ def _vpn_network(name: str, internal: bool) -> str | None:
     return None if r.returncode == 0 else f"the VPN's network could not be created ({first_line(r)})"
 
 
+def gateways_present() -> list[str]:
+    """The exits' gateway containers there are (by their label), each named
+    as its exit's: [exit name]. One labelled but not named so is left alone
+    (and logged)."""
+    r = docker("ps", "-a", "--filter", f"label={VPN_LABEL}", "--filter", f"label={EXIT_LABEL}",
+               "--format", "{{.Names}} {{.Label \"" + EXIT_LABEL + "\"}}")
+    out = []
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        cname, _, name = line.strip().partition(" ")
+        if EXIT_NAME_RE.match(name) and cname == gateway_name(name):
+            out.append(name)
+        elif cname:
+            log(f"vpn: {cname} carries an exit's label but is not named as its gateway; "
+                "left alone")
+    return out
+
+
+def remove_gateway(name: str) -> None:
+    """One exit's gateway, by its name, and its tunnel's record."""
+    if container_state(gateway_name(name))[0] != "absent":
+        docker("rm", "-f", gateway_name(name))
+    t = TUNNELS.pop(name, None)
+    if t is not None:
+        t.forget()
+
+
 def remove_vpn() -> None:
-    """The gateway, the VPN's SearXNG and their two networks, by name."""
-    for c in (SEARXNG_VPN_CONTAINER, VPN_CONTAINER):
+    """Every exit's gateway, the VPN's SearXNG and their two networks, by
+    name (the release before exits' one gateway too)."""
+    for c in (SEARXNG_VPN_CONTAINER, V1_GATEWAY):
         if container_state(c)[0] != "absent":
             docker("rm", "-f", c)
+    for name in gateways_present():
+        remove_gateway(name)
+    for t in list(TUNNELS.values()):
+        t.forget()
+    TUNNELS.clear()
     for net in (SEARXNG_VPN_NETWORK, VPN_WAN_NETWORK):
         if docker("network", "inspect", net).returncode == 0:
             docker("network", "rm", net)
@@ -797,50 +923,91 @@ def _image_id(image: str) -> str:
     return r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else ""
 
 
-def ensure_vpn() -> str | None:
-    """Bring the VPN gateway in line with the delivered configuration: none
-    delivered, it and the VPN's SearXNG go; one delivered, the gateway runs
-    (re-created when its image changed) and is set up again with it, then the
-    VPN's SearXNG runs on its route, and a check of the tunnel starts in the
-    background (the previous one's result is forgotten). None, or why it is
-    not set up (also kept for the status)."""
+def ensure_vpn(renew: str | None = None) -> str | None:
+    """Bring the gateways in line with the delivered exits: none delivered,
+    every gateway and the VPN's SearXNG go; else the gateway of an exit no
+    longer delivered goes (by name), each delivered exit's gateway runs
+    (re-created when its image changed) and is set up again when its
+    configuration changed, its gateway is new or it is `renew` (the exit the
+    operator just saved; every other unchanged exit is left as it is), then
+    the VPN's SearXNG runs on the first exit's route, and a check of each
+    tunnel set up again starts in the background. None, or why the exits
+    could not be used at all (each exit's own failure is its status)."""
     global _vpn_error
     with _vpn_lock:
-        cfg = read_vpn()
-        if cfg is None:
+        exits = read_vpn()
+        if exits is None:
             remove_vpn()
-            _forget_checks()
             _vpn_error = None
             if os.path.exists(VPN_PATH):
-                _vpn_error = "the VPN configuration the search service was handed is not usable"
+                _vpn_error = "the VPN exits the search service was handed are not usable"
             return _vpn_error
-        _vpn_error = _ensure_vpn(cfg)
-        _forget_checks()
+        _vpn_error = _ensure_vpn(exits, renew)
         if _vpn_error:
             log(f"vpn: {_vpn_error}")
-            return _vpn_error
-        log("vpn gateway set up")
-    start_check()
+        checks = [TUNNELS[e["name"]] for e in exits
+                  if e["name"] in TUNNELS and TUNNELS[e["name"]].error is None]
+    for t in checks:
+        with t.lock:
+            fresh = t.result is None
+        if fresh:
+            start_check(t)
+    return _vpn_error
+
+
+def _ensure_vpn(exits: list, renew: str | None) -> str | None:
+    """Under _vpn_lock. None, or why no exit could be set up."""
+    names = [e["name"] for e in exits]
+    for name in gateways_present():
+        if name not in names:
+            remove_gateway(name)
+            log(f"vpn: the gateway of exit {name} removed")
+    for name in list(TUNNELS):
+        if name not in names:
+            TUNNELS.pop(name).forget()
+    for name in names:
+        TUNNELS.setdefault(name, Tunnel(name))
+    image_id = _image_id(VPN_IMAGE)
+    problem = None if image_id else "the VPN gateway's image is not staged in the search service"
+    for net, internal in ((VPN_WAN_NETWORK, False), (SEARXNG_VPN_NETWORK, True)):
+        problem = problem or _vpn_network(net, internal)
+    if problem:
+        for name in names:
+            TUNNELS[name].error = problem
+            TUNNELS[name].applied = None
+            TUNNELS[name].forget()
+        return problem
+    first_fresh = False
+    for i, e in enumerate(exits):
+        t = TUNNELS[e["name"]]
+        fresh, t.error = _ensure_gateway(e, image_id, t, e["name"] == renew)
+        if i == 0:
+            first_fresh = fresh
+        if t.error:
+            log(f"vpn: exit {e['name']}: {t.error}")
+    problem = ensure_searxng_vpn(exits[0], first_fresh)
+    if problem:
+        log(f"vpn: {problem}")
     return None
 
 
-def _ensure_vpn(cfg: dict) -> str | None:
-    image_id = _image_id(VPN_IMAGE)
-    if not image_id:
-        return "the VPN gateway's image is not staged in the search service"
-    for name, internal in ((VPN_WAN_NETWORK, False), (SEARXNG_VPN_NETWORK, True)):
-        problem = _vpn_network(name, internal)
-        if problem:
-            return problem
-    state, labels = container_state(VPN_CONTAINER)
+def _ensure_gateway(cfg: dict, image_id: str, t: Tunnel,
+                    renew: bool) -> tuple[bool, str | None]:
+    """One exit's gateway running and set up with its configuration (again
+    only when it changed, the gateway is new or `renew`). (whether the
+    gateway container is new, None or why it is not set up)."""
+    cname = gateway_name(cfg["name"])
+    state, labels = container_state(cname)
     fresh = False
-    if state != "absent" and (state != "running" or labels.get(VPN_LABEL) != image_id):
-        docker("rm", "-f", VPN_CONTAINER)
+    if state != "absent" and (state != "running" or labels.get(VPN_LABEL) != image_id
+                              or labels.get(EXIT_LABEL) != cfg["name"]):
+        docker("rm", "-f", cname)
         state = "absent"
     if state == "absent":
         # NET_ADMIN only (the tunnel, its routes and its firewall), IPv4
         # forwarding on, a read-only root and a tmpfs for the settings.
-        r = docker("run", "-d", "--name", VPN_CONTAINER, "--label", f"{VPN_LABEL}={image_id}",
+        r = docker("run", "-d", "--name", cname, "--label", f"{VPN_LABEL}={image_id}",
+                   "--label", f"{EXIT_LABEL}={cfg['name']}",
                    "--network", VPN_WAN_NETWORK, "--restart", "no",
                    "--cap-drop", "ALL", "--cap-add", "NET_ADMIN",
                    "--security-opt", "no-new-privileges",
@@ -848,42 +1015,62 @@ def _ensure_vpn(cfg: dict) -> str | None:
                    "--read-only", "--tmpfs", "/etc/wireguard:mode=0700",
                    VPN_IMAGE)
         if r.returncode != 0:
-            return f"the VPN gateway could not be started ({first_line(r)})"
-        r = docker("network", "connect", SEARXNG_VPN_NETWORK, VPN_CONTAINER)
-        if r.returncode != 0:
-            return f"the VPN gateway could not join its SearXNG's network ({first_line(r)})"
+            t.applied = None
+            t.forget()
+            return False, f"the exit's VPN gateway could not be started ({first_line(r)})"
         fresh = True
-        log("vpn gateway started")
-    r = docker("exec", "-i", VPN_CONTAINER, "/bin/sh", f"{VPN_SCRIPTS}/up.sh",
-               input=vpn_stdin(cfg))
+        log(f"vpn gateway of exit {cfg['name']} started")
+    stdin = vpn_stdin(cfg)
+    digest = hashlib.sha256(stdin).hexdigest()
+    if not fresh and not renew and t.error is None and t.applied == digest:
+        return False, None
+    r = docker("exec", "-i", cname, "/bin/sh", f"{VPN_SCRIPTS}/up.sh", input=stdin)
+    t.forget()
     if r.returncode != 0:
-        return f"the VPN gateway could not set the tunnel up ({first_line(r)})"
-    return ensure_searxng_vpn(cfg, fresh)
+        t.applied = None
+        return fresh, f"the exit's VPN gateway could not set the tunnel up ({first_line(r)})"
+    t.applied = digest
+    log(f"vpn gateway of exit {cfg['name']} set up")
+    return fresh, None
 
 
-def ensure_searxng_vpn(cfg: dict, gateway_fresh: bool) -> str | None:
-    """The VPN's SearXNG, on its route through the gateway and resolving
-    through the tunnel: (re)created when it is not running, when its
-    resolvers changed or when the gateway is new; then joined again to the
-    SearXNG network of every VPN search still running. None, or why not."""
-    want = f"{SEARXNG_IMAGE}|{','.join(cfg['dns'])}"
+def ensure_searxng_vpn(first: dict, gateway_fresh: bool) -> str | None:
+    """The VPN's SearXNG, on its route through the first exit's gateway and
+    resolving through that tunnel: the other gateways leave its network;
+    (re)created when it is not running, when its exit or resolvers changed or
+    when that gateway is new or joined its network now; then joined again
+    to the SearXNG network of every VPN search still running. None, or why
+    not."""
+    gw_name = gateway_name(first["name"])
+    members = network_members(SEARXNG_VPN_NETWORK) or []
+    for m in members:
+        if is_gateway(m) and m != gw_name:
+            docker("network", "disconnect", "-f", SEARXNG_VPN_NETWORK, m)
+    joined = False
+    if gw_name not in members:
+        r = docker("network", "connect", SEARXNG_VPN_NETWORK, gw_name)
+        if r.returncode != 0:
+            return f"the first exit's gateway could not join the VPN's SearXNG's network ({first_line(r)})"
+        joined = True
+    want = f"{SEARXNG_IMAGE}|{','.join(first['dns'])}|{first['name']}"
     state, labels = container_state(SEARXNG_VPN_CONTAINER)
-    if state == "running" and labels.get(VPN_LABEL) == want and not gateway_fresh:
+    if state == "running" and labels.get(VPN_LABEL) == want and not gateway_fresh \
+            and not joined:
         return None
     if state != "absent":
         docker("rm", "-f", SEARXNG_VPN_CONTAINER)
     if not image_present(SEARXNG_IMAGE):
         return "the SearXNG image is not staged in the search service"
-    gw = container_ip(VPN_CONTAINER, SEARXNG_VPN_NETWORK)
+    gw = container_ip(gw_name, SEARXNG_VPN_NETWORK)
     if gw is None:
-        return "the VPN gateway has no address on its SearXNG's network"
+        return "the first exit's gateway has no address on the VPN's SearXNG's network"
     os.makedirs(SEARXNG_VPN_DIR, mode=0o755, exist_ok=True)
     tmp = os.path.join(SEARXNG_VPN_DIR, f".settings.{secrets.token_hex(4)}")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, "w") as f:
         f.write(searxng_settings())
     os.replace(tmp, os.path.join(SEARXNG_VPN_DIR, "settings.yml"))
-    dns = [a for d in cfg["dns"] for a in ("--dns", d)]
+    dns = [a for d in first["dns"] for a in ("--dns", d)]
     # Hardened as the other SearXNG; created on its internal network (no way
     # out until the helper routes it through the gateway), its names resolved
     # through the tunnel.
@@ -904,29 +1091,33 @@ def ensure_searxng_vpn(cfg: dict, gateway_fresh: bool) -> str | None:
         return f"the VPN's SearXNG could not be routed through the gateway ({problem})"
     for net in SEARCHES.vpn_searxng_networks():
         docker("network", "connect", "--alias", SEARXNG_ALIAS, net, SEARXNG_VPN_CONTAINER)
-    log("searxng (vpn) started")
+    log(f"searxng (vpn) started, through exit {first['name']}")
     return None
 
 
-def _vpn_look() -> tuple[dict | None, dict | None, str | None]:
-    """(cfg, off-or-error reply, peek): the delivered configuration; the
-    reply when the tunnel cannot be checked (no configuration, the gateway
-    not running, its setup failed), else None; and the tunnel's state from
-    its current handshake alone (status.sh peek: nothing renewed or awaited),
-    "up <age>" or None when it is not fresh or could not be read."""
+def _vpn_look(name: str) -> tuple[dict | None, dict | None, str | None]:
+    """(cfg, off-or-error reply, peek) of one exit: its delivered
+    configuration; the reply when its tunnel cannot be checked (not
+    delivered, its gateway not running, its setup failed), else None; and
+    the tunnel's state from its current handshake alone (status.sh peek:
+    nothing renewed or awaited), its age or None when it is not fresh or could
+    not be read."""
     with _vpn_lock:
-        cfg = read_vpn()
+        cfg = next((e for e in read_vpn() or [] if e["name"] == name), None)
+        t = TUNNELS.get(name)
         if cfg is None:
             return None, {"tunnel": "off", "handshake_s": None, "checking": False,
-                          "error": "no VPN configuration is stored (the operator stores "
-                                   "one under Search → Settings → VPN)"}, None
-        if container_state(VPN_CONTAINER)[0] != "running":
+                          "error": "this exit is not stored (the operator adds exits "
+                                   "under Search → Settings → VPN)"}, None
+        if container_state(gateway_name(name))[0] != "running":
             return cfg, {"tunnel": "off", "handshake_s": None, "checking": False,
-                         "error": _vpn_error or "the VPN gateway is not running"}, None
-        if _vpn_error:
+                         "error": (t.error if t else None) or _vpn_error
+                         or "the exit's VPN gateway is not running"}, None
+        if t is None or t.error:
             return cfg, {"tunnel": "down", "handshake_s": None, "checking": False,
-                         "error": _vpn_error}, None
-        r = docker("exec", VPN_CONTAINER, "/bin/sh", f"{VPN_SCRIPTS}/status.sh",
+                         "error": (t.error if t else None)
+                         or "the exit's VPN gateway is not set up yet"}, None
+        r = docker("exec", gateway_name(name), "/bin/sh", f"{VPN_SCRIPTS}/status.sh",
                    "peek", str(VPN_SESSION_MAX_AGE_S))
     words = r.stdout.decode("utf-8", "replace").split() if r.returncode == 0 else []
     up = len(words) == 2 and words[0] == "up" and words[1].isdigit()
@@ -934,10 +1125,10 @@ def _vpn_look() -> tuple[dict | None, dict | None, str | None]:
 
 
 def _tunnel_check(cfg: dict) -> dict:
-    """One check: status.sh renews a handshake older than
+    """One check of one exit: status.sh renews a handshake older than
     VPN_SESSION_MAX_AGE_S and awaits it up to VPN_HANDSHAKE_WAIT_S.
     {tunnel: up | down, handshake_s, error}."""
-    r = docker("exec", VPN_CONTAINER, "/bin/sh", f"{VPN_SCRIPTS}/status.sh",
+    r = docker("exec", gateway_name(cfg["name"]), "/bin/sh", f"{VPN_SCRIPTS}/status.sh",
                str(VPN_HANDSHAKE_WAIT_S), str(VPN_SESSION_MAX_AGE_S))
     words = r.stdout.decode("utf-8", "replace").split() if r.returncode == 0 else []
     server = f"{cfg['endpoint_ip']}:{cfg['endpoint_port']}"
@@ -956,110 +1147,114 @@ def _tunnel_check(cfg: dict) -> dict:
     if words == ["down", "nolink"]:
         return {"tunnel": "down", "handshake_s": None, "error": "the tunnel is not set up"}
     return {"tunnel": "down", "handshake_s": None,
-            "error": f"the VPN gateway's state could not be read ({first_line(r)})"}
+            "error": f"the exit's VPN gateway's state could not be read ({first_line(r)})"}
 
 
-def _forget_checks() -> None:
-    """The gateway was set up again (or removed): no check has finished on
-    it, and a check that runs now records nothing. Called under _vpn_lock."""
-    global _check_result, _check_gen
-    with _check_lock:
-        _check_result = None
-        _check_gen += 1
-
-
-def _run_check() -> dict:
-    """Run one check, after any check already running (at most one runs at
-    a time), and record its result as the last finished one unless the
-    gateway was set up again meanwhile. A check that finished while this one
-    waited for its turn answers for it. The result."""
-    global _checks_running, _check_result, _check_at
+def _run_check(t: Tunnel) -> dict:
+    """Run one check of an exit, after any check of it already running (at
+    most one runs at a time per exit), and record its result as the last
+    finished one unless the gateway was set up again meanwhile. A check that
+    finished while this one waited for its turn answers for it. The result."""
     asked = time.monotonic()
-    with _check_lock:
-        gen = _check_gen
-        _checks_running += 1
+    with t.lock:
+        gen = t.gen
+        t.running += 1
     try:
-        with _check_run_lock:
-            with _check_lock:
-                if gen == _check_gen and _check_result is not None and _check_at >= asked:
-                    return dict(_check_result)
-            cfg, off, _peek = _vpn_look()
+        with t.run_lock:
+            with t.lock:
+                if gen == t.gen and t.result is not None and t.at >= asked:
+                    return dict(t.result)
+            cfg, off, _peek = _vpn_look(t.name)
             res = off if off is not None else _tunnel_check(cfg)
             res = {k: res[k] for k in ("tunnel", "handshake_s", "error")}
-            with _check_lock:
-                if gen == _check_gen:
-                    _check_result, _check_at = dict(res), time.monotonic()
+            with t.lock:
+                if gen == t.gen:
+                    t.result, t.at = dict(res), time.monotonic()
             return res
     finally:
-        with _check_lock:
-            _checks_running -= 1
+        with t.lock:
+            t.running -= 1
 
 
-def _background_check() -> None:
-    global _check_background
+def _background_check(t: Tunnel) -> None:
     while True:
-        with _check_lock:
-            gen = _check_gen
+        with t.lock:
+            gen = t.gen
         try:
-            _run_check()
+            _run_check(t)
         except Exception as e:      # the thread ends; the next read starts another
-            log(f"vpn: the tunnel's check failed ({type(e).__name__})")
-        with _check_lock:
-            if gen == _check_gen:
-                _check_background = False
+            log(f"vpn: exit {t.name}: the tunnel's check failed ({type(e).__name__})")
+        with t.lock:
+            if gen == t.gen:
+                t.background = False
                 return
         # The gateway was set up again while it ran: check the new tunnel.
 
 
-def start_check() -> None:
-    """Start a check of the tunnel in the background, unless one is out."""
-    global _check_background
-    with _check_lock:
-        if _check_background:
+def start_check(t: Tunnel) -> None:
+    """Start a check of an exit's tunnel in the background, unless one is out."""
+    with t.lock:
+        if t.background:
             return
-        _check_background = True
-    threading.Thread(target=_background_check, daemon=True).start()
+        t.background = True
+    threading.Thread(target=_background_check, args=(t,), daemon=True).start()
 
 
-def vpn_status() -> dict:
-    """The tunnel as the operator's page reads it, at once (never awaiting a
-    handshake): {tunnel: up | down | off | checking, handshake_s, error,
-    checking}. off when no configuration was delivered or the gateway does
+def exit_status(name: str) -> dict:
+    """One exit's tunnel as the operator's page reads it, at once (never
+    awaiting a handshake): {tunnel: up | down | off | checking, handshake_s,
+    error, checking}. off when the exit was not delivered or its gateway does
     not run; up when its handshake is younger than VPN_SESSION_MAX_AGE_S;
     else the last finished check's result (checking: no check has finished
-    since the configuration was last applied), and a check starts in the
+    since its configuration was last applied), and a check starts in the
     background unless one runs or the last one found the tunnel down less
     than VPN_SESSION_MAX_AGE_S ago (a result is trusted as long as a
     handshake would be). `checking` (the field): a check runs now."""
-    _cfg, off, peek = _vpn_look()
+    _cfg, off, peek = _vpn_look(name)
     if off is not None:
         return off
-    with _check_lock:
-        busy = _checks_running > 0 or _check_background
+    with _vpn_lock:
+        t = TUNNELS.get(name)
+    if t is None:
+        return {"tunnel": "off", "handshake_s": None, "error": "the exit's VPN gateway is not "
+                "set up", "checking": False}
+    with t.lock:
+        busy = t.running > 0 or t.background
         if peek is not None:
             return {"tunnel": "up", "handshake_s": peek, "error": None, "checking": busy}
-        last = None if _check_result is None else dict(_check_result)
+        last = None if t.result is None else dict(t.result)
         trusted = (last is not None and last["tunnel"] == "down"
-                   and time.monotonic() - _check_at < VPN_SESSION_MAX_AGE_S)
+                   and time.monotonic() - t.at < VPN_SESSION_MAX_AGE_S)
     if not busy and not trusted:
-        start_check()
+        start_check(t)
         busy = True
     if last is None:
         return {"tunnel": "checking", "handshake_s": None, "error": None, "checking": busy}
     return dict(last, checking=busy)
 
 
-def vpn_wait_up() -> dict:
-    """The tunnel as a VPN search's start needs it: a fresh handshake as it
-    is, else a check (renewed and awaited up to VPN_HANDSHAKE_WAIT_S), whose
-    result is recorded as the last finished one. {tunnel, handshake_s,
+def vpn_status() -> dict:
+    """Every delivered exit's tunnel, in order: {"exits": [{name, tunnel,
+    handshake_s, error, checking}, …]} (exit_status each, at once)."""
+    return {"exits": [dict(exit_status(n), name=n) for n in exit_names()]}
+
+
+def vpn_wait_up(name: str) -> dict:
+    """One exit's tunnel as a VPN search's start needs it: a fresh handshake
+    as it is, else a check (renewed and awaited up to VPN_HANDSHAKE_WAIT_S),
+    whose result is recorded as the last finished one. {tunnel, handshake_s,
     error}."""
-    _cfg, off, peek = _vpn_look()
+    _cfg, off, peek = _vpn_look(name)
     if off is not None:
         return off
     if peek is not None:
         return {"tunnel": "up", "handshake_s": peek, "error": None}
-    return _run_check()
+    with _vpn_lock:
+        t = TUNNELS.get(name)
+    if t is None:
+        return {"tunnel": "down", "handshake_s": None,
+                "error": "the exit's VPN gateway is not set up"}
+    return _run_check(t)
 
 
 # --- the agent's output, followed live -----------------------------------------------
@@ -1077,27 +1272,38 @@ def usage_tokens(usage) -> int:
                                                 "cache_read_input_tokens"))
 
 
-def _browser_call(name, args) -> tuple[str, str, str] | None:
-    """(tier, tool, target) of a tool_use of a browser tier, or None. The
-    target is the call's URL argument when it has one, else a short text of
-    its arguments."""
-    if not isinstance(name, str):
+# A normal search's browser tiers' tool servers: {server name: (tier, exit)}.
+BROWSER_SERVERS = {t: (t, None) for t in TIER_NAMES}
+
+
+def server_name(tier: str, lane: int | None) -> str:
+    """A tier's tool server as the agent's tool list names it: the tier, and
+    in a VPN search the tier and the exit's position in the search
+    (`plain-<n>`, `browser-<n>`, `stealth-<n>`; LANE_LABEL)."""
+    return tier if lane is None else f"{tier}-{lane}"
+
+
+def _browser_call(name, args, servers: dict) -> tuple[str, str | None, str, str] | None:
+    """(tier, exit, tool, target) of a tool_use of a browser tier's server
+    (`servers`: {server name: (tier, exit)}), or None. The target is the
+    call's URL argument when it has one, else a short text of its
+    arguments."""
+    if not isinstance(name, str) or not name.startswith("mcp__"):
         return None
-    for tier in TIER_NAMES:
-        prefix = f"mcp__{tier}__"
-        if name.startswith(prefix):
-            args = args if isinstance(args, dict) else {}
-            url = args.get("url")
-            if isinstance(url, str):
-                target = url
-            else:
-                try:
-                    target = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
-                except (ValueError, TypeError, RecursionError):
-                    target = ""
-            return (tier, name[len(prefix):][:TRACE_NAME_MAX_CHARS],
-                    target[:TRACE_TARGET_MAX_CHARS])
-    return None
+    server, sep, tool = name[len("mcp__"):].partition("__")
+    if not sep or server not in servers:
+        return None
+    tier, exit_name = servers[server]
+    args = args if isinstance(args, dict) else {}
+    url = args.get("url")
+    if isinstance(url, str):
+        target = url
+    else:
+        try:
+            target = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+        except (ValueError, TypeError, RecursionError):
+            target = ""
+    return (tier, exit_name, tool[:TRACE_NAME_MAX_CHARS], target[:TRACE_TARGET_MAX_CHARS])
 
 
 def _result_first_line(content) -> str:
@@ -1122,35 +1328,51 @@ class AgentStream:
     read (bounded: the newest VIEW_TAIL_ENTRIES, all the view shows).
 
     It also records the browser tiers' tool calls, which no RS code of the
-    plain tier's kind traces: each `tool_use` of a `browser`/`stealth` server
-    in an assistant event, completed by its `tool_result`'s error flag in a
-    later user event, as a work entry of the trace's shape (kept up to
-    BROWSER_CALLS_MAX; every call counted per tier, tool and outcome)."""
+    plain tier's kind traces: each `tool_use` of a browser tier's server
+    (`servers`; in a VPN search one per tier and exit, and the entry names the
+    exit) in an assistant event, completed by its `tool_result`'s error flag
+    in a later user event, as a work entry of the trace's shape (kept up to
+    BROWSER_CALLS_MAX; every call counted per tier, tool and outcome).
+    `exits`: a VPN search's exits it ran on, in order (set at its start)."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        self.servers: dict = dict(BROWSER_SERVERS)
+        self.exits: tuple = ()
         self.per_message: dict[str, int] = {}
         self.final: int | None = None
         self.texts: collections.deque = collections.deque(maxlen=VIEW_TAIL_ENTRIES)
         self.dropped = 0
-        self.pending: dict[str, tuple[str, str, str]] = {}
+        self.pending: dict[str, tuple[str, str | None, str, str]] = {}
         self.seen: set = set()
         self.calls: list[dict] = []
         self.calls_dropped = 0
         self.counts: dict = {}
 
+    def set_exits(self, servers: dict, exits: list) -> None:
+        """A VPN search's start: its browser tiers' servers and its exits."""
+        with self.lock:
+            self.servers = dict(servers)
+            self.exits = tuple(exits)
+
+    def exit_names(self) -> tuple:
+        with self.lock:
+            return self.exits
+
     def _complete(self, uid: str, error: bool, detail: str, now: float) -> None:
         """Under the lock: a pending call's result arrived (or never will)."""
-        tier, tool, target = self.pending.pop(uid)
+        tier, exit_name, tool, target = self.pending.pop(uid)
         outcome = "error" if error else "ok"
         t = self.counts.setdefault(tier, {}).setdefault(tool, {})
         t[outcome] = t.get(outcome, 0) + 1
         if len(self.calls) >= BROWSER_CALLS_MAX:
             self.calls_dropped += 1
             return
-        self.calls.append({"ts": now, "kind": "tool", "tool": tool, "tier": tier,
-                           "target": target, "outcome": outcome,
-                           "detail": detail if error else ""})
+        call = {"ts": now, "kind": "tool", "tool": tool, "tier": tier, "target": target,
+                "outcome": outcome, "detail": detail if error else ""}
+        if exit_name is not None:
+            call["exit"] = exit_name
+        self.calls.append(call)
 
     def work_calls(self) -> tuple[list[dict], bool]:
         with self.lock:
@@ -1173,8 +1395,8 @@ class AgentStream:
                     t = tried["tiers"].setdefault(tier, {}).setdefault(tool, {})
                     for k, n in outcomes.items():
                         t[k] = t.get(k, 0) + n
-            tried["failures"] += [{k: c[k] for k in ("tier", "tool", "target", "outcome",
-                                                     "detail")}
+            tried["failures"] += [{k: c[k] for k in ("tier", "exit", "tool", "target",
+                                                     "outcome", "detail") if k in c}
                                   for c in self.calls if c["outcome"] != "ok"]
 
     def feed_oversized(self, head: bytes) -> None:
@@ -1205,7 +1427,7 @@ class AgentStream:
             if not (isinstance(b, dict) and b.get("type") == "tool_use"
                     and isinstance(b.get("id"), str) and b["id"] not in self.seen):
                 continue
-            call = _browser_call(b.get("name"), b.get("input"))
+            call = _browser_call(b.get("name"), b.get("input"), self.servers)
             if call is None or len(self.pending) >= BROWSER_CALLS_MAX:
                 continue
             self.seen.add(b["id"])
@@ -1393,6 +1615,7 @@ class Searches:
             "question": question, "prompt": prompt, "conversation": conversation,
             "searcher": s["name"], "model": s["model"], "effort": s["effort"],
             "tiers": dict(s["tiers"]), "vpn": vpn, "contact": settings["contact"],
+            "exits_per_site": settings["exits_per_site"],
             "state": "queued", "submitted_at": time.time(),
             "started_at": None, "finished_at": None, "outcome": None,
             "stream": AgentStream(), "stop": False}
@@ -1519,7 +1742,8 @@ class Searches:
                     row.update(summary=_as_text(rep.get("summary")),
                                sources=rep.get("sources"), tiers=rep.get("tiers"))
             elif rec is not None:
-                tools = self._trace_tools(a["id"]) if rec["state"] != "queued" else []
+                tools = (self._trace_tools(a["id"], rec["stream"].exit_names())
+                         if rec["state"] != "queued" else [])
                 v = self._build_view(rec, tools)
                 row.update(state=v["state"], waited_s=v["waited_s"], ran_s=v["ran_s"],
                            tokens=v["tokens"], reason=v["reason"], work=v["work"])
@@ -1827,7 +2051,8 @@ class Searches:
                         return dict(e["view"])
                 a = self._find_ask(sid)
                 return dict(a["view"]) if a is not None else None
-        tools = self._trace_tools(sid) if rec["state"] != "queued" else []
+        tools = (self._trace_tools(sid, rec["stream"].exit_names())
+                 if rec["state"] != "queued" else [])
         return self._build_view(rec, tools)
 
     def report(self, sid: str) -> dict | None:
@@ -1869,12 +2094,13 @@ class Searches:
         return {**out, "has_report": True, **json.loads(raw)}
 
     @staticmethod
-    def _trace_tools(sid: str) -> list[dict]:
+    def _trace_tools(sid: str, exits) -> list[dict]:
         """Outside the lock: the tool calls of a search's trace (none when it
-        has no volume)."""
+        has no volume); `exits`: a VPN search's exits, which its entries may
+        name."""
         root = volume_root(SEARCH_PREFIX + sid)
         return _trace_work(read_volume_file(root, OUT_DIR, TRACE_NAME, TRACE_MAX_BYTES)
-                           if root else None)
+                           if root else None, exits)
 
     def _build_view(self, rec: dict, tools: list[dict]) -> dict:
         """One search's view from its record and its trace's tool calls: the
@@ -1981,7 +2207,9 @@ class Searches:
         # The trace is read before the search counts as ended: its container
         # is gone, so the trace is final, and no collect can remove the
         # volume yet.
-        tools = self._trace_tools(sid)
+        with self.lock:
+            stream = self.table[sid]["stream"] if sid in self.table else None
+        tools = self._trace_tools(sid, stream.exit_names() if stream else ())
         ask = False
         with self.lock:
             rec = self.table.get(sid)
@@ -2154,8 +2382,10 @@ def _read_conversations() -> tuple[list, str | None]:
     return convs, None
 
 
-def sidecar_name(sid: str, tier: str) -> str:
-    return f"{SEARCH_PREFIX}{sid}-{tier}"
+def sidecar_name(sid: str, tier: str, lane: int | None = None) -> str:
+    """A search's sidecar of one tier (in a VPN search, of one tier and the
+    exit's position in the search)."""
+    return f"{SEARCH_PREFIX}{sid}-{tier}" + (f"-{lane}" if lane is not None else "")
 
 
 def searxng_net_name(sid: str) -> str:
@@ -2166,13 +2396,18 @@ def out_net_name(sid: str) -> str:
     return f"{SEARCH_PREFIX}{sid}{OUT_NET_SUFFIX}"
 
 
+def exit_net_name(sid: str, lane: int) -> str:
+    return f"{SEARCH_PREFIX}{sid}{EXIT_NET_INFIX}{lane}"
+
+
 def route_helper_name(sid: str) -> str:
     return f"{SEARCH_PREFIX}{sid}{ROUTE_SUFFIX}"
 
 
 # The containers of the service's own that a search's networks may hold
-# besides the search's: they are disconnected before a network is removed.
-_NETWORK_PEERS = (SEARXNG_CONTAINER, SEARXNG_VPN_CONTAINER, VPN_CONTAINER)
+# besides the search's (and every exit's gateway, is_gateway): they are
+# disconnected before a network is removed.
+_NETWORK_PEERS = (SEARXNG_CONTAINER, SEARXNG_VPN_CONTAINER)
 
 
 def network_members(net: str) -> list[str] | None:
@@ -2180,25 +2415,48 @@ def network_members(net: str) -> list[str] | None:
     return r.stdout.decode("utf-8", "replace").split() if r.returncode == 0 else None
 
 
+def _search_exit_things(sid: str) -> tuple[list[str], list[str]]:
+    """A VPN search's per-exit containers and networks there are (found by
+    its ID_LABEL and LANE_LABEL), each only when it is named as that
+    position's: (containers, networks)."""
+    found: tuple[list[str], list[str]] = ([], [])
+    for kind, fmt, out in (("ps", "{{.Names}}", found[0]), ("network", "{{.Name}}", found[1])):
+        args = (["ps", "-a"] if kind == "ps" else ["network", "ls"]) + [
+            "--filter", f"label={ID_LABEL}={sid}", "--filter", f"label={LANE_LABEL}",
+            "--format", fmt + " {{.Label \"" + LANE_LABEL + "\"}}"]
+        r = docker(*args)
+        for line in r.stdout.decode("utf-8", "replace").splitlines():
+            n, _, lane = line.strip().partition(" ")
+            if not LANE_RE.match(lane):
+                continue
+            names = ({sidecar_name(sid, t, int(lane)) for t in (*TIER_NAMES, PLAIN_TIER)}
+                     if kind == "ps" else {exit_net_name(sid, int(lane))})
+            if n in names:
+                out.append(n)
+    return found
+
+
 def remove_search(sid: str) -> list[str]:
-    """Remove one search's containers (its agent, its sidecars and a route
-    helper a crash left), networks (its own, the one it shares with a
-    SearXNG, and a VPN search's agent's own way out; the service's SearXNGs
-    and VPN gateway are disconnected first) and volume, each by its name.
-    Idempotent; returns what could not be removed."""
+    """Remove one search's containers (its agent, its sidecars — a VPN
+    search's per exit — and a route helper a crash left), networks (its own,
+    the one it shares with a SearXNG, a VPN search's network of each exit and
+    its agent's own way out; the service's SearXNGs and the exits' gateways
+    are disconnected first) and volume, each by its name. Idempotent; returns
+    what could not be removed."""
     name = SEARCH_PREFIX + sid
     problems = []
+    exit_containers, exit_nets = _search_exit_things(sid)
     for cname in (name, *(sidecar_name(sid, t) for t in (*TIER_NAMES, PLAIN_TIER)),
-                  route_helper_name(sid)):
+                  *exit_containers, route_helper_name(sid)):
         if container_state(cname)[0] != "absent":
             r = docker("rm", "-f", cname)
             if r.returncode != 0:
                 problems.append(f"container {cname}: {first_line(r)}")
-    for net in (name, searxng_net_name(sid), out_net_name(sid)):
+    for net in (name, searxng_net_name(sid), out_net_name(sid), *exit_nets):
         members = network_members(net)
         if members is not None:
-            for peer in _NETWORK_PEERS:
-                if peer in members:
+            for peer in members:
+                if peer in _NETWORK_PEERS or is_gateway(peer):
                     docker("network", "disconnect", "-f", net, peer)
             r = docker("network", "rm", net)
             if r.returncode != 0:
@@ -2208,6 +2466,14 @@ def remove_search(sid: str) -> list[str]:
         if r.returncode != 0:
             problems.append(f"volume {name}: {first_line(r)}")
     return problems
+
+
+# What follows a search's id in the name of one of its things: a sidecar
+# (-<tier>, a VPN search's -<tier>-<n>), the SearXNG network (-sx), a VPN
+# search's agent's network (-out) or network of one exit (-x-<n>), or a
+# route helper.
+_THING_TAIL_RE = re.compile(r"^(?:-(?:browser|stealth|plain)(?:-[1-9][0-9]*)?|-sx|-out|-route"
+                            r"|-x-[1-9][0-9]*)?$")
 
 
 def remove_leftovers() -> None:
@@ -2220,15 +2486,9 @@ def remove_leftovers() -> None:
             "--filter", f"label={ID_LABEL}", "--format", fmt]
         r = docker(*args)
         for n in r.stdout.decode("utf-8", "replace").split():
-            sid = n[len(SEARCH_PREFIX):] if n.startswith(SEARCH_PREFIX) else ""
-            # a sidecar (<id>-<tier>), the SearXNG network (<id>-sx), a VPN
-            # search's agent's network (<id>-out) or a route helper
-            for suffix in (*(f"-{t}" for t in (*TIER_NAMES, PLAIN_TIER)), SEARXNG_NET_SUFFIX,
-                           OUT_NET_SUFFIX, ROUTE_SUFFIX):
-                if sid.endswith(suffix):
-                    sid = sid[:-len(suffix)]
-                    break
-            if ID_RE.match(sid):
+            rest = n[len(SEARCH_PREFIX):] if n.startswith(SEARCH_PREFIX) else ""
+            sid, tail = rest[:16], rest[16:]
+            if ID_RE.match(sid) and _THING_TAIL_RE.match(tail):
                 found.add(sid)
             else:
                 log(f"leftover {n} carries the search label but is not named as one "
@@ -2273,7 +2533,14 @@ def _agent_end(name: str) -> dict:
     return out
 
 
-def _trace_summary(raw: bytes | None) -> dict:
+def _trace_exit(ev: dict, exits) -> dict:
+    """{"exit": …} when a trace line names one of the search's exits (a VPN
+    search's plain-tier sidecar writes its exit), else {}."""
+    e = ev.get("exit")
+    return {"exit": e} if isinstance(e, str) and e in exits else {}
+
+
+def _trace_summary(raw: bytes | None, exits=()) -> dict:
     """What was tried, from the plain tier's trace (one line per tool call,
     written by RS's code, not by the model): per tier and tool the calls and
     their outcomes, the failures with their tiers and targets, and every
@@ -2295,7 +2562,7 @@ def _trace_summary(raw: bytes | None) -> dict:
         t = tiers.setdefault(tier, {}).setdefault(tool, {})
         t[outcome] = t.get(outcome, 0) + 1
         if outcome not in ("ok", "empty"):
-            failures.append({"tier": tier, "tool": tool,
+            failures.append({"tier": tier, **_trace_exit(ev, exits), "tool": tool,
                              "target": str(ev.get("target", ""))[:TRACE_TARGET_MAX_CHARS],
                              "outcome": outcome,
                              "detail": str(ev.get("detail", ""))[:TRACE_TARGET_MAX_CHARS]})
@@ -2309,9 +2576,10 @@ def _trace_summary(raw: bytes | None) -> dict:
     return {"tiers": tiers, "failures": failures, "searxng_unresponsive": unresponsive}
 
 
-def _trace_work(raw: bytes | None) -> list[dict]:
+def _trace_work(raw: bytes | None, exits=()) -> list[dict]:
     """The tool calls of a trace as the operator's view lists them: each with
-    its time and every field a string, capped as _trace_summary caps them. A
+    its time and every field a string, capped as _trace_summary caps them,
+    and the exit when the line names one of `exits` (a VPN search's). A
     line without a usable time is not listed (RS's tool server always writes
     one; the agent can write the file, so its contents are untrusted)."""
     out = []
@@ -2328,6 +2596,7 @@ def _trace_work(raw: bytes | None) -> list[dict]:
         out.append({"ts": ts, "kind": "tool",
                     "tool": str(ev.get("tool", "?"))[:TRACE_NAME_MAX_CHARS],
                     "tier": str(ev.get("tier", "?"))[:TRACE_NAME_MAX_CHARS],
+                    **_trace_exit(ev, exits),
                     "target": str(ev.get("target", ""))[:TRACE_TARGET_MAX_CHARS],
                     "outcome": str(ev.get("outcome", "?"))[:TRACE_NAME_MAX_CHARS],
                     "detail": str(ev.get("detail", ""))[:TRACE_TARGET_MAX_CHARS]})
@@ -2389,118 +2658,188 @@ def _sidecar_answers(address: str) -> bool:
     return ok
 
 
-def start_sidecars(rec: dict, name: str, labels: list[str],
-                   vpn: dict | None = None) -> tuple[dict, dict]:
-    """Start the sidecar of every browser tier the searcher has on, on the
-    search's network, hardened as the agent (no capability, no privilege
-    gain, its own user; the browsers run without their own sandbox, so the
-    container is the boundary), the volume's files folder as its output
-    folder; then wait (together, up to SIDECAR_READY_S) until each one's tool
-    server answers. Returns ({tier: the agent's URL of its tool server},
-    {tier: why it is unavailable}); a sidecar that does not come up is
-    removed and its tier left out.
+def start_sidecars(rec: dict, labels: list[str], lanes: list[dict]) -> tuple[dict, dict]:
+    """Start the sidecars of one search, hardened as the agent (no
+    capability, no privilege gain, its own user; the browsers run without
+    their own sandbox, so the container is the boundary), the volume's files
+    folder as a browser's output folder; then wait (all together, up to
+    SIDECAR_READY_S) until each one's tool server answers. Returns ({server
+    name: the agent's URL of its tool server}, {server name: why it is
+    unavailable}); a sidecar that does not come up is removed and its server
+    left out.
 
-    A VPN search (`vpn`: {"gateway": the gateway's address on the search's
-    network, "dns": the tunnel's resolvers, "env": the plain tier's
-    settings}) also has the plain tier as a sidecar (agent/tools.py over
-    HTTP, the whole search volume at /search, on the search's SearXNG network
-    too); each sidecar is created on the search's `--internal` network,
-    resolves names through the tunnel, and gets its default route through the
-    gateway from a one-shot helper before anything uses it (the plain
-    sidecar's SearXNG network takes no new connection in)."""
+    `lanes`: where the sidecars go. A normal search has one lane ({"exit":
+    None, "n": None, "net": the search's network}): a sidecar per browser
+    tier the searcher has on. A VPN search has one lane per exit whose tunnel
+    is up ({"exit": its name, "n": its position in the search, which names
+    the lane's sidecars and servers, "net": the search's network of that
+    exit, "gateway":
+    the exit's gateway's address on it, "dns": the exit's resolvers, "env":
+    the plain tier's settings, "web": whether its plain sidecar joins the
+    search's SearXNG network}): each lane also has the plain tier as a sidecar
+    (agent/tools.py over HTTP, the whole search volume at /search), every
+    sidecar of the lane is created on the lane's `--internal` network,
+    resolves names through the exit's tunnel, and gets its default route
+    through the exit's gateway from a one-shot helper before anything uses it
+    (a plain sidecar's SearXNG network takes no new connection in)."""
     up: dict = {}
     unavailable: dict = {}
-    waiting: dict = {}
-    tiers = [t for t in TIER_NAMES if rec["tiers"].get(t)]
-    if vpn is not None:
-        tiers.append(PLAIN_TIER)
-    for tier in tiers:
-        cname = sidecar_name(rec["id"], tier)
-        image = AGENT_IMAGE if tier == PLAIN_TIER else SIDECAR_IMAGES[tier]
-        if not image_present(image):
-            unavailable[tier] = (f"the {tier} sidecar's image is not staged in the search "
-                                 "service; the operator turns the service on again")
-            continue
-        common = ["--name", cname, *labels, "--label", f"{TIER_LABEL}={tier}",
-                  "--network", name, "--restart", "no",
-                  "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                  "--user", RUN_AS]
-        if tier == PLAIN_TIER:
-            mount = ["-v", f"{name}:{AGENT_VOLUME_MOUNT}",
-                     *(a for k, v in vpn["env"].items() for a in ("-e", f"{k}={v}")),
-                     "--entrypoint", PLAIN_SIDECAR_CMD[0], image, *PLAIN_SIDECAR_CMD[1:]]
-        else:
-            mount = ["--mount", f"type=volume,src={name},dst={SIDECAR_OUTPUT},"
-                                f"volume-subpath={FILES_DIR}", image]
-        if vpn is None:
-            r = docker("run", "-d", *common, *mount)
-        else:
-            dns = [a for d in vpn["dns"] for a in ("--dns", d)]
-            r = docker("create", *common, *dns, *mount)
-            if r.returncode == 0 and tier == PLAIN_TIER:
-                r = docker("network", "connect", searxng_net_name(rec["id"]), cname)
-            if r.returncode == 0:
-                r = docker("start", cname)
-            if r.returncode == 0:
-                closed = (container_ip(cname, searxng_net_name(rec["id"]))
-                          if tier == PLAIN_TIER else None)
-                problem = ("it has no address on the search's SearXNG network"
-                           if tier == PLAIN_TIER and closed is None else
-                           route_through_gateway(cname, vpn["gateway"], labels,
-                                                 route_helper_name(rec["id"]), closed))
-                if problem:
-                    unavailable[tier] = (f"the {tier} sidecar could not be routed through "
-                                         f"the VPN ({problem})")
-                    docker("rm", "-f", cname)
-                    continue
-        if r.returncode != 0:
-            unavailable[tier] = f"the {tier} sidecar could not be started ({first_line(r)})"
-            docker("rm", "-f", cname)
-            continue
-        waiting[tier] = cname
+    waiting: dict = {}          # server: (container, network)
+    sid = rec["id"]
+    for lane in lanes:
+        ex, n = lane["exit"], lane["n"]
+        tiers = [t for t in TIER_NAMES if rec["tiers"].get(t)]
+        if ex is not None:
+            tiers.insert(0, PLAIN_TIER)
+        for tier in tiers:
+            server = server_name(tier, n)
+            cname = sidecar_name(sid, tier, n)
+            image = AGENT_IMAGE if tier == PLAIN_TIER else SIDECAR_IMAGES[tier]
+            if not image_present(image):
+                unavailable[server] = (f"the {tier} sidecar's image is not staged in the "
+                                       "search service; the operator turns the service on "
+                                       "again")
+                continue
+            common = ["--name", cname, *labels, "--label", f"{TIER_LABEL}={tier}",
+                      *(["--label", f"{LANE_LABEL}={n}", "--label", f"{EXIT_LABEL}={ex}"]
+                        if ex is not None else []),
+                      "--network", lane["net"], "--restart", "no",
+                      "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                      "--user", RUN_AS]
+            if tier == PLAIN_TIER:
+                mount = ["-v", f"{SEARCH_PREFIX}{sid}:{AGENT_VOLUME_MOUNT}",
+                         *(a for k, v in lane["env"].items() for a in ("-e", f"{k}={v}")),
+                         "--entrypoint", PLAIN_SIDECAR_CMD[0], image, *PLAIN_SIDECAR_CMD[1:]]
+            else:
+                mount = ["--mount", f"type=volume,src={SEARCH_PREFIX}{sid},"
+                                    f"dst={SIDECAR_OUTPUT},volume-subpath={FILES_DIR}", image]
+            if ex is None:
+                r = docker("run", "-d", *common, *mount)
+            else:
+                dns = [a for d in lane["dns"] for a in ("--dns", d)]
+                web = tier == PLAIN_TIER and lane["web"]
+                r = docker("create", *common, *dns, *mount)
+                if r.returncode == 0 and web:
+                    r = docker("network", "connect", searxng_net_name(sid), cname)
+                if r.returncode == 0:
+                    r = docker("start", cname)
+                if r.returncode == 0:
+                    closed = container_ip(cname, searxng_net_name(sid)) if web else None
+                    problem = ("it has no address on the search's SearXNG network"
+                               if web and closed is None else
+                               route_through_gateway(cname, lane["gateway"], labels,
+                                                     route_helper_name(sid), closed))
+                    if problem:
+                        unavailable[server] = (f"the {tier} sidecar could not be routed "
+                                               f"through the exit {ex} ({problem})")
+                        docker("rm", "-f", cname)
+                        continue
+            if r.returncode != 0:
+                unavailable[server] = (f"the {tier} sidecar could not be started "
+                                       f"({first_line(r)})")
+                docker("rm", "-f", cname)
+                continue
+            waiting[server] = (cname, lane["net"])
     deadline = time.monotonic() + SIDECAR_READY_S
     addresses: dict = {}
     while waiting:
-        for tier, cname in list(waiting.items()):
+        for server, (cname, net) in list(waiting.items()):
             if container_state(cname)[0] != "running":
-                unavailable[tier] = f"the {tier} sidecar stopped as it started"
-                del waiting[tier]
+                unavailable[server] = f"the {server} sidecar stopped as it started"
+                del waiting[server]
                 continue
-            if tier not in addresses:
-                ip = container_ip(cname, name)
+            if server not in addresses:
+                ip = container_ip(cname, net)
                 if ip:
-                    addresses[tier] = ip
-            if tier in addresses and _sidecar_answers(addresses[tier]):
-                up[tier] = f"http://{cname}:{SIDECAR_PORT}{SIDECAR_PATH}"
-                del waiting[tier]
+                    addresses[server] = ip
+            if server in addresses and _sidecar_answers(addresses[server]):
+                up[server] = f"http://{cname}:{SIDECAR_PORT}{SIDECAR_PATH}"
+                del waiting[server]
         if not waiting:
             break
         if time.monotonic() >= deadline:
-            for tier in waiting:
-                unavailable[tier] = (f"the {tier} sidecar's tool server did not answer within "
-                                     f"{SIDECAR_READY_S} seconds")
+            for server in waiting:
+                unavailable[server] = (f"the {server} sidecar's tool server did not answer "
+                                       f"within {SIDECAR_READY_S} seconds")
             break
         time.sleep(SIDECAR_POLL_S)
-    for tier in unavailable:
-        if container_state(sidecar_name(rec["id"], tier))[0] != "absent":
-            docker("rm", "-f", sidecar_name(rec["id"], tier))
-    for tier, why in unavailable.items():
-        log(f"search {rec['id']}: {why}")
+    for lane in lanes:
+        for tier in (*TIER_NAMES, PLAIN_TIER):
+            if server_name(tier, lane["n"]) in unavailable:
+                cname = sidecar_name(sid, tier, lane["n"])
+                if container_state(cname)[0] != "absent":
+                    docker("rm", "-f", cname)
+    for why in unavailable.values():
+        log(f"search {sid}: {why}")
     return up, unavailable
 
 
-def agent_tools(up: dict) -> str:
+def agent_tools(up: dict, vpn: bool) -> str:
     """The agent's tool list for this search (Claude Code's --mcp-config
-    JSON): the plain tier always (over stdio in the agent's own container,
-    or over HTTP at its sidecar in a VPN search), and each browser tier
-    whose sidecar is up, over HTTP at the sidecar's name on the search's
-    network."""
-    servers: dict = {"plain": ({"type": "http", "url": up[PLAIN_TIER]} if PLAIN_TIER in up
-                               else PLAIN_SERVER)}
-    for tier in TIER_NAMES:
-        if tier in up:
-            servers[tier] = {"type": "http", "url": up[tier]}
+    JSON): each tool server that is up (`up`: {server name: its URL}), over
+    HTTP at the sidecar's name on the search's network (of that exit, in a
+    VPN search), and a normal search's plain tier over stdio in the agent's
+    own container."""
+    servers: dict = {} if vpn else {PLAIN_TIER: PLAIN_SERVER}
+    for server, url in up.items():
+        servers[server] = {"type": "http", "url": url}
     return json.dumps({"mcpServers": servers}, separators=(",", ":"))
+
+
+def exits_instructions(ran: list[dict], left_out: list[tuple[str, str]], per_site: int,
+                       web: bool) -> str:
+    """The part of a VPN search agent's instructions about its exits (the
+    agent's run.sh appends it to RS's instructions, whose tool names it has
+    renamed for the first exit): the exits it has, in order, each with its
+    tool servers (named by its position in this search); the ones left out and
+    why; and how to use them: every site starts on the first exit, a page
+    refused by the search's address is tried again through the next exit, at
+    most `per_site` exits per site (by the page's host name), and every source
+    names its exit (by its name). `ran`: [{"exit", "n", "servers"}] in order;
+    `web`: the first exit's plain server has the web search."""
+    first, first_n = ran[0]["exit"], ran[0]["n"]
+    lines = ["## The exits", "",
+             "This search reaches every site through a VPN, from one of its exits, never "
+             "from the address of the computer it runs on. Each exit has its own tool "
+             "servers with the same tools; a tool is called by the exit's server's name, "
+             "`mcp__<server>__` and the tool's own name. The tools named above are the "
+             f"first exit's (`{first}`). The exits, in their order:", ""]
+    for i, r in enumerate(ran, 1):
+        names = ", ".join(f"`{s}`" for s in r["servers"])
+        plain = server_name(PLAIN_TIER, r["n"])
+        lines.append(f"{i}. `{r['exit']}`" + (" (the first exit)" if i == 1 else "")
+                     + f": its servers {names} (as in `mcp__{plain}__fetch_page`).")
+    if left_out:
+        lines += ["", "Left out of this search: "
+                  + "; ".join(f"`{n}` ({why})" for n, why in left_out) + "."]
+    signs = ("refused because of where the request comes from (the signs under Your "
+             "report: a page or an error that names your address or your network, \"not "
+             "available in your region\", a block that names the address)")
+    if per_site == 1:
+        how = [f"- Try at most one exit on a site: a page {signs} on the first exit is not "
+               "tried again through another exit; report it as blocked."]
+    else:
+        how = [f"- When a page is {signs}, call the same tool for the same page through the "
+               "next exit in the order, on that exit's server."
+               + ("" if len(ran) > 1 else " This search has no other exit: such a page "
+                  "stays blocked."),
+               f"- Try at most {per_site} exits on one site, counted by the host name in the "
+               f"page's address (the first exit counts as one): once {per_site} exits were "
+               "refused there, stop trying that site and report it as blocked."]
+    lines += ["", "How to use them:", "",
+              f"- Start every site on the first exit (`{first}`).",
+              *how,
+              (f"- The web search runs only on the first exit (`mcp__"
+               f"{server_name(PLAIN_TIER, first_n)}__web_search`); the other exits' "
+               "`web_search` answers that it is unavailable." if web else
+               "- The web search is not available in this search (its SearXNG goes out "
+               "through the VPN's first exit, which this search does not have, or it is "
+               "not running): `web_search` answers that it is unavailable."),
+              "- Report which exit each source came from: give each source an `exit`, "
+              "the NAME of the exit whose server fetched or opened it (as listed above, "
+              "not its servers' number); and name the exit on every line of `tiers` you "
+              "tried through one."]
+    return "\n".join(lines) + "\n"
 
 
 def list_dropped_files(root: str) -> list[dict]:
@@ -2558,15 +2897,49 @@ def address_block_note(n: int, vpn_search: bool) -> str:
     another one."""
     head = f"{n} site{'s' if n != 1 else ''} refused this search by its address"
     if vpn_search:
-        return head + " (the VPN's address)"
+        return head + " (the addresses of the VPN's exits it tried)"
     if vpn_on():
         return head + (f"; the {SERVER_NAMES[True]} MCP server reaches sites from the VPN's "
                        "address, if you have it")
     return head
 
 
+def _exits_up(exits: list) -> list[tuple[dict, dict]]:
+    """Each exit with its tunnel as a VPN search's start needs it
+    (vpn_wait_up, the exits checked side by side), in order."""
+    results: dict = {}
+
+    def one(name: str) -> None:
+        try:
+            results[name] = vpn_wait_up(name)
+        except Exception as e:  # noqa: BLE001 — one exit's failure leaves it out
+            results[name] = {"tunnel": "down", "handshake_s": None,
+                             "error": f"its check failed ({type(e).__name__})"}
+    threads = [threading.Thread(target=one, args=(e["name"],), daemon=True) for e in exits]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return [(e, results[e["name"]]) for e in exits]
+
+
+def _source_exits(sources, exits) -> object:
+    """A report's sources with each one's `exit` kept only when it names one
+    of the search's exits (`exits`; none in a normal search, whose sources
+    never carry one)."""
+    if not isinstance(sources, list):
+        return sources
+    out = []
+    for src in sources:
+        if isinstance(src, dict) and "exit" in src and not (
+                isinstance(src["exit"], str) and src["exit"] in exits):
+            src = {k: v for k, v in src.items() if k != "exit"}
+        out.append(src)
+    return out
+
+
 def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
-    """Create the search's network, volume and container, follow and wait for
+    """Create the search's networks, volume and container, follow and wait for
     the agent, and read back its report. `stopped()` says whether the operator
     stopped it. Returns (state, outcome)."""
     sid = rec["id"]
@@ -2581,31 +2954,53 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
             not os.path.islink(os.path.join(CLAUDE_DIST, "local", "bin", "claude")):
         return "failed", {"reason": "the Claude download is missing on the host; the "
                                     "operator pulls it under Host → Software"}
-    vpn_cfg = None
-    if rec["vpn"]:
-        # A VPN search runs only on a tunnel that is up: never from the
-        # host's address, and nothing is made for it otherwise.
-        st = vpn_wait_up()
-        vpn_cfg = read_vpn()
-        if st["tunnel"] != "up" or vpn_cfg is None:
-            return "failed", {"reason": VPN_NOT_UP + (st["error"] or "the VPN gateway is "
-                                                                    "not running")}
-        searxng_problem = (None if container_state(SEARXNG_VPN_CONTAINER)[0] == "running"
-                           else "the VPN's SearXNG is not running")
+    vpn = bool(rec["vpn"])
+    ups: list = []              # a VPN search's exits whose tunnel is up: [cfg]
+    left_out: list = []         # the others: [(name, why)]
+    stored_first = None
+    if vpn:
+        # A VPN search runs only through exits whose tunnel is up: never from
+        # the host's address, and nothing is made for it when none is.
+        exits = read_vpn() or []
+        stored_first = exits[0]["name"] if exits else None
+        for cfg, st in _exits_up(exits):
+            if st["tunnel"] == "up":
+                ups.append(cfg)
+            else:
+                left_out.append((cfg["name"], "its tunnel was not up when the search "
+                                              "started: " + (st["error"] or "no handshake")))
+        if not ups:
+            return "failed", {"reason": VPN_NOT_UP + ("; ".join(f"{n}: {why}" for n, why
+                                                                in left_out)
+                                                      or "no exit is stored")}
+        # The VPN's SearXNG goes out through the stored first exit: the web
+        # search is there only when that exit is the search's first.
+        web = ups[0]["name"] == stored_first
+        searxng_problem = (None if web and container_state(SEARXNG_VPN_CONTAINER)[0] == "running"
+                           else "the VPN's SearXNG is not running" if web
+                           else "the VPN's first exit is not up, and the VPN's SearXNG "
+                                "goes out through it")
         searxng = SEARXNG_VPN_CONTAINER
     else:
         searxng_problem = ensure_searxng()
         searxng = SEARXNG_CONTAINER
     labels = ["--label", f"{ID_LABEL}={sid}", "--label", f"{PROJECT_LABEL}={rec['project']}"]
     sx = searxng_net_name(sid)
-    # A VPN search's own network is internal (its sidecars' only way out is
-    # the gateway the helper routes them through); its agent reaches its
-    # model provider by a network of its own.
-    nets = [(["network", "create", *(["--internal"] if vpn_cfg else []), *labels, name],
-             "network"),
-            (["network", "create", "--internal", *labels, sx], "SearXNG network")]
-    if vpn_cfg:
+    # A VPN search has one network per exit, each internal (its sidecars'
+    # only way out is the exit's gateway the helper routes them through), and
+    # its agent reaches its model provider by a network of its own; a normal
+    # search has one network, its sidecars' and its agent's.
+    if vpn:
+        # Each exit up gets its position in this search (1, 2, …), which
+        # names its network, sidecars and servers (LANE_LABEL).
+        nets = [(["network", "create", "--internal", *labels,
+                  "--label", f"{LANE_LABEL}={i}", "--label", f"{EXIT_LABEL}={cfg['name']}",
+                  exit_net_name(sid, i)],
+                 f"network of the exit {cfg['name']}") for i, cfg in enumerate(ups, 1)]
         nets.append((["network", "create", *labels, out_net_name(sid)], "agent's network"))
+    else:
+        nets = [(["network", "create", *labels, name], "network")]
+    nets.append((["network", "create", "--internal", *labels, sx], "SearXNG network"))
     for args, what in ((["volume", "create", *labels, name], "volume"), *nets):
         r = docker(*args)
         if r.returncode != 0:
@@ -2618,44 +3013,88 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
         r = docker("network", "connect", "--alias", SEARXNG_ALIAS, sx, searxng)
         if r.returncode != 0:
             searxng_problem = f"SearXNG could not join the search's network ({first_line(r)})"
-    vpn = None
-    if vpn_cfg:
-        r = docker("network", "connect", name, VPN_CONTAINER)
-        gw = container_ip(VPN_CONTAINER, name) if r.returncode == 0 else None
-        if gw is None:
-            return "failed", {"reason": VPN_NOT_UP + "the VPN gateway could not join the "
-                                                     f"search's network ({first_line(r)})"}
-        vpn = {"gateway": gw, "dns": vpn_cfg["dns"],
-               "env": {"RS_SEARCH_CONTACT": rec["contact"],
-                       "RS_SEARCH_SEARXNG": "" if searxng_problem else "on"}}
+    lanes = []
+    if vpn:
+        for i, cfg in enumerate(ups, 1):
+            net = exit_net_name(sid, i)
+            r = docker("network", "connect", net, gateway_name(cfg["name"]))
+            gw = container_ip(gateway_name(cfg["name"]), net) if r.returncode == 0 else None
+            if gw is None:
+                left_out.append((cfg["name"], "its gateway could not join the search's "
+                                              f"network ({first_line(r)})"))
+                continue
+            web_lane = i == 1 and searxng_problem is None
+            lanes.append({"exit": cfg["name"], "n": i, "net": net, "gateway": gw, "dns": cfg["dns"],
+                          "web": web_lane,
+                          "env": {"RS_SEARCH_CONTACT": rec["contact"],
+                                  "RS_SEARCH_SEARXNG": "on" if web_lane else "",
+                                  "RS_SEARCH_EXIT": cfg["name"]}})
+        if not lanes:
+            return "failed", {"reason": VPN_NOT_UP + "; ".join(f"{n}: {why}"
+                                                               for n, why in left_out)}
+    else:
+        lanes.append({"exit": None, "n": None, "net": name})
     if stopped():
         return "failed", {"reason": STOPPED_NO_REPORT}
     # The sidecars, before the agent (its tool servers have to answer when
     # its session starts).
-    up, unavailable = start_sidecars(rec, name, labels, vpn)
+    up, unavailable = start_sidecars(rec, labels, lanes)
+    # A VPN search's exits it runs on, in order: [{"exit", "n", "servers"}].
+    ran: list = []
+    if vpn:
+        for lane in lanes:
+            ex, n = lane["exit"], lane["n"]
+            tiers = [t for t in (PLAIN_TIER, *TIER_NAMES) if server_name(t, n) in up]
+            if PLAIN_TIER not in tiers:
+                # An exit without its plain tier has no way to fetch or report.
+                for t in tiers:
+                    docker("rm", "-f", sidecar_name(sid, t, n))
+                    del up[server_name(t, n)]
+                left_out.append((ex, "its plain tier did not come up ("
+                                 + unavailable.get(server_name(PLAIN_TIER, n),
+                                                   "it did not answer") + ")"))
+                continue
+            ran.append({"exit": ex, "n": n, "servers": [server_name(t, n) for t in tiers]})
+        # Which exit each server is: the view's calls and the report's
+        # sources name the exit, never its position.
+        rec["stream"].set_exits({server_name(t, r["n"]): (t, r["exit"])
+                                 for r in ran for t in TIER_NAMES},
+                                [r["exit"] for r in ran])
 
     def drop_sidecars() -> None:
-        for tier in up:
-            docker("rm", "-f", sidecar_name(sid, tier))
-    if vpn is not None and PLAIN_TIER not in up:
+        for lane in lanes:
+            for tier in (PLAIN_TIER, *TIER_NAMES):
+                if server_name(tier, lane["n"]) in up:
+                    docker("rm", "-f", sidecar_name(sid, tier, lane["n"]))
+    if vpn and not ran:
         drop_sidecars()
-        return "failed", {"reason": "the plain tier could not run on the VPN's route ("
-                                    + unavailable.get(PLAIN_TIER, "it did not come up") + ")"}
+        return "failed", {"reason": "the plain tier could not run on any VPN exit's route ("
+                                    + "; ".join(f"{n}: {why}" for n, why in left_out) + ")"}
+    first_n = ran[0]["n"] if vpn else None
+    tiers_up = [t for t in TIER_NAMES if server_name(t, first_n) in up]
+    env_vpn = []
+    if vpn:
+        note = exits_instructions(ran, left_out, rec["exits_per_site"],
+                                  web=ran[0]["exit"] == stored_first and searxng_problem is None)
+        env_vpn = ["-e", f"RS_SEARCH_SERVER_SUFFIX=-{first_n}", "-e",
+                   f"RS_SEARCH_EXITS_NOTE={note}"]
     # No capability at all, no privilege gain, the agent's own user; its
     # networks reach the internet and its own sidecars (the search's network,
     # its default route) and SearXNG (the internal one, which has no route
     # out), nothing else (the service's guard drops everything from an inner
     # network toward the service and toward any private address). Created,
     # joined to the SearXNG network, then started, so SearXNG answers from its
-    # first call. A VPN search's agent is on its search's internal network
-    # (its sidecars) and its own network instead of SearXNG's: its default
+    # first call. A VPN search's agent is on its exits' internal networks
+    # (their sidecars) and its own network instead of SearXNG's: its default
     # route, to its model provider. The token reaches it through an env file read by the docker
     # client here, never on this command line.
     if stopped():
         drop_sidecars()
         return "failed", {"reason": STOPPED_NO_REPORT}
+    agent_nets = ([exit_net_name(sid, r["n"]) for r in ran] + [out_net_name(sid)] if vpn
+                  else [name, sx])
     r = docker("create", "--name", name, *labels,
-               "--network", name, "--restart", "no",
+               "--network", agent_nets[0], "--restart", "no",
                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                "--user", RUN_AS,
                "--env-file", TOKEN_PATH,
@@ -2665,17 +3104,19 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
                "-e", f"RS_SEARCH_CONTACT={rec['contact']}",
                "-e", f"RS_SEARCH_SEARXNG={'' if searxng_problem else 'on'}",
                "-e", f"RS_SEARCH_QUESTION={rec['prompt']}",
-               "-e", f"RS_SEARCH_MCP_CONFIG={agent_tools(up)}",
-               "-e", f"RS_SEARCH_TIERS={' '.join(t for t in TIER_NAMES if t in up)}",
+               "-e", f"RS_SEARCH_MCP_CONFIG={agent_tools(up, vpn)}",
+               "-e", f"RS_SEARCH_TIERS={' '.join(tiers_up)}",
+               *env_vpn,
                "-v", f"{name}:{AGENT_VOLUME_MOUNT}",
                "-v", f"{CLAUDE_DIST}:/opt/claude:ro",
                AGENT_IMAGE)
-    if r.returncode == 0:
-        # A normal search's agent calls SearXNG itself; a VPN search's agent
-        # only reaches its sidecars and, by its own network, its model.
-        r = docker("network", "connect", out_net_name(sid) if vpn else sx, name)
+    # A normal search's agent calls SearXNG itself; a VPN search's agent
+    # only reaches its sidecars and, by its own network, its model.
+    for net in agent_nets[1:]:
         if r.returncode == 0:
-            r = docker("start", name)
+            r = docker("network", "connect", net, name)
+    if r.returncode == 0:
+        r = docker("start", name)
     if r.returncode != 0:
         drop_sidecars()
         docker("rm", "-f", name)
@@ -2706,13 +3147,18 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
         agent["exit_code"] = exit_code
     root = volume_root(name)
     report_raw = read_volume_file(root, OUT_DIR, REPORT_NAME, REPORT_MAX_BYTES) if root else None
+    exits_ran = [r["exit"] for r in ran]
     tried = _trace_summary(read_volume_file(root, OUT_DIR, TRACE_NAME, TRACE_MAX_BYTES)
-                           if root else None)
+                           if root else None, exits_ran)
     if searxng_problem:
         tried["searxng"] = searxng_problem
     rec["stream"].tried_into(tried)
     if unavailable:
         tried["unavailable"] = unavailable
+    if vpn:
+        tried["exits"] = exits_ran
+        if left_out:
+            tried["exits_left_out"] = {n: why for n, why in left_out}
     report = None
     if report_raw is not None:
         try:
@@ -2725,7 +3171,7 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
         outcome["dropped_files"] = dropped
     if isinstance(report, dict):
         outcome["summary"] = report.get("summary", "")
-        outcome["sources"] = report.get("sources", [])
+        outcome["sources"] = _source_exits(report.get("sources", []), exits_ran)
         outcome["tiers"] = report.get("tiers", [])
         if was_stopped:
             outcome["reason"] = STOPPED_WITH_REPORT
@@ -2867,8 +3313,10 @@ def tools_listed(vpn: bool) -> list[dict]:
     VPN's address; on search's, while the VPN version is on, that the
     search-vpn server does."""
     if vpn:
-        extra = (" This server's searches reach every site from the VPN's address, not "
-                 "this installation's; its tools see only the searches asked through it.")
+        extra = (" This server's searches reach every site from the VPN's exits' addresses "
+                 "(the first exit first, the next one for a page refused by its address), "
+                 "never this installation's; its tools see only the searches asked through "
+                 "it.")
     elif vpn_on():
         extra = (f" The {SERVER_NAMES[True]} MCP server, if you have it, runs the same "
                  "searches reaching every site from the VPN's address instead of this "
@@ -3110,7 +3558,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/vpn" and not post:
             return self._json(200, vpn_status())
         if path == "/admin/vpn/apply" and post:
-            ensure_vpn()                # the gateway set up again; a check starts
+            ensure_vpn()                # the gateways in line; checks start
+            return self._json(200, vpn_status())
+        if path.startswith("/admin/vpn/apply/") and post:
+            name = path[len("/admin/vpn/apply/"):]
+            if not EXIT_NAME_RE.match(name):
+                return self._json(404, {"error": "not found"})
+            ensure_vpn(renew=name)      # that exit set up again; a check of it starts
             return self._json(200, vpn_status())
         if path == "/admin/clear" and post:
             return self._json(200, SEARCHES.clear_ended())
@@ -3217,6 +3671,7 @@ ADMIN_REFUSED_EXIT = 3
 # stdin as the body.
 _ADMIN_ROUTES = {"status": ("status", True), "ensure": ("ensure", False),
                  "vpn": ("vpn", True), "vpn-apply": ("vpn/apply", False),
+                 "vpn-renew": ("vpn/apply", False),
                  "clear": ("clear", False), "list": ("list", True), "test": ("test", False),
                  "view": ("view", True), "report": ("report", True), "stop": ("stop", False),
                  "ask": ("ask", False), "conversations": ("conversations", True),
@@ -3229,8 +3684,11 @@ _ADMIN_ID_SUFFIX = {"conversation-delete": "/delete"}
 
 
 def admin(what: str, sid: str | None = None) -> int:
-    if what not in _ADMIN_ROUTES or (what in _ADMIN_WITH_ID) != (sid is not None) \
-            or (sid is not None and not ID_RE.match(sid)):
+    # `vpn-renew` takes an exit's name where the others take a search's id.
+    takes = _ADMIN_WITH_ID + ("vpn-renew",)
+    if what not in _ADMIN_ROUTES or (what in takes) != (sid is not None) \
+            or (sid is not None and not (EXIT_NAME_RE if what == "vpn-renew"
+                                         else ID_RE).match(sid)):
         sys.stderr.write("unknown admin request\n")
         return 2
     route, get = _ADMIN_ROUTES[what]
@@ -3273,7 +3731,7 @@ def main(argv: list) -> int:
         return admin(*argv[1:])
     sys.stderr.write("usage: service.py serve | put NAME | drop NAME | admin "
                      "status|ensure|vpn|vpn-apply|clear|list|test|conversations|"
-                     "conversations-clear | "
+                     "conversations-clear | admin vpn-renew EXIT | "
                      "admin ask (the body on stdin) | "
                      "admin view|report|stop|conversation|conversation-delete ID\n")
     return 2

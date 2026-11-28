@@ -660,14 +660,15 @@ def _verb_search_settings_set(args: dict, _progress=None) -> dict:
 
 
 def _verb_search_vpn(_args: dict, _progress=None) -> dict:
-    """The VPN: the stored configuration's public parts and the tunnel's
+    """The VPN's exits, in order: each one's public parts and its tunnel's
     state (never a key)."""
     return rscore.search_vpn(rscore._mcp_deadline())
 
 
 def _verb_search_vpn_set(args: dict, _progress=None) -> dict:
-    """Store the VPN configuration (field `config`, the provider's file, or
-    `manual`, its fields) and bring the service's tunnel up with it."""
+    """Store one exit (`name`, and `config`, the provider's file, or
+    `manual`, its fields): a new name is added last, a stored one replaced
+    where it is; its gateway's tunnel comes up with it."""
     deadline = rscore._mcp_deadline()
     _search_not_turning_on()
     safe = {k: v for k, v in args.items() if k in SEARCH_VPN_WEBUI_FIELDS}
@@ -675,11 +676,23 @@ def _verb_search_vpn_set(args: dict, _progress=None) -> dict:
     return rscore.search_vpn_set(req, blocking=False, deadline=deadline)
 
 
-def _verb_search_vpn_clear(_args: dict, _progress=None) -> dict:
-    """Remove the VPN configuration (and the `search-vpn` server with it)."""
+def _verb_search_vpn_clear(args: dict, _progress=None) -> dict:
+    """Remove one exit by `name` (the last one takes the `search-vpn` server
+    with it)."""
     deadline = rscore._mcp_deadline()
     _search_not_turning_on()
-    return rscore.search_vpn_clear(blocking=False, deadline=deadline)
+    safe = {k: v for k, v in args.items() if k in SEARCH_VPN_NAME_WEBUI_FIELDS}
+    req = rscore.SearchVpnNameRequest.from_kwargs(**safe)
+    return rscore.search_vpn_clear(req, blocking=False, deadline=deadline)
+
+
+def _verb_search_vpn_order(args: dict, _progress=None) -> dict:
+    """Put the stored exits in a new order (`names`, every stored one once)."""
+    deadline = rscore._mcp_deadline()
+    _search_not_turning_on()
+    safe = {k: v for k, v in args.items() if k in SEARCH_VPN_ORDER_WEBUI_FIELDS}
+    req = rscore.SearchVpnOrderRequest.from_kwargs(**safe)
+    return rscore.search_vpn_order(req, blocking=False, deadline=deadline)
 
 
 def _verb_search_clear(_args: dict, _progress=None) -> dict:
@@ -1637,14 +1650,21 @@ MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 # The search service's sign-in: the long-lived token `claude setup-token`
 # prints (a SECRET: repr=False on the request, never in a result or a log).
 SEARCH_TOKEN_WEBUI_FIELDS = frozenset({"token"})
-# The one searcher, the contact address, the recent list, the sidebar switch
-# and the VPN version's tick, saved whole.
+# The one searcher, the contact address, the recent list, the sidebar switch,
+# the VPN version's tick and how many exits a VPN search tries on one site,
+# saved whole.
 SEARCH_SETTINGS_WEBUI_FIELDS = frozenset({"name", "model", "effort", "at_once", "contact",
-                                          "recent", "sidebar", "tiers", "vpn"})
-# The VPN configuration: the provider's file as text, OR its fields typed by
-# hand (an object). Both hold the tunnel's private key (a SECRET: repr=False
-# on the request, never in a result or a log).
-SEARCH_VPN_WEBUI_FIELDS = frozenset({"config", "manual"})
+                                          "recent", "sidebar", "tiers", "vpn",
+                                          "exits_per_site"})
+# One VPN exit: its name, and its configuration as the provider's file as
+# text, OR its fields typed by hand (an object). Both hold the tunnel's
+# private key (a SECRET: repr=False on the request, never in a result or a
+# log).
+SEARCH_VPN_WEBUI_FIELDS = frozenset({"name", "config", "manual"})
+# One VPN exit by its name (its removal).
+SEARCH_VPN_NAME_WEBUI_FIELDS = frozenset({"name"})
+# The exits' new order: every stored exit's name, once each.
+SEARCH_VPN_ORDER_WEBUI_FIELDS = frozenset({"names"})
 # One search in the service (view, report, stop), or one kept conversation,
 # by its id.
 SEARCH_ID_WEBUI_FIELDS = frozenset({"id"})
@@ -1927,6 +1947,7 @@ VERBS = {
     "search_vpn": _verb_search_vpn,
     "search_vpn_set": _verb_search_vpn_set,
     "search_vpn_clear": _verb_search_vpn_clear,
+    "search_vpn_order": _verb_search_vpn_order,
     "search_clear": _verb_search_clear,
     "search_list": _verb_search_list,
     "search_view": _verb_search_view,

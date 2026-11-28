@@ -23716,8 +23716,8 @@ def resume_aldine_with_fleet() -> None:
 # One search service for the whole installation, turned on by the operator
 # (Services → Search or `research search on`), resumed by `research start`
 # only when it was turned on, and offered to agents as the MCP gateway server
-# `search` and, while the VPN version is on with a VPN configuration stored,
-# `search-vpn`. Names, the container's exact shape and the host files are in
+# `search` and, while the VPN version is on with at least one VPN exit
+# stored, `search-vpn`. Names, the container's exact shape and the host files are in
 # cli/search.py; the service program is container/search/service.py.
 
 # How long Turn on / start waits for the service to answer after (re)creating
@@ -23907,9 +23907,9 @@ def _search_list_ready(vpn: bool = False) -> None:
 
 
 def _search_vpn_wanted() -> bool:
-    """Whether the VPN version is due: ticked in the settings and a VPN
-    configuration stored (SearchError for a damaged settings or VPN file)."""
-    return bool(_search_settings()["vpn"]) and search.read_vpn_file() is not None
+    """Whether the VPN version is due: ticked in the settings and at least
+    one exit stored (SearchError for a damaged settings or exits file)."""
+    return bool(_search_settings()["vpn"]) and bool(search.read_exits_file())
 
 
 def _search_vpn_entry(want: bool, *, blocking: bool, deadline: float | None) -> None:
@@ -24028,20 +24028,22 @@ def _search_networks_up() -> bool:
         raise search.SearchError("the search service's egress rules could not be set "
                                  "on RS's router (the operation's log has the "
                                  "router's answer)") from None
-    # The VPN's tunnel, the service's one named destination (after the purge,
-    # which took any earlier one with the range's other rules).
-    record = search.read_vpn_file()
-    if record is not None:
-        _search_vpn_router(None, record, None)
+    # The exits' tunnels, the service's named destinations, one per exit's
+    # VPN server (after the purge, which took any earlier ones with the
+    # range's other rules).
+    exits = search.read_exits_file()
+    if exits:
+        _search_vpn_router([], exits, None)
     return fresh
 
 
-def _search_vpn_router(old: dict | None, new: dict | None, deadline: float | None) -> None:
-    """Move the service's named destination on RS's router from the old VPN
-    configuration's server to the new one's (`<address>:<port>/udp`, the
-    tunnel's only way out), or take it away (new None). Nothing when the
-    service's network is not there (Turn on applies it after the range's
-    rules) or the router is not running (its start replays the record)."""
+def _search_vpn_router(old: list, new: list, deadline: float | None) -> None:
+    """Bring the service's named destinations on RS's router from the old
+    exits' VPN servers to the new ones' (`<address>:<port>/udp` each, a
+    tunnel's only way out): every new one allowed, every old one no new exit
+    uses taken away. Nothing when the service's network is not there (Turn on
+    applies them after the range's rules) or the router is not running (its
+    start replays the record)."""
     info = _search_network(search.EGRESS_NETWORK, deadline)
     if info is None or not info["subnet"]:
         return
@@ -24049,21 +24051,21 @@ def _search_vpn_router(old: dict | None, new: dict | None, deadline: float | Non
                              ROUTER_CONTAINER], deadline)
     if router.stdout.strip() != "true":
         return
-    want = search.vpn_destination(new) if new is not None else None
-    if want is not None:
-        ip, port = want
+    want = list(dict.fromkeys(search.vpn_destination(e) for e in new))
+    for ip, port in want:
         r = _search_docker(["docker", "exec", ROUTER_CONTAINER, "/scripts/mcp-allow.sh",
                             info["subnet"], ip, str(port), "udp"], deadline)
         if r.returncode != 0:
             raise _search_failed("RS's router could not let the search service reach the "
                                  "VPN server", r)
-    if old is not None and search.vpn_destination(old) != want:
-        ip, port = search.vpn_destination(old)
+    for ip, port in dict.fromkeys(search.vpn_destination(e) for e in old):
+        if (ip, port) in want:
+            continue
         r = _search_docker(["docker", "exec", ROUTER_CONTAINER, "/scripts/mcp-deny.sh",
                             info["subnet"], ip, str(port), "udp"], deadline)
         if r.returncode != 0:
             raise _search_failed("RS's router could not take away the search service's "
-                                 "way to the earlier VPN server", r)
+                                 "way to an earlier VPN server", r)
 
 
 def _search_conversations_volume_up() -> None:
@@ -24093,11 +24095,11 @@ def _search_inject_route() -> None:
                                  "could not be set") from None
 
 
-def _search_admin(what: str, deadline: float | None) -> dict | None:
+def _search_admin(what: str, deadline: float | None, *args: str) -> dict | None:
     """Ask the running service (from inside its container). None when it does
     not answer or the answer is not JSON."""
     r = _search_docker(["docker", "exec", search.SERVICE_CONTAINER, *_SEARCH_PY,
-                        "admin", what], deadline)
+                        "admin", what, *args], deadline)
     if r.returncode != 0:
         return None
     try:
@@ -24181,17 +24183,16 @@ def _search_stage(pins: dict) -> None:
 
 _SEARCH_DELIVERED_WHAT = {search.SETTINGS_FILE_NAME: "settings",
                           search.TOKEN_FILE_NAME: "sign-in",
-                          search.VPN_FILE_NAME: "VPN configuration"}
+                          search.VPN_FILE_NAME: "VPN exits"}
 
 
 def _search_deliver(deadline: float | None, *, only_vpn: bool = False) -> None:
-    """Hand the running service its settings, its token and its VPN
-    configuration (or take the token or the VPN configuration away), over
-    stdin into its tmpfs — never on a command line. The VPN configuration
-    goes only while the VPN version is ticked (unticked, the service holds no
-    key and runs no gateway). `only_vpn`: the VPN configuration alone (a
-    change of it)."""
-    vpn = search.read_vpn_file()
+    """Hand the running service its settings, its token and the VPN's exits
+    (or take the token or the exits away), over stdin into its tmpfs — never
+    on a command line. The exits go only while the VPN version is ticked
+    (unticked, the service holds no key and runs no gateway). `only_vpn`:
+    the exits alone (a change of them)."""
+    vpn = search.read_exits_file() or None
     current = _search_settings() if vpn is not None or not only_vpn else None
     if current is not None and not current["vpn"]:
         vpn = None
@@ -24221,7 +24222,7 @@ def _search_up(progress) -> None:
     pins = _search_pins()
     _search_settings()                  # a damaged settings file refuses first
     search.read_token_file()            # so does a damaged token file
-    search.read_vpn_file()              # and a damaged VPN configuration
+    search.read_exits_file()            # and a damaged exits file
     vpn_wanted = _search_vpn_wanted()
     if not dist_present(DEFAULT_AGENT):
         raise search.SearchError("the Claude download is not on this computer; pull "
@@ -24491,11 +24492,13 @@ class SearchSettingsRequest:
     tiers: dict
     # The VPN version (the `search-vpn` server) on or off.
     vpn: bool
+    # How many exits a VPN search tries on one site (said to the searcher).
+    exits_per_site: int
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "SearchSettingsRequest":
         missing = [k for k in ("name", "model", "effort", "at_once", "contact", "recent",
-                               "sidebar", "tiers", "vpn") if k not in kw]
+                               "sidebar", "tiers", "vpn", "exits_per_site") if k not in kw]
         if missing:
             raise ValidationError(f"the searcher needs {', '.join(missing)}")
         for problem in (search.searcher_name_problem(kw["name"]),
@@ -24504,7 +24507,8 @@ class SearchSettingsRequest:
                         search.recent_problem(kw["recent"]),
                         search.sidebar_problem(kw["sidebar"]),
                         search.tiers_problem(kw["tiers"]),
-                        search.vpn_problem(kw["vpn"])):
+                        search.vpn_problem(kw["vpn"]),
+                        search.exits_per_site_problem(kw["exits_per_site"])):
             if problem:
                 raise ValidationError(problem)
         model, effort = kw["model"], kw["effort"]
@@ -24516,7 +24520,8 @@ class SearchSettingsRequest:
         return cls(name=kw["name"], model=model, effort=effort, at_once=kw["at_once"],
                    contact=kw["contact"].strip(), recent=kw["recent"],
                    sidebar=kw["sidebar"],
-                   tiers={t: kw["tiers"][t] for t in search.TIER_NAMES}, vpn=kw["vpn"])
+                   tiers={t: kw["tiers"][t] for t in search.TIER_NAMES}, vpn=kw["vpn"],
+                   exits_per_site=kw["exits_per_site"])
 
 
 def search_token_set(req: SearchTokenRequest, *, blocking: bool = True,
@@ -24577,23 +24582,23 @@ def search_settings_set(req: SearchSettingsRequest, *, blocking: bool = True,
                         deadline: float | None = None) -> dict:
     """Save the whole searcher (replacing a damaged file too: the page sends
     every field) and hand it to a running service. The VPN version follows
-    the tick: ticked with a VPN configuration stored (and the service on),
-    `search-vpn` is listed and the service runs its gateway; unticked, both
-    go. Ticking it with no configuration stored is saved as it is (the page
-    then asks for one)."""
+    the tick: ticked with an exit stored (and the service on), `search-vpn`
+    is listed and the service runs the exits' gateways; unticked, both go.
+    Ticking it with no exit stored is saved as it is (the page then asks for
+    one)."""
     deadline = _mcp_deadline() if deadline is None and not blocking else deadline
     data = {"version": search.SETTINGS_VERSION,
             "searcher": {"name": req.name, "model": req.model, "effort": req.effort,
                          "at_once": req.at_once, "tiers": dict(req.tiers)},
             "contact": req.contact, "recent": req.recent, "sidebar": req.sidebar,
-            "vpn": req.vpn}
+            "vpn": req.vpn, "exits_per_site": req.exits_per_site}
     try:
         with _search_lock(blocking):
             try:
                 was_vpn = _search_settings()["vpn"]
             except search.SearchError:
                 was_vpn = None              # a damaged record is replaced
-            want = search.is_on() and req.vpn and search.read_vpn_file() is not None
+            want = search.is_on() and req.vpn and bool(search.read_exits_file())
             if want:
                 _search_list_ready(vpn=True)        # another `search-vpn` refuses the save
             try:
@@ -24603,7 +24608,7 @@ def search_settings_set(req: SearchSettingsRequest, *, blocking: bool = True,
                                          f"({e.strerror or 'write failed'})") from None
         out = _search_deliver_if_running(deadline)
         if out["delivered"] and was_vpn != req.vpn:
-            _search_tunnel(deadline, apply=True)    # the gateway up, or gone
+            _search_tunnels(deadline, apply=True)   # the gateways up, or gone
         if search.is_on():
             _search_vpn_entry(want, blocking=blocking, deadline=deadline)
     except search.SearchError as e:
@@ -24629,27 +24634,45 @@ def search_clear(deadline: float | None = None) -> dict:
     return {"cleared": out["cleared"], "problems": [str(p)[:300] for p in problems]}
 
 
-# --- the VPN (Services → Search → Settings → VPN) ------------------------------
-# One WireGuard configuration for the whole service, pasted as the provider's
-# file or typed field by field, normalized and checked in cli/search.py,
-# stored on the host (0600, VPN_PATH) with the VPN server's name resolved
-# once here, and handed to the running service over stdin; the service hands
-# it to its VPN gateway the same way. No reply, log or command line carries a
-# key.
+# --- the VPN's exits (Services → Search → Settings → VPN) ----------------------
+# An ordered list of exits for the whole service, each a name and a WireGuard
+# configuration pasted as the provider's file or typed field by field,
+# normalized and checked in cli/search.py, stored on the host (0600,
+# VPN_PATH) with each VPN server's name resolved once here, and handed to the
+# running service over stdin; the service hands each exit's configuration to
+# that exit's VPN gateway the same way. The first exit is where every VPN
+# search starts. No reply, log or command line carries a key.
 
-SEARCH_VPN_ONE_FORM = ("give the VPN configuration either as the configuration file or "
+SEARCH_VPN_ONE_FORM = ("give the exit's configuration either as the configuration file or "
                        "as its fields, not both")
-SEARCH_VPN_NONE_GIVEN = "give the VPN configuration as the configuration file or as its fields"
-# A VPN configuration stored while the VPN version is unticked: the service
-# holds no key and runs no gateway.
+SEARCH_VPN_NONE_GIVEN = "give the exit's configuration as the configuration file or as its fields"
+# Exits stored while the VPN version is unticked: the service holds no key
+# and runs no gateway.
 SEARCH_VPN_UNTICKED = "the VPN version is off (Enable the VPN version turns it on)"
+SEARCH_EXIT_UNKNOWN = "there is no exit named {name}"
+SEARCH_EXITS_ORDER_BAD = ("the new order must name every stored exit exactly once (the "
+                          "exits are: {names})")
+# A stored exit the running service's answer does not name (it was handed
+# the exits a moment before or after this read).
+SEARCH_EXIT_NOT_RUN = "the search service does not run this exit's gateway"
 # The tunnel's states as the service reports them (service.py — MIRROR);
-# "checking": no check of it has finished since the configuration was applied.
+# "checking": no check of it has finished since its configuration was applied.
 _SEARCH_TUNNEL_STATES = ("up", "down", "off", "checking")
+
+
+def _search_exit_name(kw: dict) -> str:
+    name = kw.get("name")
+    problem = search.exit_name_problem(name)
+    if problem:
+        raise ValidationError(problem)
+    return name
 
 
 @dataclass(frozen=True)
 class SearchVpnRequest:
+    # The exit's name: a new one is added at the end, a stored one has its
+    # configuration replaced where it is.
+    name: str
     # The normalized configuration (search._vpn_normalize), without the VPN
     # server's resolved address: it holds the tunnel's keys, so it is off the
     # repr, and never in a result or on a command line.
@@ -24657,6 +24680,7 @@ class SearchVpnRequest:
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "SearchVpnRequest":
+        name = _search_exit_name(kw)
         has_file = kw.get("config") not in (None, "")
         has_manual = kw.get("manual") is not None
         if has_file and has_manual:
@@ -24668,7 +24692,33 @@ class SearchVpnRequest:
                       else search.parse_vpn_manual(kw["manual"]))
         except search.SearchError as e:
             raise ValidationError(str(e)) from None
-        return cls(record=record)
+        return cls(name=name, record=record)
+
+
+@dataclass(frozen=True)
+class SearchVpnNameRequest:
+    name: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "SearchVpnNameRequest":
+        return cls(name=_search_exit_name(kw))
+
+
+@dataclass(frozen=True)
+class SearchVpnOrderRequest:
+    # Every stored exit's name, in the new order.
+    names: tuple
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "SearchVpnOrderRequest":
+        names = kw.get("names")
+        if not isinstance(names, list):
+            raise ValidationError("the new order is the list of the exits' names")
+        for n in names:
+            problem = search.exit_name_problem(n)
+            if problem:
+                raise ValidationError(problem)
+        return cls(names=tuple(names))
 
 
 def _search_vpn_resolve(record: dict) -> dict:
@@ -24690,125 +24740,195 @@ def _search_vpn_resolve(record: dict) -> dict:
     return dict(record, endpoint_ip=ip)
 
 
-def _search_tunnel(deadline: float | None, apply: bool) -> dict:
-    """{tunnel, handshake_s, error, checking} from the running service
-    (`apply`: after it (re)applied the configuration it holds), or tunnel
-    "off" when it is not running. The service answers at once: `checking`
-    says a check of the tunnel runs there now. The answer is checked again
-    (the service runs search agents)."""
+def _search_tunnel_ok(t: Any) -> bool:
+    if not isinstance(t, dict):
+        return False
+    hs, err = t.get("handshake_s"), t.get("error")
+    return (search.exit_name_problem(t.get("name")) is None
+            and t.get("tunnel") in _SEARCH_TUNNEL_STATES
+            and (hs is None or (isinstance(hs, int) and not isinstance(hs, bool) and hs >= 0))
+            and (err is None or isinstance(err, str))
+            and isinstance(t.get("checking"), bool))
+
+
+def _search_tunnels(deadline: float | None, apply: bool,
+                    renew: str | None = None) -> tuple[dict, dict | None]:
+    """The running service's exits' tunnels ({name: {tunnel, handshake_s,
+    error, checking}}), `apply`: after it brought its gateways in line with
+    the exits it holds (`renew`: and set that exit up again, the one the
+    operator just saved); or, when there is nothing per exit to show, the one
+    state every exit is shown in (tunnel "off": the service is not running,
+    did not answer, or answered something RS cannot read). The service
+    answers at once: `checking` says a check of that tunnel runs there now.
+    The answer is checked again (the service runs search agents)."""
+    off = {"tunnel": "off", "handshake_s": None, "error": None, "checking": False}
     state, labels = _search_container(deadline)
     if state != "running" or labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
-        return {"tunnel": "off", "handshake_s": None, "error": None, "checking": False}
-    out = _search_admin("vpn-apply" if apply else "vpn", deadline)
+        return {}, off
+    out = (_search_admin("vpn-renew", deadline, renew) if apply and renew
+           else _search_admin("vpn-apply" if apply else "vpn", deadline))
     if out is None:
-        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_NO_ANSWER,
-                "checking": False}
-    tunnel, hs, err = out.get("tunnel"), out.get("handshake_s"), out.get("error")
-    checking = out.get("checking")
-    if tunnel not in _SEARCH_TUNNEL_STATES             or not (hs is None or (isinstance(hs, int) and not isinstance(hs, bool) and hs >= 0))             or not (err is None or isinstance(err, str))             or not isinstance(checking, bool):
-        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_BAD_ANSWER,
-                "checking": False}
-    return {"tunnel": tunnel, "handshake_s": hs,
-            "error": None if err is None else err[:_SEARCH_REASON_MAX], "checking": checking}
+        return {}, dict(off, error=SEARCH_NO_ANSWER)
+    tunnels = out.get("exits")
+    if not isinstance(tunnels, list) or not all(_search_tunnel_ok(t) for t in tunnels):
+        return {}, dict(off, error=SEARCH_BAD_ANSWER)
+    return {t["name"]: {"tunnel": t["tunnel"], "handshake_s": t["handshake_s"],
+                        "error": None if t["error"] is None else t["error"][:_SEARCH_REASON_MAX],
+                        "checking": t["checking"]} for t in tunnels}, None
 
 
-def _search_tunnel_shown(record: dict | None, deadline: float | None, apply: bool) -> dict:
-    """The tunnel as the page shows it: off (and why) while the VPN version
-    is unticked with a configuration stored, else as the service sees it."""
-    if record is not None and not _search_settings()["vpn"]:
-        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_VPN_UNTICKED,
-                "checking": False}
-    return _search_tunnel(deadline, apply=apply)
-
-
-def _search_vpn_reply(record: dict | None, tunnel: dict) -> dict:
-    pub = search.vpn_public(record)
-    return {"configured": pub["configured"], "endpoint": pub["endpoint"],
-            "endpoint_ip": pub["endpoint_ip"], "address": pub["address"], "dns": pub["dns"],
-            "tunnel": tunnel["tunnel"], "handshake_s": tunnel["handshake_s"],
-            "error": tunnel["error"], "checking": tunnel["checking"], "note": pub["note"]}
+def _search_exits_reply(exits: list, deadline: float | None, *, apply: bool = False,
+                        renew: str | None = None, error: str | None = None) -> dict:
+    """The VPN as the Search page shows it: each stored exit, in order, with
+    its public parts (never a key) and its tunnel as the running service last
+    saw it (`off` while the VPN version is unticked, or when the service or
+    the exit's gateway is not running; `checking` while no check has
+    finished since its configuration was applied). `apply`: the service
+    brings its gateways in line first (`renew`: that exit's set up again).
+    `error`: why the stored exits could
+    not be read (none is shown then)."""
+    by_name: dict = {}
+    every = None
+    try:
+        unticked = bool(exits) and not _search_settings()["vpn"]
+        if apply or (exits and not unticked):
+            by_name, every = _search_tunnels(deadline, apply, renew)
+        if unticked:
+            every = {"tunnel": "off", "handshake_s": None, "error": SEARCH_VPN_UNTICKED,
+                     "checking": False}
+    except search.SearchError as e:
+        every = {"tunnel": "off", "handshake_s": None, "error": str(e), "checking": False}
+    shown = []
+    for e in exits:
+        t = every if every is not None else by_name.get(e["name"], {
+            "tunnel": "off", "handshake_s": None, "error": SEARCH_EXIT_NOT_RUN,
+            "checking": False})
+        pub = search.vpn_public(e)
+        shown.append({"name": pub["name"], "configured": pub["configured"],
+                      "endpoint": pub["endpoint"], "endpoint_ip": pub["endpoint_ip"],
+                      "address": pub["address"], "dns": pub["dns"], "note": pub["note"],
+                      "tunnel": t["tunnel"], "handshake_s": t["handshake_s"],
+                      "error": t["error"], "checking": t["checking"]})
+    return {"exits": shown, "error": error}
 
 
 def search_vpn(deadline: float | None = None) -> dict:
-    """The VPN as the Search page shows it: the stored configuration's public
-    parts (never a key), and the tunnel as the running service last saw it
-    (`off` when the service or its gateway is not running, `checking` while
-    no check has finished since the configuration was applied), answered at
-    once: `checking` says a check runs now."""
+    """The VPN's exits as the Search page shows them (_search_exits_reply),
+    answered at once: `checking` says a check of that tunnel runs now. A
+    damaged exits file shows no exit and says why (adding an exit replaces
+    it)."""
     deadline = _mcp_deadline() if deadline is None else deadline
     try:
-        record = search.read_vpn_file()
+        exits = search.read_exits_file()
     except search.SearchError as e:
-        return dict(_search_vpn_reply(None, {"tunnel": "off", "handshake_s": None,
-                                             "error": str(e), "checking": False}))
-    try:
-        tunnel = _search_tunnel_shown(record, deadline, apply=False)
-    except search.SearchError as e:
-        tunnel = {"tunnel": "off", "handshake_s": None, "error": str(e), "checking": False}
-    return _search_vpn_reply(record, tunnel)
+        return _search_exits_reply([], deadline, error=str(e))
+    return _search_exits_reply(exits, deadline)
+
+
+def _search_exits_changed(old: list, new: list, deadline: float | None) -> None:
+    """After the exits file changed: the router's destinations moved to the
+    new exits' servers, and a running service handed the new exits."""
+    _search_vpn_router(old, new, deadline)
+    state, labels = _search_container(deadline)
+    if state == "running" and labels.get(search.OWNER_LABEL) == search.OWNER_VALUE:
+        _search_deliver(deadline, only_vpn=True)
 
 
 def search_vpn_set(req: SearchVpnRequest, *, blocking: bool = True,
                    deadline: float | None = None) -> dict:
-    """Store the VPN configuration (0600; a damaged one is replaced), move the
-    service's router destination to its server, hand it to a running service
-    (which brings its gateway's tunnel up while the VPN version is ticked),
-    list `search-vpn` when the VPN version is ticked and the service is on,
-    and answer the VPN's status."""
+    """Store one exit (0600): a new name at the end of the list, a stored one
+    with its configuration replaced where it is (a damaged file is replaced
+    by this exit alone). The router's destinations follow, a running service
+    is handed the exits (it brings their gateways in line while the VPN
+    version is ticked), `search-vpn` is listed when the VPN version is ticked
+    and the service is on, and the exits are answered as search_vpn does."""
     deadline = _mcp_deadline() if deadline is None and not blocking else deadline
     try:
-        record = _search_vpn_resolve(req.record)
+        record = dict(_search_vpn_resolve(req.record), name=req.name)
         with _search_lock(blocking):
             want = search.is_on() and _search_settings()["vpn"]
             if want:
                 _search_list_ready(vpn=True)        # another `search-vpn` refuses the store
             try:
-                old = search.read_vpn_file()
+                old = search.read_exits_file()
             except search.SearchError:
-                old = None              # a damaged record is replaced; nothing of it was applied
+                old = []                # a damaged record is replaced; nothing of it was applied
+            new = [record if e["name"] == req.name else e for e in old]
+            if not any(e["name"] == req.name for e in old):
+                new.append(record)
             try:
-                search.write_vpn_file(record)
+                search.write_exits_file(new)
             except OSError as e:
-                raise search.SearchError("cannot store the VPN configuration on the host "
+                raise search.SearchError("cannot store the exit on the host "
                                          f"({e.strerror or 'write failed'})") from None
-        _search_vpn_router(old, record, deadline)
-        state, labels = _search_container(deadline)
-        if state == "running" and labels.get(search.OWNER_LABEL) == search.OWNER_VALUE:
-            _search_deliver(deadline, only_vpn=True)
-        tunnel = _search_tunnel_shown(record, deadline, apply=True)
+        _search_exits_changed(old, new, deadline)
+        reply = _search_exits_reply(new, deadline, apply=True, renew=req.name)
         if want:
             _search_vpn_entry(True, blocking=blocking, deadline=deadline)
     except search.SearchError as e:
         raise ValidationError(str(e)) from None
-    return _search_vpn_reply(record, tunnel)
+    return reply
 
 
-def search_vpn_clear(*, blocking: bool = True, deadline: float | None = None) -> dict:
-    """Remove the VPN configuration: `search-vpn` goes from the gateway's
-    list first (unwired everywhere), then the configuration from the host,
-    the router and a running service (whose gateway goes with it). The VPN
-    version's tick is kept as saved."""
+def search_vpn_clear(req: SearchVpnNameRequest, *, blocking: bool = True,
+                     deadline: float | None = None) -> dict:
+    """Remove one exit; the others keep their order. With the last one gone,
+    `search-vpn` goes from the gateway's list first (unwired everywhere) and
+    the exits file from the host. The router's destinations and a running
+    service (whose gateway of that exit goes) follow. The VPN version's tick
+    is kept as saved. Answered as search_vpn does."""
     deadline = _mcp_deadline() if deadline is None and not blocking else deadline
     try:
-        _search_vpn_entry(False, blocking=blocking, deadline=deadline)
+        stored = search.read_exits_file()
+        if not any(e["name"] == req.name for e in stored):
+            raise search.SearchError(SEARCH_EXIT_UNKNOWN.format(name=req.name))
+        if len(stored) == 1:
+            _search_vpn_entry(False, blocking=blocking, deadline=deadline)
         with _search_lock(blocking):
+            old = search.read_exits_file()
+            if not any(e["name"] == req.name for e in old):
+                raise search.SearchError(SEARCH_EXIT_UNKNOWN.format(name=req.name))
+            new = [e for e in old if e["name"] != req.name]
             try:
-                old = search.read_vpn_file()
-            except search.SearchError:
-                old = None
-            try:
-                search.clear_vpn_file()
+                search.write_exits_file(new)
             except OSError as e:
-                raise search.SearchError("cannot remove the VPN configuration on the host "
+                raise search.SearchError("cannot remove the exit on the host "
                                          f"({e.strerror or 'remove failed'})") from None
-        _search_vpn_router(old, None, deadline)
-        state, labels = _search_container(deadline)
-        if state == "running" and labels.get(search.OWNER_LABEL) == search.OWNER_VALUE:
-            _search_deliver(deadline, only_vpn=True)
-            _search_tunnel(deadline, apply=True)
+        _search_exits_changed(old, new, deadline)
+        reply = _search_exits_reply(new, deadline, apply=True)
+        if search.is_on():
+            # Another exit stored meanwhile keeps `search-vpn` listed.
+            _search_vpn_entry(_search_vpn_wanted(), blocking=blocking, deadline=deadline)
     except search.SearchError as e:
         raise ValidationError(str(e)) from None
-    return {"cleared": True}
+    return reply
+
+
+def search_vpn_order(req: SearchVpnOrderRequest, *, blocking: bool = True,
+                     deadline: float | None = None) -> dict:
+    """Put the stored exits in a new order (every stored name exactly once);
+    the first one is where every VPN search starts from now on. A running
+    service is handed them (the VPN's SearXNG follows the first exit).
+    Answered as search_vpn does."""
+    deadline = _mcp_deadline() if deadline is None and not blocking else deadline
+    try:
+        with _search_lock(blocking):
+            old = search.read_exits_file()
+            by_name = {e["name"]: e for e in old}
+            if len(req.names) != len(old) or set(req.names) != set(by_name):
+                raise search.SearchError(SEARCH_EXITS_ORDER_BAD.format(
+                    names=", ".join(by_name) or "none"))
+            new = [by_name[n] for n in req.names]
+            try:
+                search.write_exits_file(new)
+            except OSError as e:
+                raise search.SearchError("cannot store the exits' order on the host "
+                                         f"({e.strerror or 'write failed'})") from None
+        _search_exits_changed(old, new, deadline)
+        reply = _search_exits_reply(new, deadline, apply=True)
+    except search.SearchError as e:
+        raise ValidationError(str(e)) from None
+    return reply
 
 
 # --- the operator's list, view, stop and sign-in test (Services → Search) -----
@@ -24994,11 +25114,16 @@ def _search_work_entry(raw: Any) -> dict:
     if kind == "text":
         return {"ts": _search_reply_ts(e.get("ts")), "kind": kind,
                 "text": _search_reply_str(e.get("text"), _SEARCH_VIEW_TEXT_MAX)}
-    return {"ts": _search_reply_ts(e.get("ts")), "kind": kind,
-            **{k: _search_reply_str(e.get(k), _SEARCH_TRACE_NAME_MAX)
-               for k in ("tool", "tier", "outcome")},
-            **{k: _search_reply_str(e.get(k), _SEARCH_TRACE_TARGET_MAX)
-               for k in ("target", "detail")}}
+    out = {"ts": _search_reply_ts(e.get("ts")), "kind": kind,
+           **{k: _search_reply_str(e.get(k), _SEARCH_TRACE_NAME_MAX)
+              for k in ("tool", "tier", "outcome")},
+           **{k: _search_reply_str(e.get(k), _SEARCH_TRACE_TARGET_MAX)
+              for k in ("target", "detail")}}
+    if "exit" in e:
+        # A VPN search's call names the exit it went out through (the
+        # service derives it from the tool server's name).
+        out["exit"] = _search_reply_str(e["exit"], _SEARCH_TRACE_NAME_MAX)
+    return out
 
 
 def search_view(req: SearchIdRequest, deadline: float | None = None) -> dict:
@@ -25044,6 +25169,10 @@ _SEARCH_SOURCE_FIELDS = (("n", ("n", "number")),       # the number the summary 
                          ("doi", ("doi",)),
                          ("contributed", ("contributed", "contribution")),
                          ("file", ("saved_as", "file", "saved")))
+# A source's optional fields: present only when the agent wrote them (the
+# service keeps a VPN search's `exit` only when it names one of its exits,
+# and drops it from every other search's sources).
+_SEARCH_SOURCE_OPTIONAL = (("exit", ("exit",)),)
 _SEARCH_TIER_FIELDS = (("tier", ("tier", "tool", "database")),
                        ("asked", ("asked", "query")),
                        ("result", ("hit", "result", "results", "outcome")))
@@ -25060,8 +25189,9 @@ def _search_report_text(value: Any) -> str:
         raise ValidationError(SEARCH_BAD_ANSWER) from None
 
 
-def _search_report_items(value: Any, fields: tuple) -> list[dict]:
-    """A report's sources or tiers as text-only objects, nothing dropped."""
+def _search_report_items(value: Any, fields: tuple, optional: tuple = ()) -> list[dict]:
+    """A report's sources or tiers as text-only objects, nothing dropped
+    (`optional`: fields an item carries only when the agent wrote them)."""
     items = value if isinstance(value, list) else [value]
     out = []
     for item in items:
@@ -25074,6 +25204,11 @@ def _search_report_items(value: Any, fields: tuple) -> list[dict]:
             key = next((k for k in keys if k in item), None)
             entry[name] = "" if key is None else _search_report_text(item[key])
             if key is not None:
+                used.add(key)
+        for name, keys in optional:
+            key = next((k for k in keys if k in item), None)
+            if key is not None:
+                entry[name] = _search_report_text(item[key])
                 used.add(key)
         entry["other"] = "; ".join(f"{k}: {_search_report_text(v)}"
                                    for k, v in item.items() if k not in used)
@@ -25101,7 +25236,8 @@ def search_report(req: SearchIdRequest, deadline: float | None = None) -> dict:
             "searcher": _search_reply_str(v.get("searcher"), _SEARCH_NAME_MAX),
             "vpn": _search_reply_bool(v.get("vpn")),
             "summary": _search_report_text(v.get("summary")),
-            "sources": _search_report_items(v.get("sources"), _SEARCH_SOURCE_FIELDS),
+            "sources": _search_report_items(v.get("sources"), _SEARCH_SOURCE_FIELDS,
+                                            _SEARCH_SOURCE_OPTIONAL),
             "tiers": _search_report_items(v.get("tiers"), _SEARCH_TIER_FIELDS)}
 
 
@@ -25146,7 +25282,7 @@ def search_test(deadline: float | None = None) -> dict:
 SEARCH_NO_CONVERSATION = "no conversation with that id is kept"   # service.py NO_SUCH_CONVERSATION
 SEARCH_EMPTY_QUESTION = "the question is empty"
 SEARCH_ASK_NO_VPN = ("the VPN version of the search service is not on: tick Enable the VPN "
-                     "version and store a VPN configuration under Settings, or ask without "
+                     "version and add an exit under Settings → VPN, or ask without "
                      "Through the VPN")
 
 
@@ -25273,8 +25409,8 @@ def _search_ask_row(raw: Any) -> dict:
             # No report: no summary, no sources, no tiers. A report's parts
             # exactly as search_report normalises them.
             "summary": None if summary is None else _search_report_text(summary),
-            "sources": [] if summary is None else _search_report_items(a.get("sources"),
-                                                                       _SEARCH_SOURCE_FIELDS),
+            "sources": [] if summary is None else _search_report_items(
+                a.get("sources"), _SEARCH_SOURCE_FIELDS, _SEARCH_SOURCE_OPTIONAL),
             "tiers": [] if summary is None else _search_report_items(a.get("tiers"),
                                                                      _SEARCH_TIER_FIELDS),
             "work": work[-_SEARCH_WORK_MAX:]}
