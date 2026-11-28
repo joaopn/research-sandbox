@@ -2883,6 +2883,15 @@ def exits_instructions(ran: list[dict], left_out: list[tuple[str, str]], per_sit
                "refused there, stop trying that site and report it as blocked."]
     lines += ["", "How to use them:", "",
               f"- Start every site on the first exit ({first}).",
+              "- Tell an address block from a bot check before you move. A page refused "
+              "because of where the request comes from is an address block: another tier "
+              "on the same exit leaves from the same address, so only another exit can help "
+              "(within the limit below). A "
+              "page that checks whether you are a person (a captcha, a \"Verifying…\" or "
+              "\"checking your browser\" page, a page that stays empty without a browser) "
+              "is a bot check: climb the tiers you have on the current exit first (the "
+              "browser, then the stealth browser), and try another exit only when every "
+              "tier there was refused (within the same limit).",
               *how,
               (f"- The web search runs only on the first exit (`mcp__"
                f"{server_name(PLAIN_TIER, first_n)}__web_search`); the other exits' "
