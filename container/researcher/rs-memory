@@ -4750,6 +4750,27 @@ def hook_text(text: str) -> str:
     return text
 
 
+# The start's line, in bold and a colour by what it says, so it stands out
+# from the agent's own dim start text: both agents pass the codes through
+# (measured 2026-11-28: Claude Code 2.1.325 draws a hook's systemMessage dim
+# gray, pi 1.6.1 an info notice dim; codes inside the text override both).
+LINE_NOTHING = "\x1b[1;33m"      # bold yellow: nothing to work on
+LINE_CHOOSE = "\x1b[1;36m"       # bold cyan: several packages to choose from
+LINE_SESSION = "\x1b[1;32m"      # bold green: the session's package or role
+LINE_RESET = "\x1b[0m"
+
+
+def coloured_line(line: str) -> str:
+    """The start's line in its colour (the codes around the plain text)."""
+    if line.startswith("Nothing to work on"):
+        colour = LINE_NOTHING
+    elif line.startswith("Work session:"):
+        colour = LINE_CHOOSE
+    else:
+        colour = LINE_SESSION
+    return colour + line + LINE_RESET
+
+
 def hook_output(agent: "str | None", line: "str | None", text: str) -> str:
     """open --hook's output, for the agent that runs the start hook: the text
     for the model (cut to the hook's limit) and the line for the user.
@@ -4760,10 +4781,11 @@ def hook_output(agent: "str | None", line: "str | None", text: str) -> str:
     which shows the line and gives the model the text. No agent named: the
     text alone."""
     text = hook_text(text)
+    shown = coloured_line(line) if line else line
     if agent == "pi":
-        return json.dumps({"line": line, "text": text}) + "\n"
+        return json.dumps({"line": shown, "text": text}) + "\n"
     if agent == "claude" and line:
-        return json.dumps({"systemMessage": line,
+        return json.dumps({"systemMessage": shown,
                            "hookSpecificOutput": {"hookEventName": "SessionStart",
                                                   "additionalContext": text}}) + "\n"
     return text
