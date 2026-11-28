@@ -2681,10 +2681,17 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .searchsvc-tiers { flex-basis: 100%; }
 .searchsvc-tier-list { display: flex; flex-direction: column; gap: 4px; }
 .searchsvc-tier { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
-/* Settings → VPN: the status line, the two ways in (a pasted or chosen
-   WireGuard file, or its fields by hand), one shown at a time. The panes
-   carry display rules, so [hidden] is restated for them. */
-.searchsvc-vpn-status { flex-wrap: wrap; }
+/* Settings → VPN: the exits in list order, one row each (its name, its status
+   line, its buttons), then the add form with the two ways in (a pasted or
+   chosen WireGuard file, or its fields by hand), one shown at a time. The
+   panes carry display rules, so [hidden] is restated for them. */
+.searchsvc-vpn-exit { flex-wrap: wrap; }
+.searchsvc-vpn-name { font-weight: 600; color: var(--fg-base); }
+.searchsvc-vpn-status { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.searchsvc-vpn-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.searchsvc-vpn-list-err { margin: 0 10px; }
+.searchsvc-vpn-add { margin-top: 10px; }
+.searchsvc-vpn-add-title { margin: 0 10px 4px; font-weight: 600; color: var(--fg-base); }
 .searchsvc-vpn-modes { flex-wrap: wrap; gap: 16px; }
 .searchsvc-vpn-file { margin: 0 10px; display: flex; flex-direction: column; gap: 6px; }
 .searchsvc-vpn-file[hidden], .searchsvc-vpn-manual[hidden] { display: none; }

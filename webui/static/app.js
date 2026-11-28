@@ -8738,16 +8738,31 @@ const SEARCH_TIERS_HINT =
 // Under the Enable the VPN version box: what ticking it adds.
 const SEARCH_VPN_BOX_HINT =
     "Adds a second MCP server, search-vpn, whose searches reach sites from your "
-    + "VPN's address; wire it to projects on the MCP tab like any server.";
+    + "VPN exits' addresses; wire it to projects on the MCP tab like any server.";
 // The VPN section's one line.
 const SEARCH_VPN_HINT =
-    "VPN searches reach sites from the VPN's address; their model traffic stays on "
+    "VPN searches reach sites from an exit's address; their model traffic stays on "
     + "this machine's. WireGuard only; the keys are never shown again.";
-// The tunnel's state (the VPN status' `tunnel`), for a stored configuration;
-// "checking": no check has finished since the configuration was applied.
+// Over the exit list: what its order means.
+const SEARCH_VPN_ORDER_HINT =
+    "Every VPN search starts on the first exit and moves down the list when a "
+    + "site blocks it.";
+// The exit list when nothing is stored.
+const SEARCH_VPN_NO_EXIT = "no VPN exit is stored";
+// An exit's name: the service's rule, checked on the page before a Save.
+const SEARCH_VPN_EXIT_NAME_RE = /^[a-z][a-z0-9-]*$/;
+const SEARCH_VPN_EXIT_NAME_RULE =
+    "An exit's name starts with a lowercase letter and holds only lowercase "
+    + "letters, digits and dashes.";
+// Shown on Exits tried per site's question mark (a mouseover title).
+const SEARCH_EXITS_PER_SITE_HINT =
+    "How many exits a VPN search may try on one site before it gives up on it: "
+    + "the first exit, then the next ones down the list. Normal searches use none.";
+// An exit's tunnel state (its `tunnel`); "checking": no check has finished
+// since its configuration was applied.
 const SEARCH_VPN_TUNNEL_TEXT = {
     up: "tunnel up",
-    down: "tunnel down: VPN searches reach no site",
+    down: "tunnel down: VPN searches skip this exit",
     off: "tunnel off while the search service is not running",
     checking: "connecting…",
 };
@@ -8802,14 +8817,15 @@ const SEARCH_STOPPED_MARK = "stopped by the operator";
 // the value doubles the broker calls for no change anyone sees, ten times
 // makes the count look stuck between turns. The time column does not wait
 // for it: it counts up locally (SEARCH_CLOCK_TICK_MS). The VPN section re-reads
-// its status line at the same pace while the service checks the tunnel (a
-// check takes a few seconds, so the line moves at the first or second read).
+// its exits' status lines at the same pace while the service checks any of
+// their tunnels (a check takes a few seconds, so a line moves at the first or
+// second read).
 const SEARCH_LIST_POLL_MS = 5000;
 // The time column shows whole seconds, so it moves once a second.
 const SEARCH_CLOCK_TICK_MS = 1000;
-// The one re-read of the VPN status line on the page (searchVpnWatch): a new
-// VPN section (a fresh render, a Save's re-render) replaces it, so two never
-// run at once.
+// The one re-read of the VPN exits' status lines on the page (searchVpnWatch):
+// a new VPN section (a fresh render, a Save's re-render) replaces it, so two
+// never run at once.
 let searchVpnPoll = null;
 // What the last change on the page reported, shown once by the render that
 // follows it (every change re-reads the page). {where: "bar" | "token" |
@@ -8895,7 +8911,7 @@ function searchBarParts(view, a, refresh) {
         b.onclick = () => mcpConfirmDialog(view, {
             title: "Turn the search service off",
             text: "Its container and networks are removed, and every running search "
-                + "ends with it. The sign-in, the searcher, the VPN configuration and "
+                + "ends with it. The sign-in, the searcher, the VPN exits and "
                 + "the downloaded images are kept, so turning it on again finds them. "
                 + "Every agent loses the MCP servers search and search-vpn.",
             confirmLabel: "Turn off",
@@ -9247,12 +9263,14 @@ function searchSavedFields(cur) {
         name: s.name, model: s.model, effort: s.effort, at_once: s.at_once,
         tiers: searchTiers(s), contact: (cur && cur.contact) || "",
         recent: cur ? cur.recent : undefined,
+        exits_per_site: cur ? cur.exits_per_site : undefined,
         sidebar: !!(cur && cur.sidebar === true), vpn: !!(cur && cur.vpn === true),
     };
 }
 
 // Searcher: the one searcher's name, model and effort, searches at once, the
-// contact address and the browser tiers, saved together (the broker replaces
+// contact address, the browser tiers and (with the VPN version on) the exits
+// tried per site, saved together (the broker replaces
 // the whole file, so the saved sidebar switch and VPN box go with them). The
 // same settings serve both MCP servers, search and search-vpn.
 function searchSearcherSection(view, cfg, cfgErr, flash) {
@@ -9304,6 +9322,18 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
             ]);
         })), SEARCH_TIERS_HINT);
     tierCell.classList.add("searchsvc-tiers");
+    // Exits tried per site: a VPN search's cap, shown while the VPN version is
+    // on (its saved state: the box saves at once). Hidden, Save sends the saved
+    // value unchanged. Its default is the service's (the reply's defaults).
+    const vpnOn = cur.vpn === true;
+    const savedExits = cur.exits_per_site !== undefined && cur.exits_per_site !== null
+        ? cur.exits_per_site : (cfg.defaults || {}).exits_per_site;
+    const exitsPerSite = el("input", { type: "number", class: "searchsvc-input searchsvc-input-num",
+                                       min: "1", step: "1" });
+    exitsPerSite.value = savedExits !== undefined && savedExits !== null ? String(savedExits) : "";
+    const exitsCell = vpnOn
+        ? searchCell("exits tried per site", exitsPerSite, SEARCH_EXITS_PER_SITE_HINT) : null;
+    if (exitsCell) exitsCell.classList.add("searchsvc-exits-per-site");
     // A damaged settings file: the broker's text (the form shows the defaults,
     // and Save replaces the file).
     const errEl = el("span", { class: "mgmt-reviewer-err" }, [cfg.error || ""]);
@@ -9323,6 +9353,15 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
             errEl.textContent = `Recent searches kept is a whole number from 0 to ${maxRecent}.`;
             return;
         }
+        let exits = cur.exits_per_site;
+        if (vpnOn) {
+            const rawExits = exitsPerSite.value.trim();
+            exits = /^[0-9]+$/.test(rawExits) ? Number(rawExits) : NaN;
+            if (!Number.isSafeInteger(exits) || exits < 1) {
+                errEl.textContent = "Exits tried per site is a whole number of at least 1.";
+                return;
+            }
+        }
         const v = picker.value();
         busy = true;
         save.disabled = true;
@@ -9331,6 +9370,7 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
             name: name.value.trim(), model: v.model, effort: v.effort,
             at_once: n, contact: contact.value.trim(), recent: kept,
             tiers: { browser: tierBoxes.browser.checked, stealth: tierBoxes.stealth.checked },
+            exits_per_site: exits,
             // The sidebar switch and the VPN box save at once, so the saved
             // values are their state.
             sidebar: cur.sidebar === true,
@@ -9355,6 +9395,7 @@ function searchSearcherSection(view, cfg, cfgErr, flash) {
         searchCell("recent searches kept", recent),
         searchCell("contact address", contact, SEARCH_CONTACT_HINT),
         tierCell,
+        exitsCell,
         save,
         errEl,
     ]));
@@ -9419,14 +9460,11 @@ function searchVpnAgo(sec) {
     return `last handshake ${Math.floor(s / 3600)} h ago`;
 }
 
-// The VPN's status line (`v` = the search_vpn result): not configured, or the
-// tunnel's state with the endpoint, the address, the DNS and the last
+// One exit's status line (`v` = an entry of the search_vpn result's exits):
+// the tunnel's state with the endpoint, the address, the DNS and the last
 // handshake (up) or the error (down). Every value lands as text; no key is
 // ever part of the reply, and none is shown.
 function searchVpnStatusParts(v) {
-    if (!v.configured) {
-        return [el("span", { class: "state-stopped" }, ["no VPN configuration is stored"])];
-    }
     const tunnel = String(v.tunnel || "");
     const cls = tunnel === "up" ? "state-running" : tunnel === "checking" ? "state-inflight" : "state-stopped";
     const parts = [el("span", { class: cls }, [SEARCH_VPN_TUNNEL_TEXT[tunnel] || "tunnel " + tunnel])];
@@ -9448,19 +9486,32 @@ function searchVpnStatusParts(v) {
     return parts;
 }
 
-// Whether a VPN status read says the service is checking the tunnel: a check
-// running now (`checking`), or none finished since a Save (`tunnel` checking).
-// A reply without `checking` (an older service) never is.
-function searchVpnChecking(v) {
-    return !!v && (v.checking === true || v.tunnel === "checking");
+// The exits of a VPN status read ({exits: […]}, in list order), or null when
+// the read holds no list.
+function searchVpnExits(vpn) {
+    return vpn && Array.isArray(vpn.exits) ? vpn.exits : null;
 }
 
-// While the last read says the tunnel is being checked, re-read the VPN status
-// every SEARCH_LIST_POLL_MS and repaint just the status line (the form below it
-// keeps what the operator is typing); stop at the first read that says the
-// check is over, when the line has left the page, or when a read fails (the
-// line keeps the last answer). A session that ended lands on the sign-in.
-function searchVpnWatch(view, status, vpn, paint, landing) {
+// Whether one exit's status says the service is checking its tunnel: a check
+// running now (`checking`), or none finished since its configuration was
+// saved (`tunnel` checking).
+function searchVpnExitChecking(e) {
+    return !!e && (e.checking === true || e.tunnel === "checking");
+}
+
+// Whether a VPN status read says any exit's tunnel is being checked.
+function searchVpnChecking(vpn) {
+    const exits = searchVpnExits(vpn);
+    return !!exits && exits.some(searchVpnExitChecking);
+}
+
+// While the last read says any exit's tunnel is being checked, re-read the VPN
+// status every SEARCH_LIST_POLL_MS and repaint just the status lines (the add
+// form below keeps what the operator is typing); stop at the first read that
+// says every check is over, when the list has left the page, or when a read
+// fails (the lines keep the last answer). A session that ended lands on the
+// sign-in.
+function searchVpnWatch(view, list, vpn, paint, landing) {
     clearInterval(searchVpnPoll);
     searchVpnPoll = null;
     if (!searchVpnChecking(vpn)) return;
@@ -9470,55 +9521,137 @@ function searchVpnWatch(view, status, vpn, paint, landing) {
             clearInterval(timer);
             if (searchVpnPoll === timer) searchVpnPoll = null;
         };
-        if (searchVpnPoll !== timer || !view.isConnected || !status.isConnected) return halt();
+        if (searchVpnPoll !== timer || !view.isConnected || !list.isConnected) return halt();
         if (reading) return undefined;
         reading = true;
         const { status: code, body } = await searchGet("/broker/search/vpn");
         reading = false;
-        if (searchVpnPoll !== timer || !view.isConnected || !status.isConnected) return halt();
+        if (searchVpnPoll !== timer || !view.isConnected || !list.isConnected) return halt();
         if (code === 401) {
             halt();
             return renderMgmtLogin(view, landing);
         }
         if (code !== 200 || !body.ok || !body.result) return halt();
-        paint(body.result, null);
+        paint(body.result);
         if (!searchVpnChecking(body.result)) halt();
         return undefined;
     }, SEARCH_LIST_POLL_MS);
     searchVpnPoll = timer;
 }
 
-// VPN: the status first, Remove beside it; then the two ways in, switched by
-// a pair of radio buttons — the WireGuard configuration file (pasted, or read
-// from a local file into the box by "Choose file…": nothing leaves the
-// browser until Save) or its fields typed by hand — and one Save. The keys
-// are secrets like the sign-in token: password fields (the file's box is
-// emptied too) cleared once a save is answered, never filled from a reply.
+// VPN: the exits in list order, each with its name, its status line and Up,
+// Down, Replace configuration and Remove; a line on what the order means;
+// then the add form (searchVpnExitForm). Up and Down send the whole new order.
 function searchVpnSection(view, vpn, vpnErr, flash) {
     const landing = view.__rsRender || renderSearchInto;
-    const status = el("div", { class: "mgmt-row mgmt-infra-row searchsvc-vpn-status" }, []);
-    // The status line from one read (`v` null: `err`, or unavailable), Remove
-    // beside it while a configuration is stored.
-    const paintStatus = (v, err) => {
-        status.replaceChildren(...(v ? searchVpnStatusParts(v)
-            : [err ? el("span", { class: "mgmt-reviewer-err" }, [err])
+    const exits = searchVpnExits(vpn);
+    const names = (exits || []).map((e) => String((e && e.name) || ""));
+    const form = searchVpnExitForm(view, landing);
+    const list = el("div", { class: "searchsvc-vpn-exits" }, []);
+    const listErr = el("span", { class: "mgmt-reviewer-err" }, []);
+    // Each exit's status line by name: what the re-read repaints.
+    const statusOf = {};
+    const paint = (v) => {
+        for (const e of searchVpnExits(v) || []) {
+            const line = statusOf[String((e && e.name) || "")];
+            if (line) line.replaceChildren(...searchVpnStatusParts(e));
+        }
+    };
+    // [button, disabled at rest] for every Up and Down: all off while an
+    // order is being saved.
+    const moves = [];
+    let ordering = false;
+    const move = async (i, by) => {
+        if (ordering || i + by < 0 || i + by >= names.length) return undefined;
+        const order = names.slice();
+        [order[i], order[i + by]] = [order[i + by], order[i]];
+        ordering = true;
+        for (const [b] of moves) b.disabled = true;
+        listErr.textContent = "";
+        const { status: code, body } = await mcpPost("/broker/search/vpn-order", { names: order });
+        ordering = false;
+        for (const [b, edge] of moves) b.disabled = edge;
+        const redirect = mgmtStatusRedirect(view, code, landing);
+        if (redirect) return redirect();
+        if (code !== 200 || !body.ok) {
+            listErr.textContent = code === 200 ? mgmtErrText(body) : "Connection failed.";
+            return undefined;
+        }
+        searchFlash = { where: "vpn", text: "The order of the exits is saved." };
+        return rerenderView(view);
+    };
+    // A stored exits file the service cannot use: its reason, never "no exit is
+    // stored" (the add form stays: saving an exit replaces the file).
+    const damaged = exits && vpn.error ? String(vpn.error) : "";
+    if (!exits) {
+        list.appendChild(el("div", { class: "mgmt-row mgmt-infra-row" }, [
+            vpnErr ? el("span", { class: "mgmt-reviewer-err" }, [vpnErr])
                    : el("span", { class: "type-badge" }, ["unavailable"])]));
-        if (!v || !v.configured) return;
+    } else if (damaged) {
+        list.appendChild(el("div", { class: "mgmt-row mgmt-infra-row searchsvc-vpn-damaged" }, [
+            el("span", { class: "mgmt-reviewer-err" }, [damaged])]));
+    } else if (!exits.length) {
+        list.appendChild(el("div", { class: "mgmt-row mgmt-infra-row" }, [
+            el("span", { class: "state-stopped" }, [SEARCH_VPN_NO_EXIT])]));
+    }
+    (exits || []).forEach((e, i) => {
+        const name = names[i];
+        const status = el("div", { class: "searchsvc-vpn-status" }, searchVpnStatusParts(e || {}));
+        statusOf[name] = status;
+        const up = el("button", { class: "btn-small" }, ["Up"]);
+        up.disabled = i === 0;
+        up.onclick = () => move(i, -1);
+        const down = el("button", { class: "btn-small" }, ["Down"]);
+        down.disabled = i === exits.length - 1;
+        down.onclick = () => move(i, 1);
+        moves.push([up, up.disabled], [down, down.disabled]);
+        const replace = el("button", { class: "btn-small" }, ["Replace configuration"]);
+        replace.onclick = () => form.replace(name);
         const remove = el("button", { class: "btn-small" }, ["Remove"]);
         remove.onclick = () => mcpConfirmDialog(view, {
-            title: "Remove the VPN configuration",
-            text: "The stored VPN configuration, its keys included, is deleted from this "
-                + "machine and the tunnel is closed. The MCP server search-vpn leaves the "
-                + "MCP server list until a configuration is stored again.",
+            title: "Remove the exit " + name,
+            text: "The exit " + name + "'s configuration, its keys included, is deleted "
+                + "from this machine and its tunnel is closed. When no exit is left, the "
+                + "MCP server search-vpn leaves the MCP server list until one is stored again.",
             confirmLabel: "Remove",
             path: "/broker/search/vpn-clear",
-            payload: {},
-            onOk: () => { searchFlash = { where: "vpn", text: "The VPN configuration is removed." }; },
+            payload: { name },
+            onOk: () => { searchFlash = { where: "vpn", text: "The exit " + name + " is removed." }; },
         });
-        status.appendChild(remove);
-    };
-    paintStatus(vpn, vpnErr);
-    searchVpnWatch(view, status, vpn, paintStatus, landing);
+        list.appendChild(el("div", { class: "mgmt-row mgmt-infra-row searchsvc-vpn-exit" }, [
+            el("span", { class: "searchsvc-vpn-name" }, [name]),
+            status,
+            el("span", { class: "searchsvc-vpn-acts" }, [up, down, replace, remove]),
+        ]));
+    });
+    searchVpnWatch(view, list, vpn, paint, landing);
+    return el("div", { class: "mgmt-infra searchsvc-vpn" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["VPN"]),
+        el("div", { class: "mgmt-settings-hint" }, [SEARCH_VPN_ORDER_HINT]),
+        list,
+        el("div", { class: "searchsvc-vpn-list-err" }, [listErr]),
+        searchFlashEl("vpn", flash),
+        form.node,
+        el("div", { class: "mgmt-settings-hint" }, [SEARCH_VPN_HINT]),
+    ]);
+}
+
+// The VPN section's add form: the exit's name, then the two ways in, switched
+// by a pair of radio buttons — the WireGuard configuration file (pasted, or
+// read from a local file into the box by "Choose file…": nothing leaves the
+// browser until Save) or its fields typed by hand — and one Save. A new name
+// is added at the end of the list. Replace configuration (an exit's row)
+// fills the name in and fixes it; Cancel goes back to adding. The keys are
+// secrets like the sign-in token: password fields (the file's box is emptied
+// too) cleared once a save is answered, never filled from a reply.
+// Returns {node, replace(name)}.
+function searchVpnExitForm(view, landing) {
+    const title = el("div", { class: "searchsvc-vpn-add-title" }, []);
+    const nameIn = el("input", {
+        type: "text", class: "searchsvc-input", spellcheck: "false", autocomplete: "off",
+    });
+    const nameRow = el("div", { class: "mgmt-row mgmt-infra-row searchsvc-form" }, [
+        searchCell("exit name", nameIn)]);
     // The way in: the configuration file (the default) or by hand.
     let mode = "file";
     const radio = (key, label) => {
@@ -9582,16 +9715,34 @@ function searchVpnSection(view, vpn, vpnErr, flash) {
         for (const [key, , secret] of SEARCH_VPN_FIELDS) if (secret) inputs[key].value = "";
     };
     const save = el("button", { class: "btn-small" }, ["Save"]);
+    const cancel = el("button", { class: "btn-small", type: "button" }, ["Cancel"]);
+    const acts = el("div", { class: "mgmt-row mgmt-infra-row" }, []);
+    // The exit being replaced (its name fixed in the field), or null: adding.
+    let replacing = null;
+    const setTarget = (name) => {
+        replacing = name;
+        nameIn.value = name || "";
+        nameIn.disabled = !!name;
+        title.textContent = name ? "Replace the configuration of " + name : "Add exit";
+        acts.replaceChildren(...(name ? [save, cancel, errEl] : [save, errEl]));
+        errEl.textContent = "";
+    };
+    setTarget(null);
+    cancel.onclick = () => setTarget(null);
     let busy = false;
     save.onclick = async () => {
         if (busy) return;
+        // Replacing: the exit's own name, whatever the field holds.
+        const name = replacing !== null ? replacing : nameIn.value.trim();
+        if (!name) { errEl.textContent = "Name the exit first."; return; }
+        if (!SEARCH_VPN_EXIT_NAME_RE.test(name)) { errEl.textContent = SEARCH_VPN_EXIT_NAME_RULE; return; }
         let payload;
         if (mode === "file") {
             if (!conf.value.trim()) {
                 errEl.textContent = "Paste the configuration file, or choose it, first.";
                 return;
             }
-            payload = { config: conf.value };
+            payload = { name, config: conf.value };
         } else {
             const manual = {};
             for (const [key, , , optional] of SEARCH_VPN_FIELDS) {
@@ -9606,8 +9757,9 @@ function searchVpnSection(view, vpn, vpnErr, flash) {
                 }
                 manual.keepalive = Number(manual.keepalive);
             }
-            payload = { manual };
+            payload = { name, manual };
         }
+        const replaced = replacing !== null;
         busy = true;
         save.disabled = true;
         errEl.textContent = "";
@@ -9618,23 +9770,23 @@ function searchVpnSection(view, vpn, vpnErr, flash) {
         const redirect = mgmtStatusRedirect(view, code, landing);
         if (redirect) return redirect();
         if (code !== 200 || !body.ok) {
-            // The service's refusal (not WireGuard, a missing key, …) as it said it.
+            // The service's refusal (not WireGuard, a missing key, a bad name, …) as it said it.
             errEl.textContent = code === 200 ? mgmtErrText(body) : "Connection failed.";
             return;
         }
-        searchFlash = { where: "vpn", text: "The VPN configuration is stored." };
+        searchFlash = { where: "vpn", text: replaced ? "The configuration of " + name + " is replaced."
+                                                     : "The exit " + name + " is stored." };
         rerenderView(view);
     };
-    return el("div", { class: "mgmt-infra searchsvc-vpn" }, [
-        el("h3", { class: "mgmt-infra-title" }, ["VPN"]),
-        status,
-        searchFlashEl("vpn", flash),
+    const node = el("div", { class: "searchsvc-vpn-add" }, [
+        title,
+        nameRow,
         el("div", { class: "mgmt-row mgmt-infra-row searchsvc-vpn-modes" }, [fileRadio.node, handRadio.node]),
         filePane,
         handPane,
-        el("div", { class: "mgmt-row mgmt-infra-row" }, [save, errEl]),
-        el("div", { class: "mgmt-settings-hint" }, [SEARCH_VPN_HINT]),
+        acts,
     ]);
+    return { node, replace: (name) => setTarget(name) };
 }
 
 const SEARCH_SIDEBAR_HINT =
@@ -9935,13 +10087,15 @@ function searchRunsSection(view) {
 
 // One work entry, as plain text (it carries text from the pages the search
 // read): a tool call on one line, a piece of the agent's writing as a block.
+// A VPN search's call names its exit beside the tier.
 function searchWorkEntry(w) {
     if (w && w.kind === "text") {
         return el("div", { class: "searchsvc-work-text" }, [String(w.text || "")]);
     }
     const o = w || {};
     const f = (v) => (v === null || v === undefined ? "" : String(v));
-    const line = `${searchTimeOfDay(o.ts)}  ${f(o.tier)} · ${f(o.tool)}  ${f(o.target)}`
+    const via = o.exit ? " via " + f(o.exit) : "";
+    const line = `${searchTimeOfDay(o.ts)}  ${f(o.tier)}${via} · ${f(o.tool)}  ${f(o.target)}`
         + ` → ${f(o.outcome)}${o.detail ? " " + f(o.detail) : ""}`;
     return el("div", { class: "searchsvc-work-tool" }, [line]);
 }
@@ -10039,12 +10193,13 @@ function searchReportLines(prefix, item, first, second) {
         .filter((l, i) => i === 0 || l);
 }
 
-// A report's sources (numbered as the agent listed them) and tiers, as lines.
+// A report's sources (numbered as the agent listed them; a VPN search's name
+// the exit they came through) and tiers, as lines.
 function searchSourceLines(r) {
     return (Array.isArray(r.sources) ? r.sources : []).map((s, i) =>
         searchReportLines(`[${s && s.n ? s.n : i + 1}] `, s,
                           (o) => [o.title, o.address, o.doi && "DOI " + o.doi,
-                                  o.file && "file " + o.file],
+                                  o.file && "file " + o.file, o.exit && "via " + o.exit],
                           (o) => [o.contributed, o.other]));
 }
 
@@ -10283,9 +10438,9 @@ function searchAskPane(view, settings, flash, vpn) {
     const landing = view.__rsRender || renderSearchInto;
     const cur = settings ? (settings.settings || settings.defaults || {}) : {};
     const searcherName = cur.searcher && cur.searcher.name ? String(cur.searcher.name) : "";
-    // The Through the VPN tick: only while the VPN version is on and a
-    // configuration is stored (the search-vpn server's searches), off at first.
-    const vpnReady = cur.vpn === true && !!(vpn && vpn.configured === true);
+    // The Through the VPN tick: only while the VPN version is on and an exit
+    // is stored (the search-vpn server's searches), off at first.
+    const vpnReady = cur.vpn === true && (searchVpnExits(vpn) || []).length > 0;
     const viaVpn = el("input", { type: "checkbox" });
     viaVpn.checked = false;
     // The conversations read's own error (its stored conversations cannot be
