@@ -6,7 +6,10 @@
 # RS_ROLE_EFFORT for Claude, RS_ROLE_THINKING for pi; empty = none named, so
 # the agent starts on its own model), then this text. It starts the plain
 # agent on that model with the role's skill as its first prompt; `claude`
-# and `pi` themselves are never changed.
+# and `pi` themselves are never changed. It names the role to the agent's
+# start in RS_SESSION_ROLE (plan, or work:<package>), so the start takes
+# nothing itself (a plain session's start takes the only free package) and
+# the skill takes the role.
 
 me=${0##*/}
 if [ "$RS_ROLE" = work ]; then
@@ -31,13 +34,16 @@ if [ "$RS_ROLE" = work ]; then
         exit 2
     fi
     skill="rs-work $1"
+    RS_SESSION_ROLE="work:$1"
 else
     if [ $# -ne 0 ]; then
         echo "usage: $me (it takes no arguments)" >&2
         exit 2
     fi
     skill=rs-plan
+    RS_SESSION_ROLE=plan
 fi
+export RS_SESSION_ROLE
 set --
 if [ "$RS_ROLE_AGENT" = claude ]; then
     [ -z "$RS_ROLE_MODEL" ] || set -- "$@" --model "$RS_ROLE_MODEL"

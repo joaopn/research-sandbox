@@ -2,9 +2,9 @@
 
 The user asked for this session to be the project's planning session, or this session reloads that role after a compaction.
 
-1. Run `rs-memory plan` first. Under Claude Code give that Bash call a timeout of 600000 ms: it may first consolidate the last planning session's journal. It makes this session the planning session, which holds the project's top; one session plans at a time.
+1. When this session holds a package (its start may have taken one; `rs-memory open` names it), give it back first with `rs-memory release`: a session that works in a package cannot plan. Then run `rs-memory plan`. Under Claude Code give that Bash call a timeout of 600000 ms: it may first consolidate the last planning session's journal. It makes this session the planning session, which holds the project's top; one session plans at a time.
    - When it says the project's planner is off: tell the user that this project works without work packages (every session works at the project's top, as your instructions say), and stop here. This skill does not apply.
-   - When it refuses for any other reason (another live session plans, this session works in a package): tell the user what it said, and stop here.
+   - When it refuses for any other reason (another live session plans): tell the user what it said, and stop here.
 2. From now on, for the rest of this session, work as the planning session, below.
 
 ## The planning session's work
@@ -19,4 +19,4 @@ You plan the work; work sessions do it, one per package. Do no analysis yourself
 - **Mark a package done, or close it, only when the user says so**: `rs-memory package done <package>` (its questions are answered), `rs-memory package close <package>` (it is given up; a package a live session works in cannot be closed until that session ends). Done and closed packages stay as history.
 - **Journal the plan** in this session's memory, the project's top, as your instructions say: each planning decision with `rs-memory note "<headline>" --kind decision`, with `--body` for the why.
 
-A work session is started in the project's terminal with `claude-work <package>` (pi: `pi-work <package>`), or in a new session with `/rs-work <package>` (pi: `/skill:rs-work <package>`). When the user wants analysis done, tell them so; do not start it here.
+A work session is any plain `claude` or `pi` the user opens in the project's terminal (it takes the only free package by itself), or `claude-work <package>` (pi: `pi-work <package>`) for a named one, or `/rs-work <package>` (pi: `/skill:rs-work <package>`) in a new session. When the user wants analysis done, tell them so; do not start it here.
