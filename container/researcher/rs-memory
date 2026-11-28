@@ -158,14 +158,30 @@ the referee's model and a re-run's folder are the workspace's in a package
 too. RS_MEMORY_DIR naming a package's memory is refused: a package's memory
 is reached by taking the package. Taking a memory first consolidates its
 last session when that one ended without `close` (as `open` does without
-the planner); `open` of a session that holds nothing lists the packages,
-names the role skills (/rs-plan, /rs-work) and their shortcuts, and
-consolidates nothing; `open` of a session that holds something names its
-role and the skill to invoke again when that skill's text is not in
-context (after a compaction); `close` and `close --hook` act on the memory the
-session holds, then give it back. Only the planning session adds a package,
-changes a charter (journalled in the package as an entry naming the
-sections that changed, so its session sees it at its next `open`) or
+the planner). A session that holds nothing is a work session without a
+package: its start (`open --hook`) takes the only open package no live
+session holds (the same take as `take`, its catch-up included), or lists
+the free ones for the agent to ask which, or says there is nothing to work
+on (counting the done, closed and held ones); it never takes the top. A
+session started by a role shortcut (RS_SESSION_ROLE, "plan" or
+"work:<package>") takes nothing at its start: the shortcut's skill does.
+A hold whose recorded agent process (pid and start time) is this
+session's own, under an earlier session id (Claude Code's /clear, pi's
+/new), is this session's: its start takes it again under the new id, and
+`take` and `plan` treat it as this session's. A plain `open` of a session
+that holds nothing lists the packages the same way and takes nothing;
+`open` of a session that holds something names its role (the planning
+session: the skill to invoke again when its text is not in context, after
+a compaction; a work session's role is in its standing instructions).
+`open --hook --agent claude` prints Claude Code's SessionStart JSON when
+it has a line for the user (`systemMessage`, the text as
+`additionalContext`) and the text alone otherwise; `--agent pi` prints
+{"line": <line or null>, "text": <text>} for RS's pi extension. The line
+names what the session holds or took, the free packages, or that there is
+nothing to work on; with the planner off there is none. `close` and `close
+--hook` act on the memory the session holds, then give it back. Only the
+planning session adds a package, changes a charter (journalled in the
+package as an entry naming the sections that changed, so its session sees it at its next `open`) or
 closes a package; the package's own session or the planning session marks
 it done. A done or closed package can no longer be taken; a closed one takes
 no writes. The top's front page lists the packages, each linked to its own.
@@ -1784,17 +1800,22 @@ def take_lines(what: str, line: "str | None") -> str:
     return (f"{what}\n\n" + (open_text(line)))
 
 
-def cmd_plan(a) -> None:
-    """Take the project's top: this session plans (one at a time)."""
-    refuse_under_guard("take the project's top")
-    require_planner("rs-memory plan")
-    src = need_session("plans")
+def same_agent(h: "dict | None", holder: dict) -> bool:
+    """Whether a recorded holder is this session's own agent process (its pid
+    with the same start time) under another session id: Claude Code's /clear
+    and pi's /new start a new session id in the same agent process."""
+    return h is not None and h["pid"] == holder["pid"] and h["start"] == holder["start"]
+
+
+def take_top(src: "tuple[str, str]", agent: "str | None") -> str:
+    """Take the project's top for this session (the planning session, one at
+    a time): the lock, the holder record, the catch-up. Returns the text."""
     sid = src[1]
     holder = holder_record(src)
-    agent = a.agent or detect_agent(quiet=True)
     with Lock(d=top_mem_dir()):
         h = read_planning()
-        if h is not None and h["session"] != sid and holder_alive(h):
+        if (h is not None and h["session"] != sid and holder_alive(h)
+                and not same_agent(h, holder)):
             raise Refused(f"another session plans: session {h['session']} holds the project's top "
                           f"since {fmt_time(h['since'])}, and one session plans at a time. Ask "
                           "the user to end that one first, or take a package (rs-memory take "
@@ -1810,22 +1831,28 @@ def cmd_plan(a) -> None:
         SESSION["binding"], SESSION["lost"] = ("top", None), None
         refresh_pages()
     line = catch_up(agent)
-    print(take_lines(f"This session now plans: it holds the project's top ({top_mem_dir()}). "
-                     "Define the task with the user and write the packages and their charters "
-                     "with rs-memory package add (rs-memory --help lists the package verbs). "
-                     "rs-memory release gives the top back.", line), end="")
+    return take_lines(f"This session now plans: it holds the project's top ({top_mem_dir()}). "
+                      "Define the task with the user and write the packages and their charters "
+                      "with rs-memory package add (rs-memory --help lists the package verbs). "
+                      "rs-memory release gives the top back.", line)
 
 
-def cmd_take(a) -> None:
-    """Take a package: this session works in it, and only in it."""
-    refuse_under_guard("take a package")
-    require_planner("rs-memory take")
-    src = need_session("takes the package")
+def cmd_plan(a) -> None:
+    """Take the project's top: this session plans (one at a time)."""
+    refuse_under_guard("take the project's top")
+    require_planner("rs-memory plan")
+    src = need_session("plans")
+    print(take_top(src, a.agent or detect_agent(quiet=True)), end="")
+
+
+def take_package(src: "tuple[str, str]", name: str, agent: "str | None") -> str:
+    """Take a package for this session (one session works in a package at a
+    time): the lock, the holder record, the catch-up in the package's memory.
+    Returns the text."""
     sid = src[1]
-    name = valid_package_name(a.package)
+    name = valid_package_name(name)
     mem = package_memory(name)
     holder = holder_record(src)
-    agent = a.agent or detect_agent(quiet=True)
     with working_in(mem):
         with Lock():
             st = read_status(name)
@@ -1833,7 +1860,8 @@ def cmd_take(a) -> None:
                 raise Refused(f"package {name} is {st['state']}: it is kept as history and is not "
                               "taken again. rs-memory open lists the open ones")
             h = st["holder"]
-            if h is not None and h["session"] != sid and holder_alive(h):
+            if (h is not None and h["session"] != sid and holder_alive(h)
+                    and not same_agent(h, holder)):
                 raise Refused(f"package {name} is being worked on in another live session "
                               f"({h['session']}, since {fmt_time(h['since'])}); one session "
                               "works in a package at a time. Take another package, or ask the "
@@ -1853,11 +1881,18 @@ def cmd_take(a) -> None:
                 SESSION["binding"], SESSION["lost"] = ("package", name), None
             refresh_pages()
         line = catch_up(agent)
-        text = take_lines(f"This session now works in package {name}. Work only inside its "
+        return take_lines(f"This session now works in package {name}. Work only inside its "
                           f"charter, {package_dir(name) / CHARTER_FILE}; bring an idea outside it "
                           "to the user as a suggestion. rs-memory release gives the package back.",
                           line)
-    print(text, end="")
+
+
+def cmd_take(a) -> None:
+    """Take a package: this session works in it, and only in it."""
+    refuse_under_guard("take a package")
+    require_planner("rs-memory take")
+    src = need_session("takes the package")
+    print(take_package(src, a.package, a.agent or detect_agent(quiet=True)), end="")
 
 
 def release_hold(sid: str, holds: object) -> str:
@@ -2029,22 +2064,68 @@ def cmd_package_list(a) -> None:
            "package below is kept as history.\n\n") + packages_text(SESSION["sid"]))
 
 
-def open_listing_text() -> str:
-    """open, with the planner on, for a session that holds nothing: the
-    packages, and what to do."""
+def package_counts(sid: "str | None") -> "tuple[list[str], dict[str, int]]":
+    """The open packages no live session holds (by name), and how many of the
+    others are done, closed, held by another live session, or cannot be read."""
+    entries, problems = package_entries()
+    free: "list[str]" = []
+    counts = {"done": 0, "closed": 0, "held": 0, "unreadable": len(problems)}
+    for e in entries:
+        st = e["status"]
+        if st["state"] != "open":
+            counts[st["state"]] += 1
+        elif holder_alive(st["holder"]) and st["holder"]["session"] != sid:
+            counts["held"] += 1
+        else:
+            free.append(e["name"])
+    return free, counts
+
+
+def counts_words(counts: "dict[str, int]") -> str:
+    """"2 packages done, 1 held by another session"; "no packages yet"."""
+    words = []
+    for key, what in (("done", "done"), ("closed", "closed"),
+                      ("held", "held by another session"),
+                      ("unreadable", "that rs-memory cannot read")):
+        n = counts[key]
+        if n:
+            words.append(f"{n} package{'' if n == 1 else 's'} {what}" if not words
+                         else f"{n} {what}")
+    return ", ".join(words) if words else "no packages yet"
+
+
+def role_commands(agent: "str | None") -> "dict[str, str]":
+    """The planning shortcut and the two role skills as the user types them
+    under this agent."""
+    if agent == "pi":
+        return {"plan_cmd": "pi-plan", "plan": "/skill:rs-plan", "work": "/skill:rs-work"}
+    return {"plan_cmd": "claude-plan", "plan": "/rs-plan", "work": "/rs-work"}
+
+
+def open_listing_text(note: "str | None" = None) -> str:
+    """open, with the planner on, for a session that holds nothing: it is a
+    work session without a package yet; the free packages, or that there is
+    nothing to work on, and what to do."""
+    free, counts = package_counts(SESSION["sid"])
+    if free:
+        what = (f"{len(free)} package{' is' if len(free) == 1 else 's are'} open and free: "
+                + ", ".join(free) + ". Open by asking the user which one to take, then invoke "
+                "/rs-work <package> (pi: /skill:rs-work <package>), which runs rs-memory take "
+                "<package>. Under Claude Code give that Bash call a timeout of 600000 ms: it "
+                "first consolidates that package's last session when the session ended without "
+                "closing.")
+    else:
+        what = (f"Nothing to work on: {counts_words(counts)}. Tell the user so, and that "
+                "planning packages is theirs to start: claude-plan (pi: pi-plan) in the "
+                "project's terminal, or /rs-plan (pi: /skill:rs-plan) in this session when they "
+                "ask for it.")
     parts = ["# rs-memory: work packages\n"
-             "This project works in work packages (its planner is on), and this session holds "
-             "none yet: its memory is not chosen, so nothing was read or consolidated. Open by "
-             "asking the user which package to take, or whether this session plans. Then invoke "
-             "the role's skill, which takes it and says how the role works:\n"
-             "- to plan (define the task with the user, add packages and their charters): "
-             "/rs-plan (pi: /skill:rs-plan), which runs rs-memory plan\n"
-             "- to work in one package, and only in it: /rs-work <package> (pi: /skill:rs-work "
-             "<package>), which runs rs-memory take <package>\n"
-             "Under Claude Code give either call a Bash timeout of 600000 ms: it first "
-             "consolidates that memory's last session when the session ended without closing. "
-             "In the project's terminal, claude-plan and claude-work <package> (pi: pi-plan and "
-             "pi-work <package>) start a new session in either role, on the role's model."]
+             "This project works in work packages (its planner is on), and this session is a "
+             "work session that holds no package yet: its memory is not chosen, so nothing was "
+             "read or consolidated. " + what + " This session plans only when the user asks it "
+             "to (/rs-plan, pi: /skill:rs-plan)."]
+    if note:
+        parts.append(note)
     if SESSION["lost"]:
         parts.append(SESSION["lost"][0].upper() + SESSION["lost"][1:] + ".")
     parts.append(packages_text(SESSION["sid"]))
@@ -2054,9 +2135,118 @@ def open_listing_text() -> str:
     return "\n\n".join(parts) + "\n"
 
 
-# What open says to a session that holds something about its role's skill:
-# the skill's text is the role, and a compaction drops it (open runs again
-# after every compaction, under both agents).
+# The role a session-role shortcut (claude-plan, claude-work <package>,
+# pi-plan, pi-work <package>) starts its agent in: "plan" or
+# "work:<package>". The shortcut's first prompt, the role's skill, takes it,
+# so the start of such a session takes nothing itself.
+ROLE_ENV = "RS_SESSION_ROLE"
+
+
+def shortcut_role() -> "tuple[str, str | None] | None":
+    """The role ROLE_ENV names: ("plan", None) or ("work", package); None
+    when it is not set."""
+    raw = os.environ.get(ROLE_ENV)
+    if not raw:
+        return None
+    if raw == "plan":
+        return ("plan", None)
+    if raw.startswith("work:") and PACKAGE_NAME_RE.match(raw[len("work:"):]):
+        return ("work", raw[len("work:"):])
+    raise Refused(f"{ROLE_ENV} is set to {single_line(raw)!r}, which is no role a session-role "
+                  "shortcut sets (plan, or work:<package>); rs-memory sets it only in those "
+                  f"shortcuts. Start the agent without {ROLE_ENV}")
+
+
+def session_start(agent: "str | None") -> "tuple[str | None, str]":
+    """open --hook, with the planner on, for a session that holds nothing:
+    (the line for the user, the text for the model). A session started by a
+    role shortcut takes nothing; a hold of this session's own agent process
+    under an earlier session id is this session's (taken again under its
+    id); otherwise the only open, free package is taken, and several or none
+    are listed. The project's top is never taken here unless this agent
+    process already holds it."""
+    cmds = role_commands(agent)
+    src = session_source()
+    if src is None:
+        return None, open_listing_text()
+    role = shortcut_role()
+    if role is not None:
+        if role[0] == "plan":
+            return (f"Planning session: {cmds['plan']} takes the project's top.",
+                    open_listing_text("This session was started as the planning session "
+                                      f"({cmds['plan_cmd']}): its first prompt, the rs-plan "
+                                      "skill, takes the project's top; this start took nothing."))
+        name = role[1]
+        return (f"Work session on package {name}: {cmds['work']} {name} takes it.",
+                open_listing_text(f"This session was started as the work session of package "
+                                  f"{name}: its first prompt, the rs-work skill, takes it; this "
+                                  "start took nothing."))
+    holder = holder_record(src)
+    try:
+        h = read_planning()
+    except Refused:
+        h = None
+    if h is not None and holder_alive(h) and same_agent(h, holder):
+        text = take_top(src, agent)
+        return ("Planning session.",
+                "This session's agent already held the project's top under an earlier session "
+                "id (a /clear or a new session in the same agent), so this session is the "
+                "planning session: " + ROLE_RELOAD.format(skill="rs-plan", cmd="rs-plan")
+                + "\n\n" + text)
+    entries, _problems = package_entries()
+    for e in entries:
+        ph = e["status"]["holder"]
+        if (e["status"]["state"] == "open" and ph is not None and ph["session"] != src[1]
+                and holder_alive(ph) and same_agent(ph, holder)):
+            name = e["name"]
+            text = take_package(src, name, agent)
+            return (f"Work session on package {name}.",
+                    f"This session's agent already held package {name} under an earlier session "
+                    "id (a /clear or a new session in the same agent), so this session works in "
+                    "it again.\n\n" + text)
+    free, _counts = package_counts(src[1])
+    note = None
+    if len(free) == 1:
+        name = free[0]
+        try:
+            text = take_package(src, name, agent)
+        except Refused as e:
+            note = f"This session's start tried to take package {name} and could not: {e}."
+        else:
+            problems = take_page_problems()
+            head = (f"This session is a work session, and its start took package {name}, the only "
+                    "open package no live session works in. Your first reply goes on from that: "
+                    f"tell the user, read the charter ({package_dir(name) / CHARTER_FILE}) and "
+                    "ask what to work on in it.")
+            if problems:
+                head += "\n\n## The PI's pages\n" + "\n".join(f"- {p}" for p in problems)
+            return (f"Work session on package {name} (its charter: {PACKAGES_DIR}/{name}/"
+                    f"{CHARTER_FILE}). To plan more packages: {cmds['plan_cmd']}.",
+                    head + "\n\n" + text)
+    free, counts = package_counts(src[1])
+    if free:
+        line = (f"Work session: {len(free)} package{' is' if len(free) == 1 else 's are'} open "
+                f"and free ({', '.join(free)}); the agent will ask which one to take. To plan "
+                f"more packages: {cmds['plan_cmd']}.")
+    else:
+        more = "more " if any(counts.values()) else ""
+        line = (f"Nothing to work on: {counts_words(counts)}. To plan {more}packages, run "
+                f"{cmds['plan_cmd']}, or {cmds['plan']} in this session.")
+    return line, open_listing_text(note)
+
+
+def held_line() -> "str | None":
+    """The line for the user at the start of a session that holds something."""
+    b = SESSION["binding"]
+    if not SESSION["planner"] or b is None:
+        return None
+    return "Planning session." if b[0] == "top" else f"Work session on package {b[1]}."
+
+
+# What open says to the planning session about its role's skill: the skill's
+# text is the role, and a compaction drops it (open runs again after every
+# compaction, under both agents). A work session's role is in the session's
+# standing instructions, which a compaction keeps.
 ROLE_RELOAD = ("Its role is the {skill} skill's text: when that text is not in your context "
                "(after a compaction, for one), invoke the skill again, /{cmd} (pi: "
                "/skill:{cmd}), and go on in the role.")
@@ -2075,9 +2265,9 @@ def open_head() -> "str | None":
                 "package charter, package done and package close.\n\n"
                 + packages_text(SESSION["sid"]))
     name = SESSION["binding"][1]
-    return (f"## This session's work package: {name}\nThis session works in package {name}. "
-            + ROLE_RELOAD.format(skill="rs-work", cmd=f"rs-work {name}") +
-            f" Its folder is {package_dir(name)}, its "
+    return (f"## This session's work package: {name}\nThis session is the work session of "
+            f"package {name}, as your instructions' Work packages text says. Its folder is "
+            f"{package_dir(name)}, its "
             f"charter {package_dir(name) / CHARTER_FILE}: work only inside the charter, and bring "
             "an idea outside it to the user as a suggestion. Its analyses go under "
             f"{package_dir(name) / TASKS_DIR}/.")
@@ -4560,14 +4750,38 @@ def hook_text(text: str) -> str:
     return text
 
 
+def hook_output(agent: "str | None", line: "str | None", text: str) -> str:
+    """open --hook's output, for the agent that runs the start hook: the text
+    for the model (cut to the hook's limit) and the line for the user.
+    Claude Code (--agent claude): its SessionStart hook JSON, the line as
+    `systemMessage` (shown before any input) and the text as
+    `additionalContext`; with no line, the text alone, as plain output. pi
+    (--agent pi): {"line": line or null, "text": text}, for RS's extension,
+    which shows the line and gives the model the text. No agent named: the
+    text alone."""
+    text = hook_text(text)
+    if agent == "pi":
+        return json.dumps({"line": line, "text": text}) + "\n"
+    if agent == "claude" and line:
+        return json.dumps({"systemMessage": line,
+                           "hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                  "additionalContext": text}}) + "\n"
+    return text
+
+
 def cmd_open(a) -> None:
     if a.hook and under_guard():
         return
-    # With the planner on, a session that holds nothing has no memory yet:
-    # it is shown the packages, and nothing is consolidated or written.
+    # With the planner on, a session that holds nothing is a work session
+    # without a package: its start takes the only free one, or lists them;
+    # a plain open lists them. Its memory is not chosen before a take, so
+    # nothing is consolidated or written otherwise.
     if SESSION["planner"] and SESSION["binding"] is None:
-        text = open_listing_text()
-        sys.stdout.write(hook_text(text) if a.hook else text)
+        if a.hook:
+            line, text = session_start(a.agent or detect_agent(quiet=True))
+            sys.stdout.write(hook_output(a.agent, line, text))
+        else:
+            sys.stdout.write(open_listing_text())
         return
     # A consolidation or referee run reads only, and never starts another.
     consolidation = None
@@ -4582,7 +4796,7 @@ def cmd_open(a) -> None:
     if problems:
         text = ("## The PI's pages\n" + "\n".join(f"- {p}" for p in problems) + "\n\n" + text)
     if a.hook:
-        text = hook_text(text)
+        text = hook_output(a.agent, held_line(), text)
     sys.stdout.write(text)
 
 
@@ -5841,7 +6055,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hook", action="store_true", help="the quiet, capped form a start hook calls")
     p.add_argument("--agent", choices=("claude", "pi"),
                    help="the agent that runs a consolidation the last session still owes "
-                   "(default: the one this shell runs in)")
+                   "(default: the one this shell runs in); with --hook, also the agent whose "
+                   "start hook reads the output (Claude Code's hook JSON, or the JSON object "
+                   "RS's pi extension reads)")
     p.set_defaults(fn=cmd_open)
 
     p = sub.add_parser("note", help="append a journal entry")
@@ -6089,8 +6305,9 @@ def main(argv: "list[str] | None" = None) -> int:
     except Refused as e:
         print(f"rs-memory: {e}", file=sys.stderr)
         if getattr(a, "hook", False):
-            if a.fn is cmd_open:
-                print(f"rs-memory: {e}")    # the agent sees what is wrong
+            if a.fn is cmd_open:        # the agent sees what is wrong
+                sys.stdout.write(json.dumps({"line": None, "text": f"rs-memory: {e}"}) + "\n"
+                                 if a.agent == "pi" else f"rs-memory: {e}\n")
             return 0                    # a hook never fails the agent's session
         return 1
     return 0

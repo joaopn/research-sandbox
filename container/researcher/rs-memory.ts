@@ -4,11 +4,17 @@
 // folder's `extensions/` directory in a researcher project, where pi loads it by
 // itself.
 //
-// - The front page reaches the agent by itself: on the first run after a
-//   session starts (startup, /new, resume, fork, reload) and after every
-//   compaction, `rs-memory open --hook` is run and its output injected as a
-//   message, once (Claude Code gets the same through its SessionStart hook,
-//   which fires on every start, resume, clear and compaction). A compaction
+// - The front page reaches the agent by itself: when a session starts
+//   (startup, /new, resume, fork, reload) `rs-memory open --hook --agent pi`
+//   runs at once, its line for the user (with the planner on: the package
+//   the start took, the free ones, or that there is nothing to work on) is
+//   shown with ctx.ui.notify before any input, and its text for the model
+//   is injected as a message at the session's first run; after every
+//   compaction it runs again and its text is injected, once (Claude Code
+//   gets the same through its SessionStart hook, which fires on every
+//   start, resume, clear and compaction, and shows the line too). The
+//   command prints one JSON object, {"line": <line or null>, "text":
+//   <text>}; output that is not one is given to the model as it is. A compaction
 //   between turns of a run (agent_start .. agent_end: pi compacts there when
 //   the context fills), or one pi says it will retry after (willRetry, an
 //   overflow), is answered at once, steered in before the next model call;
@@ -73,6 +79,19 @@ export function toolEnv(env: Record<string, string | undefined>, sessionId: stri
 	return out;
 }
 
+// The open command's output read: its line for the user ("" when none) and
+// its text for the model. Output that is not the command's JSON object is
+// all text, as the command printed it.
+export function openParts(output: string): { line: string; text: string } {
+	try {
+		const o = JSON.parse(output);
+		if (o && typeof o === "object" && !Array.isArray(o) && typeof o.text === "string") {
+			return { line: typeof o.line === "string" ? o.line : "", text: o.text };
+		}
+	} catch { /* not the JSON object: all text */ }
+	return { line: "", text: output };
+}
+
 // The message a run starts with, or undefined when the tool had nothing to say.
 export function frontMessage(output: string): { customType: string; content: string; display: boolean } | undefined {
 	const text = output.trim();
@@ -109,13 +128,25 @@ export default function (pi: any) {
 	};
 	pi.on("agent_start", () => { inRun = true; });
 	pi.on("agent_end", () => { inRun = false; });
-	pi.on("session_start", (_e: any, ctx: any) => { idOf(ctx); pending = true; });
+	// The start's text, read at session_start and given at the first run;
+	// undefined: the next run reads it afresh (after a compaction).
+	let startText: string | undefined = undefined;
+	pi.on("session_start", (_e: any, ctx: any) => {
+		const id = idOf(ctx);
+		pending = true;
+		try {
+			const parts = openParts(openNow(id));
+			startText = parts.text;
+			if (parts.line) ctx?.ui?.notify?.(parts.line, "info");
+		} catch { /* never into pi */ }
+	});
 	pi.on("session_compact", (e: any, ctx: any) => {
 		const id = idOf(ctx);
+		startText = undefined;
 		if (!inRun && e?.willRetry !== true) { pending = true; return; }
 		pending = false;
 		try {
-			const message = frontMessage(openNow(id));
+			const message = frontMessage(openParts(openNow(id)).text);
 			if (message) pi.sendMessage(message, { deliverAs: "steer" });
 		} catch { /* never into pi */ }
 	});
@@ -124,7 +155,9 @@ export default function (pi: any) {
 		if (!pending) return undefined;
 		pending = false;
 		try {
-			const message = frontMessage(openNow(id));
+			const text = startText !== undefined ? startText : openParts(openNow(id)).text;
+			startText = undefined;
+			const message = frontMessage(text);
 			return message ? { message } : undefined;
 		} catch {
 			return undefined;

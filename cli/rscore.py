@@ -18751,7 +18751,12 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # Version 12: those instructions tell a session to load its role skill again
 # after a compaction (/rs-plan, /rs-work <package>), and rely on `rs-memory
 # open` naming the role of a session that holds something and saying so.
-MEMORY_KIT_VERSION = "12"
+# Version 13: with the planner on, a session's start (`rs-memory open --hook
+# --agent claude|pi`) takes the only free package, lists the free ones or
+# says there is nothing to work on, and prints a line for the user beside
+# the model's text (Claude's SessionStart JSON, a JSON object for the pi
+# extension); the instructions carry the work session's role.
+MEMORY_KIT_VERSION = "13"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")
@@ -18766,9 +18771,17 @@ MEMORY_LOG_CMD_SRC = SCRIPT_DIR / "container" / "researcher" / "log.md"
 # entry that applies to one kind of subagent, its matcher (matched by exact
 # command, never touching other entries).
 MEMORY_CLAUDE_HOOKS = (
-    # the front page into the context at every start, resume, clear and compaction
-    {"event": "SessionStart", "command": f"{MEMORY_TOOL} open --hook"},
+    # the front page into the context at every start, resume, clear and
+    # compaction; Claude's hook JSON when it has a line for the user
+    {"event": "SessionStart", "command": f"{MEMORY_TOOL} open --hook --agent claude"},
     {"event": "SessionEnd", "command": f"{MEMORY_TOOL} close --hook --agent claude"},
+)
+# The kit's own earlier entries, removed from Claude's settings when the kit
+# writes them (an entry whose only hook was one of these goes with it): the
+# start hook before version 13, which printed plain text only and would run
+# beside the new one.
+MEMORY_CLAUDE_RETIRED_HOOKS = (
+    {"event": "SessionStart", "command": f"{MEMORY_TOOL} open --hook"},
 )
 # A researcher project's own: an analyst that ends without its
 # write-up is held back once with a reminder (the command answers nothing on
@@ -18802,8 +18815,10 @@ MEMORY_KIT_AGENT_FAILED = (
     "the research memory could not be set up for {who} in this project (its settings "
     "or its /log command could not be written); stop the project and start it again")
 # One script for both agents, run as the agent user with HOME set: $1 is the
-# Claude hook entries as a JSON list, $2 the /log command's text, then the
-# agents. Claude: built-in memory off and the hooks merged into settings.json
+# Claude hook entries as a JSON list, $2 the /log command's text, $3 the
+# retired entries (MEMORY_CLAUDE_RETIRED_HOOKS) as a JSON list, then the
+# agents. Claude: built-in memory off, the retired entries removed and the
+# hooks merged into settings.json
 # (a `hooks` that is not an object, or an event that is not a list, fails the
 # write, never replaced), then the /log command into commands/; pi: the
 # extension from stdin into its extensions/ folder, then the /log command into
@@ -18815,6 +18830,12 @@ MEMORY_CLAUDE_JQ = (
     ' .autoMemoryEnabled = false'
     ' | .hooks = (if .hooks == null then {} elif (.hooks | type) == "object" then .hooks'
     ' else error("hooks is not an object") end)'
+    ' | reduce $retired[] as $r (.;'
+    ' if (.hooks[$r.event] | type) == "array" then .hooks[$r.event] |= [.[]'
+    ' | if (type == "object" and (.hooks | type) == "array"'
+    ' and any(.hooks[]; type == "object" and .command == $r.command))'
+    ' then (.hooks |= map(select((type == "object" and .command == $r.command) | not)))'
+    ' | select(.hooks | length > 0) else . end] else . end)'
     ' | reduce $hooks[] as $h (.;'
     ' .hooks[$h.event] = (if .hooks[$h.event] == null then [] elif (.hooks[$h.event] | type) == "array"'
     ' then .hooks[$h.event] else error("a hook event is not a list") end)'
@@ -18822,7 +18843,7 @@ MEMORY_CLAUDE_JQ = (
     ' else .hooks[$h.event] += [(if $h.matcher == null then {} else {"matcher": $h.matcher} end)'
     ' + {"hooks": [{"type": "command", "command": $h.command}]}] end)')
 MEMORY_KIT_SCRIPT = (
-    'hooks="$1"; logcmd="$2"; shift 2\n'
+    'hooks="$1"; logcmd="$2"; retired="$3"; shift 3\n'
     'cs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\n'
     'pf="$pd/extensions/rs-memory.ts"\n'
     'putlog() { f="$1/log.md"; rm -f "$f.rs-tmp" && mkdir -p "$1" '
@@ -18831,7 +18852,7 @@ MEMORY_KIT_SCRIPT = (
     'for a in "$@"; do\n'
     'if [ "$a" = claude ]; then\n'
     '  [ -f "$cs" ] || { echo claude=absent; continue; }\n'
-    f'  if [ "$(wc -c < "$cs")" -le {AGENT_SETTINGS_MAX_BYTES} ] && jq --argjson hooks "$hooks" '
+    f'  if [ "$(wc -c < "$cs")" -le {AGENT_SETTINGS_MAX_BYTES} ] && jq --argjson hooks "$hooks" --argjson retired "$retired" '
     f"'{MEMORY_CLAUDE_JQ}' \"$cs\" > \"$cs.rs-tmp\" && [ -s \"$cs.rs-tmp\" ] "
     '&& mv "$cs.rs-tmp" "$cs"; then putlog "$HOME/.claude/commands" && echo claude=on '
     '|| echo claude=failed; else rm -f "$cs.rs-tmp"; echo claude=failed; fi\n'
@@ -18877,7 +18898,7 @@ def _memory_kit_exec(container: str, agents: "Sequence[str]",
         log_cmd = MEMORY_LOG_CMD_SRC.read_text(encoding="utf-8")
         r = run(["docker", "exec", "-i", "-u", "1000", "-e", f"HOME={home}", container,
                  "sh", "-c", MEMORY_KIT_SCRIPT, "sh", json.dumps(_memory_claude_hooks(subagents)),
-                 log_cmd, *agents],
+                 log_cmd, json.dumps(list(MEMORY_CLAUDE_RETIRED_HOOKS)), *agents],
                 input=ext, capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
         out = r.stdout or ""
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError):
