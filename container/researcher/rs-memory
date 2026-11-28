@@ -20,12 +20,12 @@ Everything lives under /workspace/memory/ (RS_MEMORY_DIR overrides it):
   skills.log                    one line per skill event
   consolidated                  the last journal entry a consolidation covered
   runs/                         consolidation runs: brief, delta, log
-  checks/<id>/<n>/              a finding's checks, in a researcher-subagents
+  checks/<id>/<n>/              a finding's checks, in a researcher
                                 project only: a re-run (rerun/, rerun.md) or a
                                 referee run (snapshot/, verdict.md); never
                                 deleted, the audit trail
   sessions/<id>.json            a session's own switches (`switch`), in a
-                                researcher-subagents project, and (planner
+                                researcher project, and (planner
                                 on) what the session holds; always in the
                                 top memory
   planning.json                 (planner on) which session holds the
@@ -250,7 +250,7 @@ CHECKS_KEY = "subagents"
 # and beliefs, and claims only when the PI asks for one. Never set together
 # with CHECKS_KEY.
 COMPANION_KEY = "companion"
-# A researcher-subagents project's two switches, what a NEW session starts
+# A researcher project's two switches, what a NEW session starts
 # with: one object in the record, {"subagents": "on"|"off", "checks":
 # "off"|"staged"|"all"}. A record without it (every project made before the
 # switches) reads as SWITCH_DEFAULTS, today's behaviour; a key missing from it
@@ -348,7 +348,7 @@ CONSOLIDATION_LIMIT_S = 540
 # many characters (its documented hook-output limit); `open --hook` stays under
 # it and says how to read the rest.
 HOOK_OUTPUT_LIMIT = 10_000
-# An analyst's write-up (a researcher-subagents project): the file its results
+# An analyst's write-up (a researcher project): the file its results
 # folder holds, the line of its reply that names the folder, and the reminder
 # it is held back with, once, when it ends without that file.
 WRITEUP_FILE = "writeup.md"
@@ -532,7 +532,7 @@ def companion_on() -> bool:
     if companion and rec.get(CHECKS_KEY) is True:
         raise Refused(f"the project's record {record_path()} says both \"{COMPANION_KEY}\": true "
                       f"and \"{CHECKS_KEY}\": true, which cannot be set together: a companion "
-                      "has no finding checks, and a researcher-subagents project is no "
+                      "has no finding checks, and a researcher project is no "
                       "companion, so rs-memory cannot tell how this project's memory is kept. "
                       "It does nothing in this project until one of the two is gone from the "
                       "record; tell the PI")
@@ -541,7 +541,7 @@ def companion_on() -> bool:
 
 def refuse_both_kinds() -> None:
     """Every verb's first step: a record that makes the project both a
-    companion and a researcher-subagents project refuses before anything is
+    companion and a researcher project refuses before anything is
     written. A record that cannot be read is refused where a verb reads it,
     as it always was."""
     try:
@@ -552,8 +552,8 @@ def refuse_both_kinds() -> None:
 
 
 def checks_kit() -> bool:
-    """Whether this project has the finding checks at all (a researcher-
-    subagents project): their verbs and options work there whatever the
+    """Whether this project has the finding checks at all (a researcher
+    project): their verbs and options work there whatever the
     session's checks switch, so a check the PI asks for can always run."""
     companion_on()                      # refuses a record that sets both
     return project_record().get(CHECKS_KEY) is True
@@ -561,7 +561,7 @@ def checks_kit() -> bool:
 
 def checks_on() -> bool:
     """Whether a finding needs both its checks before the PI can accept it in
-    THIS session: a researcher-subagents project whose session's checks switch
+    THIS session: a researcher project whose session's checks switch
     is not off (the session's own, else the record's, else the default)."""
     return checks_kit() and session_switches()["checks"][0] != "off"
 
@@ -597,7 +597,7 @@ def record_switches() -> "dict[str, str]":
 
 
 def planner_on() -> bool:
-    """Whether this project works in packages: a researcher-subagents project
+    """Whether this project works in packages: a researcher project
     whose record sets the planner on."""
     return checks_kit() and record_switches().get(PLANNER) == "on"
 
@@ -749,7 +749,7 @@ def item_line_re(parts: tuple) -> "re.Pattern":
 
 def require_checks(what: str) -> None:
     if not checks_kit():
-        raise Refused(f"{what} is for researcher-subagents projects only: this project's "
+        raise Refused(f"{what} is for researcher projects only: this project's "
                       f"record ({record_path()}) does not say \"{CHECKS_KEY}\": true")
 
 
@@ -2505,7 +2505,7 @@ def cmd_switch(a) -> None:
 
 
 # -------------------------------------------------------------------- checks
-# A finding's two checks, in a researcher-subagents project only: a re-run of
+# A finding's two checks, in a researcher project only: a re-run of
 # its stated command, and a referee's verdict on its claim and evidence. Each
 # check is a folder checks/<id>/<n>/ of its own, never deleted: check.md
 # (what was started, bound to the claim's and evidence's hashes), pid, a log,

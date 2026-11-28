@@ -71,7 +71,7 @@
 // does not list these servers from a subfolder.
 //
 // An analyst's write-up, as Claude Code's SubagentStop hook does it in a
-// researcher-subagents project: in RS's `analyst` child only, the last reply's
+// researcher project: in RS's `analyst` child only, the last reply's
 // text is kept, and when the child is about to settle the memory command
 // (`rs-memory analyst-check`, on PATH in a researcher project) reads it; when the
 // reply names no results folder holding the write-up, the command prints its

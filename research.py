@@ -3320,27 +3320,27 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="pi's starting thinking level: "
                         f"{', '.join(rscore.PI_THINKING_LEVELS)}. Needs pi among the agents.")
-    # The referee and helper roles of a researcher-subagents project, frozen
+    # The referee and helper roles of a researcher project, frozen
     # into its record instead of the installation defaults (changed later
     # with `project update`'s flags of the same names).
     c.add_argument("--referee-model", default="", metavar="MODEL",
-                   help="model of the finding referee, in a researcher-subagents "
+                   help="model of the finding referee, in a researcher "
                         "project (unset = the installation default)")
     c.add_argument("--referee-effort", default="", metavar="LEVEL",
                    help="effort level of the finding referee (unset = the installation default)")
     c.add_argument("--analyst-model", default="", metavar="MODEL",
-                   help="model of Claude's analyst helper, in a researcher-subagents "
+                   help="model of Claude's analyst helper, in a researcher "
                         "project (unset = the installation default)")
     c.add_argument("--analyst-effort", default="", metavar="LEVEL",
                    help="effort level of Claude's analyst helper (unset = the installation default)")
     c.add_argument("--surveyor-model", default="", metavar="MODEL",
-                   help="model of Claude's surveyor helper, in a researcher-subagents "
+                   help="model of Claude's surveyor helper, in a researcher "
                         "project (unset = the installation default)")
     c.add_argument("--surveyor-effort", default="", metavar="LEVEL",
                    help="effort level of Claude's surveyor helper (unset = the installation default)")
     c.add_argument("--pi-referee-model", dest="pi_referee_model", default="",
                    metavar="PROVIDER/MODEL",
-                   help="model of the finding referee under pi, in a researcher-subagents "
+                   help="model of the finding referee under pi, in a researcher "
                         "project (unset = the Agent model). Needs pi among the agents.")
     c.add_argument("--pi-referee-thinking", dest="pi_referee_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
@@ -3348,27 +3348,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "model (unset = pi's default)")
     c.add_argument("--pi-analyst-model", dest="pi_analyst_model", default="",
                    metavar="PROVIDER/MODEL",
-                   help="model of pi's analyst helper, in a researcher-subagents project "
+                   help="model of pi's analyst helper, in a researcher project "
                         "(unset = pi's default). Needs pi among the agents.")
     c.add_argument("--pi-analyst-thinking", dest="pi_analyst_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="thinking level of pi's analyst helper (unset = pi's default)")
-    # The session roles of a researcher-subagents project with its planner
+    # The session roles of a researcher project with its planner
     # on: the planning session and a work session (their skills /rs-plan and
     # /rs-work and their shortcuts claude-plan, claude-work, pi-plan, pi-work).
     c.add_argument("--planner-model", default="", metavar="MODEL",
-                   help="Claude's model of the planning session, in a researcher-subagents "
+                   help="Claude's model of the planning session, in a researcher "
                         "project (unset = the installation default)")
     c.add_argument("--planner-effort", default="", metavar="LEVEL",
                    help="Claude's effort level of the planning session (unset = the installation default)")
     c.add_argument("--work-model", default="", metavar="MODEL",
-                   help="Claude's model of a work session, in a researcher-subagents "
+                   help="Claude's model of a work session, in a researcher "
                         "project (unset = the installation default)")
     c.add_argument("--work-effort", default="", metavar="LEVEL",
                    help="Claude's effort level of a work session (unset = the installation default)")
     c.add_argument("--pi-planner-model", dest="pi_planner_model", default="",
                    metavar="PROVIDER/MODEL",
-                   help="pi's model of the planning session, in a researcher-subagents "
+                   help="pi's model of the planning session, in a researcher "
                         "project (unset = pi's Agent model). "
                         "Needs pi among the agents.")
     c.add_argument("--pi-planner-thinking", dest="pi_planner_thinking", default="",
@@ -3376,7 +3376,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pi's thinking level of the planning session (unset = pi's Agent model)")
     c.add_argument("--pi-work-model", dest="pi_work_model", default="",
                    metavar="PROVIDER/MODEL",
-                   help="pi's model of a work session, in a researcher-subagents "
+                   help="pi's model of a work session, in a researcher "
                         "project (unset = pi's Agent model). "
                         "Needs pi among the agents.")
     c.add_argument("--pi-work-thinking", dest="pi_work_thinking", default="",
@@ -3384,17 +3384,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pi's thinking level of a work session (unset = pi's Agent model)")
     c.add_argument("--subagents", dest="subagents_switch", default="",
                    choices=("",) + rscore.RESEARCH_SWITCHES["subagents"], metavar="on|off",
-                   help="a researcher-subagents project's new sessions hand analyses to "
+                   help="a researcher project's new sessions hand analyses to "
                         "parallel analysts (on) or do them themselves (off) (unset = on)")
     c.add_argument("--checks", dest="checks_switch", default="",
                    choices=("",) + rscore.RESEARCH_SWITCHES["checks"], metavar="off|staged|all",
-                   help="a researcher-subagents project's finding checks (a re-run and an "
+                   help="a researcher project's finding checks (a re-run and an "
                         "independent referee): needed for the findings the agent stages "
                         "(staged), staged and run on every result (all), or not needed (off) "
                         "(unset = staged)")
     c.add_argument("--planner", dest="planner_switch", default="",
                    choices=("",) + rscore.RESEARCH_SWITCHES["planner"], metavar="on|off",
-                   help="a researcher-subagents project's work split into work packages, each "
+                   help="a researcher project's work split into work packages, each "
                         "worked on in a session of its own, with a planning session over them "
                         "(on), or one session at the project's top (off) (unset = off)")
     c.add_argument("--status-bar", dest="status_bar", action=argparse.BooleanOptionalAction,
@@ -3492,28 +3492,28 @@ def build_parser() -> argparse.ArgumentParser:
     # just the role containers; the agent's own model is written into its settings
     # file (no restart) on a current image.
     _add_model_flags(u, unset_note="unset = leave unchanged")
-    # The finding referee of a researcher-subagents project (update only: at
+    # The finding referee of a researcher project (update only: at
     # create it takes the installation's default). Read at each referee run.
     u.add_argument("--referee-model", default="", metavar="MODEL",
                    help="model of the finding referee under Claude, in a "
-                        "researcher-subagents project (unset = leave unchanged)")
+                        "researcher project (unset = leave unchanged)")
     u.add_argument("--referee-effort", default="", metavar="LEVEL",
                    help="effort level of the finding referee (unset = leave unchanged)")
-    # The helper roles of a researcher-subagents project (update only, like
+    # The helper roles of a researcher project (update only, like
     # the referee): written into each helper's definition, no restart.
     u.add_argument("--analyst-model", default="", metavar="MODEL",
-                   help="model of Claude's analyst helper, in a researcher-subagents "
+                   help="model of Claude's analyst helper, in a researcher "
                         "project (unset = leave unchanged)")
     u.add_argument("--analyst-effort", default="", metavar="LEVEL",
                    help="effort level of Claude's analyst helper (unset = leave unchanged)")
     u.add_argument("--surveyor-model", default="", metavar="MODEL",
-                   help="model of Claude's surveyor helper, in a researcher-subagents "
+                   help="model of Claude's surveyor helper, in a researcher "
                         "project (unset = leave unchanged)")
     u.add_argument("--surveyor-effort", default="", metavar="LEVEL",
                    help="effort level of Claude's surveyor helper (unset = leave unchanged)")
     u.add_argument("--pi-referee-model", dest="pi_referee_model", default="",
                    metavar="PROVIDER/MODEL",
-                   help="model of the finding referee under pi, in a researcher-subagents "
+                   help="model of the finding referee under pi, in a researcher "
                         "project (unset = leave unchanged; --reset pi_referee_model = "
                         "the Agent model)")
     u.add_argument("--pi-referee-thinking", dest="pi_referee_thinking", default="",
@@ -3522,27 +3522,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "(unset = leave unchanged)")
     u.add_argument("--pi-analyst-model", dest="pi_analyst_model", default="",
                    metavar="PROVIDER/MODEL",
-                   help="model of pi's analyst helper, in a researcher-subagents project "
+                   help="model of pi's analyst helper, in a researcher project "
                         "(unset = leave unchanged; --reset pi_analyst_model = pi's default)")
     u.add_argument("--pi-analyst-thinking", dest="pi_analyst_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="thinking level of pi's analyst helper (unset = leave unchanged)")
-    # The session roles of a researcher-subagents project with its planner
+    # The session roles of a researcher project with its planner
     # on: the planning session and a work session (their skills /rs-plan and
     # /rs-work and their shortcuts claude-plan, claude-work, pi-plan, pi-work).
     u.add_argument("--planner-model", default="", metavar="MODEL",
-                   help="Claude's model of the planning session, in a researcher-subagents "
+                   help="Claude's model of the planning session, in a researcher "
                         "project (unset = leave unchanged)")
     u.add_argument("--planner-effort", default="", metavar="LEVEL",
                    help="Claude's effort level of the planning session (unset = leave unchanged)")
     u.add_argument("--work-model", default="", metavar="MODEL",
-                   help="Claude's model of a work session, in a researcher-subagents "
+                   help="Claude's model of a work session, in a researcher "
                         "project (unset = leave unchanged)")
     u.add_argument("--work-effort", default="", metavar="LEVEL",
                    help="Claude's effort level of a work session (unset = leave unchanged)")
     u.add_argument("--pi-planner-model", dest="pi_planner_model", default="",
                    metavar="PROVIDER/MODEL",
-                   help="pi's model of the planning session, in a researcher-subagents "
+                   help="pi's model of the planning session, in a researcher "
                         "project (unset = leave unchanged; --reset pi_planner_model = pi's Agent model). "
                         "Needs pi among the agents.")
     u.add_argument("--pi-planner-thinking", dest="pi_planner_thinking", default="",
@@ -3550,7 +3550,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pi's thinking level of the planning session (unset = leave unchanged)")
     u.add_argument("--pi-work-model", dest="pi_work_model", default="",
                    metavar="PROVIDER/MODEL",
-                   help="pi's model of a work session, in a researcher-subagents "
+                   help="pi's model of a work session, in a researcher "
                         "project (unset = leave unchanged; --reset pi_work_model = pi's Agent model). "
                         "Needs pi among the agents.")
     u.add_argument("--pi-work-thinking", dest="pi_work_thinking", default="",
@@ -3558,17 +3558,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pi's thinking level of a work session (unset = leave unchanged)")
     u.add_argument("--subagents", dest="subagents_switch", default="",
                    choices=("",) + rscore.RESEARCH_SWITCHES["subagents"], metavar="on|off",
-                   help="what a researcher-subagents project's new sessions start with: "
+                   help="what a researcher project's new sessions start with: "
                         "analysts on or off (unset = leave unchanged; on its own, with "
                         "--checks; running sessions keep theirs)")
     u.add_argument("--checks", dest="checks_switch", default="",
                    choices=("",) + rscore.RESEARCH_SWITCHES["checks"], metavar="off|staged|all",
-                   help="what a researcher-subagents project's new sessions start with: "
+                   help="what a researcher project's new sessions start with: "
                         "finding checks off, staged or all (unset = leave unchanged; on its "
                         "own, with --subagents; running sessions keep theirs)")
     u.add_argument("--planner", dest="planner_switch", default="",
                    choices=("",) + rscore.RESEARCH_SWITCHES["planner"], metavar="on|off",
-                   help="a researcher-subagents project's work packages: on, or off (refused "
+                   help="a researcher project's work packages: on, or off (refused "
                         "while a package is open) (unset = leave unchanged; on its own, with "
                         "--subagents and --checks)")
     u.add_argument("--pi-model", dest="pi_model", default="", metavar="PROVIDER/MODEL",

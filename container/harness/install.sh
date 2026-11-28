@@ -35,7 +35,7 @@
 #     ~/.claude/skills/rs-test/{SKILL.md,policies/<policy>.md for every staged
 #       test policy} — the test-policy switch
 #     ~/.claude/skills/rs-plan/SKILL.md, ~/.claude/skills/rs-work/SKILL.md —
-#       the session roles of a researcher-subagents project (the planning
+#       the session roles of a researcher project (the planning
 #       session, a work session on one package), with the role's model and
 #       effort in their frontmatter, and ~/.local/bin/claude-plan,
 #       ~/.local/bin/claude-work — the shortcuts that start Claude Code on
@@ -284,7 +284,7 @@ PI_CHECKER_THINKING=$(checked RS_HARNESS_PI_CHECKER_THINKING "${RS_HARNESS_PI_CH
 SUBAGENTS=0
 [ "${RS_HARNESS_SUBAGENTS:-}" = 1 ] && SUBAGENTS=1
 # The web through the search service: only beside the helper roles (a
-# researcher-subagents project's agent wired to the server `search`).
+# researcher project's agent wired to the server `search`).
 SEARCH=0
 [ "$SUBAGENTS" = 1 ] && [ "${RS_HARNESS_SEARCH:-}" = 1 ] && SEARCH=1
 # Their models (the project's record; unset: the analyst and surveyor keep the
@@ -353,7 +353,7 @@ SOURCE_CHECKER_DESC="Checks one cited source against the sentences that cite it,
 
 # skill DIR — the mode-switch skill (named rs-mode; its folder keeps the name
 # harness, so nothing is ever removed) with its own copy of every staged mode's
-# rule body. A researcher-subagents project's rs-mode is the research one: it
+# rule body. A researcher project's rs-mode is the research one: it
 # switches the session's subagents and checks, and carries their text itself.
 skill() {
     SKILL_SRC=skill/SKILL.md

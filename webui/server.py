@@ -1544,7 +1544,7 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
                       "supervisor_model", "supervisor_effort",
                       "worker_model", "worker_effort",
                       "role_model", "role_effort",
-                      # the ⚙ Agents box's Referee rows (researcher-subagents),
+                      # the ⚙ Agents box's Referee rows (researcher),
                       # Claude's and pi's
                       "referee_model", "referee_effort",
                       "pi_referee_model", "pi_referee_thinking",
@@ -1812,7 +1812,7 @@ async def broker_project_agents_handler(request: web.Request) -> web.Response:
 
 
 async def broker_project_packages_handler(request: web.Request) -> web.Response:
-    """GET /broker/project/{name}/packages — a researcher-subagents project's
+    """GET /broker/project/{name}/packages — a researcher project's
     work packages, for the planner lock in its ⚙ Workflow section (gated,
     read-only, running or stopped). Synchronous relay; the broker's
     PROJECT_PACKAGES_WEBUI_FIELDS is the input boundary."""

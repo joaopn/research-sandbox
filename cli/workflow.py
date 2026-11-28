@@ -331,8 +331,9 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
                          "project's instruction file is the dev text)"))
 
     # memory — the project's agent keeps RS's research memory (the rs-memory
-    # command, its hooks and skills): the researcher project type. Only on the
-    # rs-sandbox-dind image, which carries the command, and never with dev.
+    # command, its hooks and skills): the researcher and companion types. Only
+    # on the rs-sandbox-dind image, which carries the command, and never with
+    # dev.
     if "memory" in m:
         if not isinstance(m["memory"], bool):
             out.append(p(f"memory must be a boolean, got {m.get('memory')!r}"))
@@ -345,8 +346,7 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
 
     # subagents — the researcher's parallel helpers (the analyst, and the
     # surveyor under Claude) and a finding's two checks (re-run, referee):
-    # the researcher-subagents project type. It extends the memory, so it
-    # needs it.
+    # the researcher type. It extends the memory, so it needs it.
     if "subagents" in m:
         if not isinstance(m["subagents"], bool):
             out.append(p(f"subagents must be a boolean, got {m.get('subagents')!r}"))

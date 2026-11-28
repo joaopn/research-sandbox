@@ -1209,7 +1209,7 @@ def _resolve_all_model_pairs(supervisor: tuple[str, str] = ("", ""),
     """Resolve all FOUR container types into concrete, mutually-valid pairs — the
     exact shape written into `.orchestrator/project.json`. `subagents` adds the
     finding referee's pair and the analyst's and surveyor's, for a
-    researcher-subagents project only: `rs-memory referee` reads the first from
+    researcher project only: `rs-memory referee` reads the first from
     the record, the kit's installer the other two. `helpers` maps each of those
     types to the create's requested pair, taken over the defaults ("" halves =
     the default, as for the four types above).
@@ -1295,7 +1295,7 @@ def model_default_set(req: "ModelDefaultSetRequest") -> dict:  # type: ignore[na
     Atomic tmp+replace; the file has host-only readers (nothing bind-mounts
     it), so the inode change is safe. The reviewer consumes the result on its
     very next run (review_pr resolves live); the four project types, and the
-    referee of a researcher-subagents project, consume it at their next
+    referee of a researcher project, consume it at their next
     create/box-add. Returns the type's post-write merged default
     plus whether an override now exists for it."""
     catalog = _model_catalog_checked()
@@ -1421,7 +1421,7 @@ class CreateRequest:
     # project's record at create and read from there by every later step.
     research_memory: bool = False
     # The researcher's parallel helpers and a finding's two checks (the
-    # researcher-subagents type), DERIVED from the manifest's `subagents: true`
+    # researcher type), DERIVED from the manifest's `subagents: true`
     # (which requires `memory: true`), written into the record as
     # SUBAGENTS_RECORD_KEY beside the memory key and read from there.
     research_subagents: bool = False
@@ -1467,7 +1467,7 @@ class CreateRequest:
     # among them (see PI_MODEL_RE for why the model is free text).
     pi_model: str = ""
     pi_thinking: str = ""
-    # A researcher-subagents project's referee and helper roles (the New
+    # A researcher project's referee and helper roles (the New
     # Project window's rows beside Agent): Claude's pairs resolved here like
     # worker_*, frozen into models.referee/analyst/surveyor instead of the
     # installation defaults; pi's referee and analyst into pi_models.referee /
@@ -1496,7 +1496,7 @@ class CreateRequest:
     pi_planner_thinking: str = ""
     pi_work_model: str = ""
     pi_work_thinking: str = ""
-    # A researcher-subagents project's two switches (RESEARCH_SWITCHES), what
+    # A researcher project's two switches (RESEARCH_SWITCHES), what
     # its new sessions start with: "" = the default (RESEARCH_SWITCH_DEFAULTS).
     # Refused on any other workflow; written into the record's
     # RESEARCH_SWITCHES_KEY object when either is given.
@@ -1873,7 +1873,7 @@ class CreateRequest:
         switches = _research_switch_args(kw)
         if any(switches.values()) and not research_subagents:
             raise ValidationError("the subagents, checks and planner settings apply only to a "
-                                  "researcher-subagents project")
+                                  "researcher project")
         return cls(
             name=_require_name(kw.get("name")),
             status_bar=status_bar,
@@ -1920,7 +1920,7 @@ class CreateRequest:
         )
 
 
-# The create fields of a researcher-subagents project's referee, helper
+# The create fields of a researcher project's referee, helper
 # roles and session roles (CreateRequest; the same names as UpdateRequest's):
 # Claude's pairs per SUBAGENT_MODEL_TYPES, then pi's referee, analyst and
 # session roles.
@@ -1941,7 +1941,7 @@ def _validated_subagent_pairs(kw: dict, *, subagents: bool, agents: "Sequence[st
     the agents and pi's referee and analyst without pi. A Claude pair given
     (either half) is resolved against the catalog like worker_* (an unknown
     tier or an impossible pair refused); an empty one stays "" and create()
-    freezes the installation default. A researcher-subagents project with pi
+    freezes the installation default. A researcher project with pi
     needs a model for pi's referee: its own (pi_referee_model) or pi's Agent
     model (`pi_model`, the validated one), else the create is refused, since
     the referee has no default of its own. The texts reach the browser
@@ -1954,13 +1954,13 @@ def _validated_subagent_pairs(kw: dict, *, subagents: bool, agents: "Sequence[st
             raise ValidationError(f"{f} must be a string")
         out[f] = (v or "").strip()
     if subagents and "pi" in agents and not (pi_model or out["pi_referee_model"]):
-        raise ValidationError("pi's referee needs a model in a researcher-subagents "
+        raise ValidationError("pi's referee needs a model in a researcher "
                               "project: set the Referee row (or the Agent row) on pi's tab")
     if not any(out.values()):
         return out
     if not subagents:
         raise ValidationError("the Referee, Analyst, Surveyor, Planning session and Work "
-                              "session models apply only to a researcher-subagents project; "
+                              "session models apply only to a researcher project; "
                               "this workflow has none")
     if any(out[f] for f in claude_fields) and DEFAULT_AGENT not in agents:
         raise ValidationError("the Referee, Analyst, Surveyor, Planning session and Work "
@@ -2404,12 +2404,12 @@ class UpdateRequest:
     worker_effort: str = ""
     role_model: str = ""
     role_effort: str = ""
-    # The finding referee's pair (a researcher-subagents project only, checked
+    # The finding referee's pair (a researcher project only, checked
     # in update() against the record): written into models.referee, which
     # `rs-memory referee` reads at each run, so no container is touched.
     referee_model: str = ""
     referee_effort: str = ""
-    # The helper roles' pairs (a researcher-subagents project only, checked in
+    # The helper roles' pairs (a researcher project only, checked in
     # update() against the record like the referee's): Claude's analyst and
     # surveyor into models.analyst / models.surveyor, pi's analyst into
     # pi_models.analyst; the kit's installer is re-run so the next helper
@@ -2468,7 +2468,7 @@ class UpdateRequest:
     # Written live into a running project's Claude, owed to the next start of
     # a stopped one.
     block_account_links: bool | None = None
-    # A researcher-subagents project's two switches (RESEARCH_SWITCHES): "" =
+    # A researcher project's two switches (RESEARCH_SWITCHES): "" =
     # unchanged. Changed on their own: written into the record, and into the
     # agent's instructions at once on a running project (no restart); what
     # new sessions start with, never a running session's.
@@ -5362,9 +5362,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
               # the same way): its folders are never checked for them.
               OLD_FILES_FLAG: True}
     if req.research_subagents:
-        # The researcher-subagents type: the kit's analyst and surveyor, and
+        # The researcher type: the kit's analyst and surveyor, and
         # rs-memory's finding checks, key on it. Only written when set, so a
-        # researcher project's record is exactly as before.
+        # companion project's record never carries it.
         marker[SUBAGENTS_RECORD_KEY] = True
         # Its two switches, only when the create chose one (from_kwargs
         # refused them elsewhere): every switch named, the unchosen one at its
@@ -5397,7 +5397,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     pi_pair = ({"model": req.pi_model, "thinking": req.pi_thinking}
                if (req.pi_model or req.pi_thinking) else None)
     pi_models = {"agent": pi_pair} if pi_pair else {}
-    # pi's referee and analyst likewise (a researcher-subagents create only,
+    # pi's referee and analyst likewise (a researcher create only,
     # gated in from_kwargs), in the shape the ⚙ Agents box writes; unset = pi's
     # Agent model for the referee (rs-memory), pi's default for the analyst.
     if req.pi_referee_model or req.pi_referee_thinking:
@@ -6485,7 +6485,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # live on a running project, owed to the next start of a stopped one.
     if req.block_account_links is not None:
         return _update_account_links(req, cfg, project, container, progress)
-    # A researcher-subagents project's switches: their own change, the record
+    # A researcher project's switches: their own change, the record
     # and then (running) the agent's instructions, nothing restarted.
     if req.subagents_switch or req.checks_switch or req.planner_switch:
         return _update_research_switches(req, cfg, project, container, progress)
@@ -6499,7 +6499,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # model goes into its settings file is a property of the container's image
     # (older images keep the container setting); asked only when it matters.
     workspace_path = workspace_path_for(project, cfg)
-    # The finding referee exists only in a researcher-subagents project: its
+    # The finding referee exists only in a researcher project: its
     # pair (Claude's or pi's) is refused anywhere else before anything is
     # written, and pi's needs pi as an agent (after this update's own agent
     # change, when it carries one).
@@ -6507,7 +6507,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if ((req.referee_model or req.referee_effort or pi_referee_asked)
             and _read_marker_dict(workspace_path).get(SUBAGENTS_RECORD_KEY) is not True):
         raise ValidationError(
-            "the referee's model applies only to a researcher-subagents project; "
+            "the referee's model applies only to a researcher project; "
             f"{project!r} is not one")
     if pi_referee_asked and "pi" not in (list(req.agents) if req.agents is not None
                                          else _project_running_agents(workspace_path)):
@@ -6523,7 +6523,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         if _read_marker_dict(workspace_path).get(SUBAGENTS_RECORD_KEY) is not True:
             raise ValidationError(
                 "the Analyst, Surveyor, Planning session and Work session models apply only "
-                f"to a researcher-subagents project; {project!r} is not one")
+                f"to a researcher project; {project!r} is not one")
         helper_agents = (list(req.agents) if req.agents is not None
                          else _project_running_agents(workspace_path))
         if (set(req.model_changes()) & set(HELPER_MODEL_TYPES)
@@ -10518,13 +10518,13 @@ HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md",
                  "agents/analyst.md", "agents/surveyor.md",
                  "agents/source-checker.md", "skill-paper-check/SKILL.md",
                  "skill-paper-check/bibpass.py",
-                 # A researcher-subagents project's session roles: the text of
+                 # A researcher project's session roles: the text of
                  # the rs-plan and rs-work skills (the installer writes their
                  # frontmatter, with the role's model) and the body of their
                  # four shortcuts, claude-plan, claude-work, pi-plan, pi-work.
                  "skill-roles/rs-plan.md", "skill-roles/rs-work.md",
                  "skill-roles/shortcut.sh",
-                 # The web through the search service, for a researcher-subagents
+                 # The web through the search service, for a researcher
                  # project whose agent is wired to it: the analyst's line on it,
                  # the source-checker's passage and the rule both agents load
                  # (~/.claude/rules/rs-search.md).
@@ -10546,7 +10546,8 @@ SUBAGENTS_RECORD_KEY = "subagents"
 # record without the object, or without one of its keys, reads as
 # RESEARCH_SWITCH_DEFAULTS (today's behaviour); a malformed object is an
 # error, never read as the defaults. Never set on any other project.
-# SUBAGENTS_RECORD_KEY keeps meaning "a researcher-subagents project".
+# SUBAGENTS_RECORD_KEY keeps meaning "a researcher project" (a companion
+# has neither).
 # MIRROR of rs-memory's SWITCHES_KEY / SWITCHES / SWITCH_DEFAULTS (the
 # command reads what the host writes).
 # The third, `planner` (off = one session at the project's top, on = the work
@@ -10562,7 +10563,7 @@ RESEARCH_SESSION_SWITCHES = ("subagents", "checks")
 # The request fields that set them (CreateRequest, UpdateRequest), by switch.
 RESEARCH_SWITCH_FIELDS = {"subagents": "subagents_switch", "checks": "checks_switch",
                           "planner": "planner_switch"}
-# The instruction text of a researcher-subagents project marks each passage
+# The instruction text of a researcher project marks each passage
 # that depends on a switch with a whole line `<!-- rs-switch: NAME VALUE... -->`
 # before it and `<!-- rs-switch: end -->` after it: the passage is kept when
 # the project's NAME is one of the VALUEs, dropped otherwise, and the marker
@@ -10570,7 +10571,7 @@ RESEARCH_SWITCH_FIELDS = {"subagents": "subagents_switch", "checks": "checks_swi
 # such a project carries every passage, grouped by switch and value
 # (research_switch_pieces), so a session switched with /rs-mode has the text
 # of its new switches.
-RESEARCH_SWITCH_TEXT = SCRIPT_DIR / "workflows" / "researcher-subagents.instructions.md"
+RESEARCH_SWITCH_TEXT = SCRIPT_DIR / "workflows" / "researcher.instructions.md"
 _RESEARCH_SWITCH_MARK_RE = re.compile(r"\A<!-- rs-switch: ([a-z]+(?: [a-z]+)*) -->\Z")
 
 
@@ -10630,7 +10631,7 @@ def research_switch_pieces(text: str) -> "dict[tuple[str, str], str]":
 
 
 def read_research_switches(marker: dict) -> "dict[str, str]":
-    """A researcher-subagents record's switches, every switch named: the
+    """A researcher record's switches, every switch named: the
     record's object over the defaults. ValueError (its text in project terms)
     for an object that is not one RS writes."""
     raw = marker.get(RESEARCH_SWITCHES_KEY, {})
@@ -10682,7 +10683,7 @@ ROLE_MODEL_TYPES = ("planner", "work")
 HELPER_MODEL_TYPES = ("analyst", "surveyor", *ROLE_MODEL_TYPES)
 HARNESS_SKILL_TEMPLATE = "skill/SKILL.template.md"
 HARNESS_TEST_SKILL_TEMPLATE = "skill-test/SKILL.template.md"
-# The rs-mode skill of a researcher-subagents project (the installer lays it in
+# The rs-mode skill of a researcher project (the installer lays it in
 # place of the working-mode one where RS_HARNESS_SUBAGENTS is 1): it switches
 # the session's subagents and checks, and carries the instruction text of
 # every switch value (research_switch_pieces of RESEARCH_SWITCH_TEXT), filled
@@ -10814,16 +10815,16 @@ def harness_suite_files() -> dict[str, bytes]:
                               "has a marker RS does not fill")
     files["skill-test/SKILL.md"] = skill.encode("utf-8")
     # The research rs-mode skill: every switch value's passages from the
-    # researcher-subagents instructions.
+    # researcher instructions.
     try:
         skill = (HARNESS_SRC / HARNESS_RESEARCH_SKILL_TEMPLATE).read_bytes().decode("utf-8")
         pieces = research_switch_pieces(RESEARCH_SWITCH_TEXT.read_bytes().decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as e:
         raise ValidationError("RS's research switches are broken: the skill template or the "
-                              f"researcher-subagents instructions cannot be read ({e})")
+                              f"researcher instructions cannot be read ({e})")
     for (k, v), text in pieces.items():
         if not text:
-            raise ValidationError("RS's research switches are broken: the researcher-subagents "
+            raise ValidationError("RS's research switches are broken: the researcher "
                                   f"instructions have no text for {k} {v}")
         demoted = "\n".join("#" + line if line.startswith("#") else line
                              for line in text.split("\n"))
@@ -10919,7 +10920,7 @@ def _harness_subagents_env(container: str, marker: dict) -> list[str]:
 def _harness_paper_check_env(marker: dict) -> list[str]:
     """`-e` args that give the installer the paper check (its skill and the
     source-checker role) when the project's record carries `"memory": true`
-    (the two researcher project types); none otherwise."""
+    (the researcher and companion types); none otherwise."""
     if marker.get(MEMORY_RECORD_KEY) is not True:
         return []
     return ["-e", "RS_HARNESS_PAPER_CHECK=1"]
@@ -17165,6 +17166,23 @@ OLD_INSTRUCTIONS_PROJECT_ERROR = (
     "while this file exists, so the agent still reads the old one. Remove or "
     "rename `/workspace/CLAUDE.md` from this project's terminal or editor, then "
     "stop the project and start it again.")
+# A dind project whose record names a type the catalog does not have (a
+# retired id such as researcher-subagents, or a custom type removed since),
+# and one recorded with the retired plain researcher's shape (a type whose
+# manifest sets `subagents: true`, without the record key): RS cannot tell
+# which text the agent should have, so it writes none and leaves the file
+# there as it is. {type} is the record's name, shown only when it is a valid
+# workflow name (the record is the project's own).
+INSTRUCTIONS_UNKNOWN_TYPE_ERROR = (
+    "this project's type {type} is not one RS knows (it may be a retired type, as "
+    "researcher-subagents now is, or a custom type that was removed), so its agent's "
+    "instructions were not written and the file already there was left as it is; "
+    "the project has to be moved onto a current type.")
+INSTRUCTIONS_PLAIN_RESEARCHER_ERROR = (
+    "this project was made as the retired plain researcher type (its record names "
+    "the type {type} without the researcher's subagents setting), so its agent's "
+    "instructions were not written and the file already there was left as it is; "
+    "the project has to be moved onto a current type.")
 OLD_INSTRUCTIONS_BOX_ERROR = (
     "`/workspace/boxes/{box}/CLAUDE.md` is the instructions file RS used to write "
     "for box '{box}'. RS's instructions now live in the box's home folder and are "
@@ -17274,6 +17292,9 @@ class OldInstructions:
                        # yet; `reason` is its fixed text)
                        # | "memory-kit" (a researcher project's memory could
                        # not be set up; `reason` is its fixed text)
+                       # | "type" (the record names a type RS does not know,
+                       # or the retired plain researcher's shape; no text was
+                       # written; `reason` is its fixed text)
                        # | "files" / "box-files" (files RS used to write into
                        # the project's / a box's folder; `paths` lists them)
     project: str
@@ -17284,7 +17305,8 @@ class OldInstructions:
     def text(self) -> str:
         if self.kind == "box":
             return OLD_INSTRUCTIONS_BOX_ERROR.format(box=_shown_box(self.box))
-        if self.kind in ("box-image", "status-bar", "app-pins", "rs-commands", "memory-kit"):
+        if self.kind in ("box-image", "status-bar", "app-pins", "rs-commands", "memory-kit",
+                         "type"):
             return self.reason
         if self.kind == "files":
             return OLD_FILES_PROJECT_ERROR.format(paths=_shown_old_paths("", self.paths))
@@ -17355,9 +17377,12 @@ def _raise_old_instructions(found: "Sequence[OldInstructions]", *,
 @dataclass
 class _InstrPlan:
     """What the writer does for one project container. `text` None = unknown
-    (an input could not be read; `what` names it in project terms)."""
+    (an input could not be read; `what` names it in project terms). `error`
+    set = the record's type cannot be served: nothing is written and the
+    operation ends with that text."""
     text: "str | None" = None
     what: str = ""
+    error: str = ""
     check_old: bool = False
     keep_existing: bool = False
     cleared: bool = False
@@ -17521,20 +17546,25 @@ def _plan_project_instructions(project: str, workspace_path: "Path", *,
     # A dind project that is not dev: a built-in workflow's own text, when it
     # carries one (cli/workflow.py admits it only on the rs-sandbox-dind
     # image). No older RS wrote such a text for a dind project, so a
-    # /workspace/CLAUDE.md beside it is the user's: the old-file check stays
-    # what it was (a workflow gone from a readable catalog only).
+    # /workspace/CLAUDE.md beside it is the user's. A workflow gone from a
+    # readable catalog, or the retired plain researcher's shape (a manifest
+    # with `subagents: true`, a record without the key), is an error: RS
+    # cannot tell which text the agent should have, so it writes none.
     body = ""
     if wf:
         st, m = resolve()
         if st == "unknown":
             return _InstrPlan(what="the custom-workflow list")
-        if st == "found" and m.get("source", "builtin") == "builtin":
+        shown = f"'{wf}'" if workflow.NAME_RE.fullmatch(wf) else "(a name RS cannot show)"
+        if st == "missing":
+            return _InstrPlan(error=INSTRUCTIONS_UNKNOWN_TYPE_ERROR.format(type=shown))
+        if m.get("subagents") is True and data.get(SUBAGENTS_RECORD_KEY) is not True:
+            return _InstrPlan(error=INSTRUCTIONS_PLAIN_RESEARCHER_ERROR.format(type=shown))
+        if m.get("source", "builtin") == "builtin":
             instr = m.get("instructions")
             if isinstance(instr, str) and instr.strip():
                 body = instr
-        if not plan.cleared:
-            plan.check_old = st == "missing"     # F-L1: RS cannot tell what it wrote
-    # A researcher-subagents project: the passages of its switches only (the
+    # A researcher project: the passages of its switches only (the
     # record's, what a new session starts with). A switches object RS did not
     # write leaves the instructions as they were, with its warning.
     if body and data.get(SUBAGENTS_RECORD_KEY) is True:
@@ -17890,6 +17920,8 @@ def _write_project_instructions(project: str, container: str, workspace_path: "P
         # broken install, never a reason to fail the operation around it.
         _report_warnings([_INSTR_WRITE_FAILED], progress)
         return []
+    if plan.error:
+        return [OldInstructions("type", project, reason=plan.error)]
     if plan.text is None:
         tmpl = _INSTR_UNKNOWN_KEEP if has_file else _INSTR_UNKNOWN_NONE
         _report_warnings([tmpl.format(what=plan.what)], progress)
@@ -18709,11 +18741,11 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # Version 9: the pi extension passes `rs-memory open --agent`, and `close`,
 # `rerun` and `referee` wait for what they start (the session's end hook only
 # journals it; the next session start consolidates).
-# Version 10: the researcher-subagents instructions and its rs-mode skill name
+# Version 10: the researcher instructions and its rs-mode skill name
 # `rs-memory switch` (a session's own subagents and checks switches) and
 # `rs-memory check` (both checks of several findings at once), and rely on
 # accept honouring the checks switch (the record's research_switches).
-# Version 11: the researcher-subagents instructions name the planner's verbs
+# Version 11: the researcher instructions name the planner's verbs
 # (`rs-memory plan`, `take`, `release`, `package …`: work packages, with the
 # record's research_switches planner on).
 # Version 12: those instructions tell a session to load its role skill again
@@ -18738,7 +18770,7 @@ MEMORY_CLAUDE_HOOKS = (
     {"event": "SessionStart", "command": f"{MEMORY_TOOL} open --hook"},
     {"event": "SessionEnd", "command": f"{MEMORY_TOOL} close --hook --agent claude"},
 )
-# A researcher-subagents project's own: an analyst that ends without its
+# A researcher project's own: an analyst that ends without its
 # write-up is held back once with a reminder (the command answers nothing on
 # the second stop, so it is let go).
 MEMORY_CLAUDE_SUBAGENTS_HOOKS = (
@@ -18829,7 +18861,7 @@ def _image_memory_kit(image: str) -> bool:
 
 def _memory_claude_hooks(subagents: bool) -> "list[dict[str, str]]":
     """The Claude hook entries the kit merges into a project's agent: the
-    researcher's, plus the analyst's in a researcher-subagents project."""
+    researcher's, plus the analyst's in a researcher project."""
     return [*MEMORY_CLAUDE_HOOKS, *(MEMORY_CLAUDE_SUBAGENTS_HOOKS if subagents else ())]
 
 
@@ -19288,7 +19320,7 @@ def _update_account_links(req: "UpdateRequest", cfg: "Config", project: str,  # 
 
 def _update_research_switches(req: "UpdateRequest", cfg: "Config", project: str,  # type: ignore[name-defined]
                               container: str, progress) -> "UpdateResult":
-    """A researcher-subagents project's switches (subagents, checks, planner),
+    """A researcher project's switches (subagents, checks, planner),
     alone in their request: merged into the record's RESEARCH_SWITCHES_KEY
     object, then, on a running project, RS's instructions written again from
     it (what the agent's next session reads; no container is restarted, a
@@ -19309,7 +19341,7 @@ def _update_research_switches(req: "UpdateRequest", cfg: "Config", project: str,
                               "unreadable")
     if data.get(SUBAGENTS_RECORD_KEY) is not True:
         raise ValidationError("the subagents and checks settings apply only to a "
-                              f"researcher-subagents project; {project!r} is not one")
+                              f"researcher project; {project!r} is not one")
     try:
         read_research_switches(data)
     except ValueError as e:
@@ -19883,7 +19915,7 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
                                           "defaultThinkingLevel": (rec or {}).get("thinking")}),
                          "source": "saved"}
     if data.get(SUBAGENTS_RECORD_KEY) is True:
-        # The researcher-subagents type: the finding referee's recorded pairs
+        # The researcher type: the finding referee's recorded pairs
         # (what the next referee run uses: Claude's under Claude, pi's under
         # pi, where an unset model means pi's Agent model).
         rec = models.get("referee") if isinstance(models.get("referee"), dict) else {}
@@ -19951,7 +19983,7 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
 
 @dataclass(frozen=True)
 class ProjectPackagesRequest:
-    """Read a researcher-subagents project's work packages, for the planner
+    """Read a researcher project's work packages, for the planner
     lock in its ⚙ Workflow section."""
     project: str
 
@@ -19966,13 +19998,13 @@ def project_packages(req: ProjectPackagesRequest, _progress=None) -> dict:
     (cut past WORK_PACKAGE_NAME_SHOWN_MAX), its state, and whether its status
     records a holder; what RS could not read there; and whether the folder
     holds more than WORK_PACKAGES_READ_MAX entries, of which only that many
-    were read. Refused for a project that is not researcher-subagents."""
+    were read. Refused for a project that is not a researcher project."""
     cfg = load_config()
     if not container_exists(container_name_for(req.project)):
         raise ValidationError(f"no project named {req.project!r}")
     ws = workspace_path_for(req.project, cfg)
     if _read_marker_dict(ws).get(SUBAGENTS_RECORD_KEY) is not True:
-        raise ValidationError("work packages apply only to a researcher-subagents project; "
+        raise ValidationError("work packages apply only to a researcher project; "
                               f"{req.project!r} is not one")
     found, problems, more = _read_work_packages(ws, WORK_PACKAGES_READ_MAX)
 
@@ -21172,7 +21204,7 @@ def mcp_server_remove(req: McpServerNameRequest, *, blocking: bool = True,
     is gone (refused by the gateway), never a listed server that lost its
     wiring. `if_url` (Aldine's Turn off): remove the server only when it is on
     the list at exactly that address, and otherwise change nothing — an
-    absent one included — instead of refusing. A running researcher-subagents
+    absent one included — instead of refusing. A running researcher
     project whose own agent it unwired has its helpers restaged at once, as a
     wiring change does (_mcp_restage_unwired): the web follows the search
     service's wiring without a start."""
@@ -21238,7 +21270,7 @@ def _mcp_restage_unwired(projects: "set[str]", deadline: float | None) -> None:
     """A removal took servers from these projects' own agents: in each one
     that is RUNNING, restage the helpers (_mcp_restage_helpers, a no-op for a
     project without them), as a wiring change does, so the web of a
-    researcher-subagents project follows the search service's wiring at once.
+    researcher project follows the search service's wiring at once.
     A stopped project gets it at its next start. Never raises: the removal is
     already done, and one project's failure is a warning naming it."""
     for project in sorted(projects):

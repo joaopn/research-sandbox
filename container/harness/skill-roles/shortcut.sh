@@ -1,4 +1,4 @@
-# The body of a session-role shortcut of a researcher-subagents project:
+# The body of a session-role shortcut of a researcher project:
 # claude-plan, claude-work, pi-plan, pi-work. RS's harness installer writes
 # each into ~/.local/bin (beside the agents' own launchers, on the terminal's
 # PATH) as a shebang, the lines setting RS_ROLE_AGENT (claude or pi),

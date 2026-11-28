@@ -22,7 +22,7 @@
 // - Every call is given the session's id as PI_SESSION_ID, read from the
 //   handler's context (ctx.sessionManager.getSessionId(), the value pi's bash
 //   tool puts in PI_SESSION_ID for the session's own commands), so `open`
-//   names the switches this session works under (a researcher-subagents
+//   names the switches this session works under (a researcher
 //   session switched with /skill:rs-mode keeps them after a compaction) and
 //   the end entry names the session. No id: the variable is left out.
 // - At the end of a session it journals the end (`rs-memory close --hook`),

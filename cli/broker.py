@@ -1091,7 +1091,7 @@ CREATE_WEBUI_FIELDS = frozenset({
     # path, host port or mount); from_kwargs holds the model to a strict
     # charset and refuses both where pi is not deployed.
     "pi_model", "pi_thinking",
-    # A researcher-subagents project's referee and helper roles (the New
+    # A researcher project's referee and helper roles (the New
     # Project window's rows beside Agent): IN-BOX like the pairs above —
     # catalog tokens and a pi provider/model id frozen into the project's
     # record, which rs-memory and the kit's installer read inside the
@@ -1150,7 +1150,7 @@ UPDATE_WEBUI_FIELDS = frozenset({
     "supervisor_model", "supervisor_effort",
     "worker_model", "worker_effort",
     "role_model", "role_effort",
-    # The finding referee's pairs (the ⚙ Agents box of a researcher-subagents
+    # The finding referee's pairs (the ⚙ Agents box of a researcher
     # project): IN-BOX like the worker pair — catalog tokens (Claude's) and a
     # pi provider/model id (pi's) written into the project's record, which
     # rs-memory reads inside the container; refused in update() on any other
@@ -1346,7 +1346,7 @@ BOX_REMOVE_WEBUI_FIELDS = BOX_TARGET_WEBUI_FIELDS | {"keep_workspace"}
 PROJECT_FOLDERS_WEBUI_FIELDS = frozenset({"project"})
 # The ⚙ Agents box's read (I33 slice 3): the project only; read-only.
 PROJECT_AGENTS_WEBUI_FIELDS = frozenset({"project"})
-# The ⚙ Workflow section's read of a researcher-subagents project's work
+# The ⚙ Workflow section's read of a researcher project's work
 # packages (the planner lock): the project only; read-only, from the
 # project's folder on the host, bounded by rscore.WORK_PACKAGES_READ_MAX.
 PROJECT_PACKAGES_WEBUI_FIELDS = frozenset({"project"})

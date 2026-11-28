@@ -1,6 +1,5 @@
 {
   "name": "researcher",
-  "title": "researcher (legacy)",
   "group": "research",
   "tags": [
     "research",
@@ -15,6 +14,7 @@
     "reader": true
   },
   "memory": true,
-  "description": "One research agent that does its own analysis, keeps a memory, and writes pages you read in the Reader tab: what waits for you, what you accepted, and a logbook of the work.",
-  "greeting": "Researcher: one research agent with a memory.\n\nRun `claude` or `pi` here, whichever this project carries. The agent does its\nown analysis in this container, on the data folders you gave the project, and\nkeeps its own memory under /workspace/memory/. Read what it has for you in the\nReader tab: README.md, the front page (what waits for you, what is running,\nwhere things stand, what is known); staging/, the claims waiting for you;\nresults/, what you accepted; logbook/, the story of the work, one entry per\ntopic, written when you type /log. The agent writes these pages; do not edit\nthem.\n\nA finding enters the record only when you accept it: say \"accept F-3\".\n"
+  "subagents": true,
+  "description": "The research agent with a memory. By default it hands analyses to parallel helpers and has every finding it stages re-run and refereed before you accept it; both are switches, and a planner splits the work into packages when you turn it on.",
+  "greeting": "Researcher: one research agent with a memory and, by default, helpers.\n\nRun `claude` or `pi` here, whichever this project carries. By default the\nagent hands analyses to analysts that run in parallel, on the data folders you\ngave the project, and keeps its own memory under /workspace/memory/. Read what\nit has for you in the Reader tab: README.md, the front page (what waits for\nyou, what is running, where things stand, what is known); staging/, the claims\nwaiting for you; results/, what you accepted; logbook/, the story of the work,\none entry per topic, written when you type /log. The agent writes these pages;\ndo not edit them.\n\nBy default a finding can be accepted only once it was re-run and an\nindependent referee read it; its page shows what both found. Accept it by\nsaying \"accept F-3\". The helpers and the checks are switches: the project's\nsettings say what a new session starts with, and /rs-mode (/skill:rs-mode in\npi) switches them for one session.\n\nWith the planner on, claude-plan (pi-plan in pi) starts the planning session\nand claude-work <package> (pi-work <package>) a work session on one work\npackage, each on its role's model; /rs-plan and /rs-work <package>\n(/skill:rs-plan, /skill:rs-work <package> in pi) take the same roles in a\nrunning session.\n"
 }

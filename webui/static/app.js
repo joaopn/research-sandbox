@@ -4527,7 +4527,7 @@ async function renderPortsInto(view) {
 }
 
 // Host → Defaults: the installation-wide choices a project picks up when it is
-// created or next starts — the researcher-subagents models (referee, analyst,
+// created or next starts — the researcher models (referee, analyst,
 // surveyor, planning session, work session) and the task limit. Every row is built synchronously before any
 // fetch, so the order never depends on fetch timing; each fills through its
 // own read, and a failed read is a quiet badge in its row (Refresh retries).
@@ -4551,25 +4551,25 @@ function renderDefaultsInto(view) {
         el("div", { class: "mgmt-infra-sub" }, ["Referee"]),
         refereeRow,
         el("div", { class: "hint" }, [
-            "The referee checks a finding in a researcher-subagents project before you " +
+            "The referee checks a finding in a researcher project before you " +
             "accept it. A new project of that type starts with this model; change an " +
             "existing one in its ⚙ Agents box."]),
         el("div", { class: "mgmt-infra-sub" }, ["Analyst"]),
         analystRow,
         el("div", { class: "hint" }, [
-            "The analyst carries out one analysis for the agent of a researcher-subagents " +
+            "The analyst carries out one analysis for the agent of a researcher " +
             "project, in parallel with others. The default for new projects of that type; " +
             "change an existing one in its ⚙ Agents box."]),
         el("div", { class: "mgmt-infra-sub" }, ["Surveyor"]),
         surveyorRow,
         el("div", { class: "hint" }, [
             "The surveyor answers one question from the web for the agent of a " +
-            "researcher-subagents project. The default for new projects of that type; " +
+            "researcher project. The default for new projects of that type; " +
             "change an existing one in its ⚙ Agents box."]),
         el("div", { class: "mgmt-infra-sub" }, ["Planning session"]),
         plannerRow,
         el("div", { class: "hint" }, [
-            "The planning session splits the work of a researcher-subagents project with its " +
+            "The planning session splits the work of a researcher project with its " +
             "planner on into work packages, with you (claude-plan, /rs-plan). The default for " +
             "new projects of that type; change an existing one in its ⚙ Agents box."]),
         el("div", { class: "mgmt-infra-sub" }, ["Work session"]),
@@ -10845,7 +10845,7 @@ function fillSettingsRow(view, row, settings, notice) {
 // One installation-wide model/effort DEFAULT row (Services → Reviews,
 // Host → Defaults), for a type no project dialog sets: `reviewer` (review_pr resolves
 // it live at each run, so Apply takes effect on the very next review) and
-// `referee` (a finding's referee in researcher-subagents projects: the next
+// `referee` (a finding's referee in researcher projects: the next
 // such project created starts with it; an existing one keeps its own, changed
 // in its ⚙ Agents box). Apply writes the pair into the operator's untracked
 // override via the token-gated model_default_set verb; Reset clears the
@@ -13064,7 +13064,7 @@ const MODEL_PICKER_SPECS = [
     ["worker", "Workers", "Headless analysis workers the agent spawns."],
     ["role", "Role-MCPs", "Tool services workers call — one session per tool-call."],
 ];
-// A researcher-subagents project's helper roles and its finding referee, in the
+// A researcher project's helper roles and its finding referee, in the
 // order the create dialog shows them after Agent. They render only for a
 // manifest with `subagents: true` (elsewhere the backend refuses the fields),
 // each prefilled from its installation default (Host → Defaults).
@@ -13442,7 +13442,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     const isDev = !!manifest.dev;
     // a researcher project is its research agent (the memory kit): it needs one, as dev does
     const isResearcher = manifest.memory === true;
-    // the researcher-subagents type: its helpers' and referee's models beside Agent
+    // the researcher type: its helpers' and referee's models beside Agent
     const isSubagents = manifest.subagents === true;
     const showInBox = !isDev && (isDocker || boxCapable);
 
@@ -13450,7 +13450,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     // so the "Agent" picker is universal (the dev card included — a dev project
     // has no worker layer, so it gets exactly one picker, like any other
     // non-research workflow). Workers/Role-MCPs only where a worker layer exists;
-    // Analyst, Surveyor and Referee only on a researcher-subagents workflow.
+    // Analyst, Surveyor and Referee only on a researcher workflow.
     const cat = state.modelCatalog;
     const modelPickers = cat
         ? [...MODEL_PICKER_SPECS.filter(([ctype]) => ctype === "supervisor" || hasWorkerLayer),
@@ -13549,8 +13549,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     // card is offered ONLY on dind workflows (!isDocker): the backend rejects reader
     // on the docker substrate, so showing it there would be a dead-end control.
     // A workflow can MANDATE the reader with `services: {reader: true}` (the
-    // researcher type: its memory is read there). The manifest forces it on
-    // server-side, so the card is pre-checked and locked, as node's is.
+    // researcher and companion types: their memory is read there). The
+    // manifest forces it on server-side, so the card is pre-checked and locked, as node's is.
     const readerMandatory = !!(manifest.services && manifest.services.reader === true);
     const readerCb = el("input", { type: "checkbox" });
     readerCb.checked = readerMandatory;
@@ -13676,7 +13676,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             ]),
         ]),
     ]);
-    // pi's referee and analyst (a researcher-subagents workflow; pi has no
+    // pi's referee and analyst (a researcher workflow; pi has no
     // surveyor): each its own model and thinking level. The referee's empty
     // model = the Agent model above (create refuses when both are empty); the
     // analyst's empty = pi's default. Changed later in the project's ⚙ Agents box.
@@ -13829,7 +13829,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         statusBarCard.classList.toggle("selected", statusBarCb.checked);
     };
     let activeAgentTab = "";
-    // The researcher workflow's switches (researcher-subagents only): its own
+    // The researcher workflow's switches (researcher projects only): its own
     // box under Agents, on the defaults; the planner's start line names the
     // agents ticked (syncAgents keeps it level).
     const switchBox = isSubagents
@@ -14313,7 +14313,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 // supervisor_* while Claude is on (always, on research);
                 // worker_*/role_* only where a worker layer exists (from_kwargs
                 // rejects them elsewhere, and the pickers are filtered to match);
-                // analyst_*/surveyor_*/referee_* on a researcher-subagents
+                // analyst_*/surveyor_*/referee_* on a researcher
                 // workflow only, likewise (planner_*/work_* too); pi_model/pi_thinking
                 // while pi is on, and pi_referee_*/pi_analyst_*/pi_planner_*/pi_work_*
                 // there too on that workflow. Every key is in
@@ -17428,7 +17428,7 @@ function openProjectConfigBox(project) {
 // Extensions, Agents, Workflow, Sharing, Ports, Alerts and Project in that
 // order (the short form, for a project whose tabs never loaded or that is
 // stopped: Tabs, Workflow, Sharing, Ports, Alerts, Project). Workflow's tab
-// shows only on a researcher-subagents project, once the agents read says so. It opens on Tabs; which section was
+// shows only on a researcher project, once the agents read says so. It opens on Tabs; which section was
 // picked is not remembered.
 // Every pane is built at open (the hidden ones are display:none), so each
 // section loads as it did when it was a folded box. Every section builder
@@ -17537,7 +17537,7 @@ function makeProjectConfigBox(project) {
     return layout;
 }
 
-// ---- the researcher workflow's switches (researcher-subagents projects) ----
+// ---- the researcher workflow's switches (researcher projects) ----
 // One settings box, in the New Project window and in the project's ⚙ Workflow
 // section, for Claude and pi projects alike: the Planner, Subagents and
 // Checks switches, the workflow they make drawn beside them, what that
@@ -17789,7 +17789,7 @@ function researchSwitchBox(opts) {
     };
 }
 
-// The ⚙ Workflow section of a researcher-subagents project: the box on the
+// The ⚙ Workflow section of a researcher project: the box on the
 // recorded switches, an Apply that sends only the switches that changed. With
 // the planner on, the project's packages are read once as the window opens
 // (no polling): an open package, or one RS cannot read, locks the planner's
@@ -17988,7 +17988,7 @@ function agentsBoxContent(name, d, cat, staged) {
         ? MODEL_PICKER_SPECS.filter(([ct]) => ct !== "supervisor").map(([ct, title, hint]) =>
             [ct, modelPicker(cat, ct, title, hint, { unchanged: true })])
         : [];
-    // A researcher-subagents project: the finding referee's model under
+    // A researcher project: the finding referee's model under
     // Claude (pi's referee has its own row on pi's tab). Read at each referee
     // run, so a change restarts nothing.
     const referee = d.subagents === true ? (d.referee || { model: "", effort: "" }) : null;
@@ -18078,7 +18078,7 @@ function agentsBoxContent(name, d, cat, staged) {
     piModelI.addEventListener("input", () => { piTouched = true; });
     piThinkS.addEventListener("change", () => { piTouched = true; });
     const piRows = harnessPiRows(harness);
-    // pi's analyst (a researcher-subagents project; pi has no surveyor): its
+    // pi's analyst (a researcher project; pi has no surveyor): its
     // own model and thinking level, empty = pi's default.
     const piAnalystInit = d.pi_analyst || { model: "", thinking: "" };
     const piAnalystModelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
