@@ -5,6 +5,8 @@
 # A handshake older than MAX_AGE_S (or none) is renewed first: one DNS query
 # to the first resolver goes into the tunnel, which makes WireGuard shake
 # hands, and the handshake is awaited up to WAIT_S seconds.
+# `status.sh peek MAX_AGE_S` prints the same line from the current handshake
+# alone: nothing is renewed and nothing awaited.
 set -u
 WAIT=$1; MAX=$2
 ip link show wg0 >/dev/null 2>&1 || { echo "down nolink"; exit 0; }
@@ -14,7 +16,7 @@ age() {
 }
 fresh() { [ "$1" != none ] && [ "$1" -le "$MAX" ]; }
 a=$(age)
-if ! fresh "$a"; then
+if [ "$WAIT" != peek ] && ! fresh "$a"; then
     dns=$(head -n 1 /etc/wireguard/dns 2>/dev/null)
     [ -n "$dns" ] && timeout "$WAIT" nslookup example.org "$dns" >/dev/null 2>&1 &
     end=$(( $(date +%s) + WAIT ))

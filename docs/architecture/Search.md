@@ -99,7 +99,7 @@ The box saves at once, with the settings as they are saved. Ticking it shows the
 
 ## The VPN
 
-Settings → **VPN**, shown while the VPN version is on, holds the VPN every search asked through `search-vpn` uses. It is WireGuard only, the kind most VPN providers offer as a small configuration file from their account page. The section shows the VPN's state first: no VPN configuration stored; the tunnel up, with the VPN's endpoint (the name and the address it was resolved to), the address the VPN gave this side, its DNS and how long ago the last handshake was; the tunnel down, with what went wrong; or off while the search service is not running.
+Settings → **VPN**, shown while the VPN version is on, holds the VPN every search asked through `search-vpn` uses. It is WireGuard only, the kind most VPN providers offer as a small configuration file from their account page. The section shows the VPN's state first: no VPN configuration stored; the tunnel up, with the VPN's endpoint (the name and the address it was resolved to), the address the VPN gave this side, its DNS and how long ago the last handshake was; the tunnel down, with what went wrong; or off while the search service is not running. The page never waits for the tunnel: the service checks it in the background (a check waits a few seconds for the VPN server's handshake) and the page shows the last result at once, with **checking…** beside it while a check runs; right after a Save the section says **connecting…** until the first check of the new configuration ends. A VPN search still waits for the tunnel before it starts.
 
 There are two ways in, switched by a pair of buttons, and both are stored as the same configuration:
 

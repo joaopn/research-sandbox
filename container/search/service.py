@@ -179,9 +179,8 @@ VPN_SESSION_MAX_AGE_S = 180
 # sends its handshake at once and repeats it after 5 seconds when unanswered
 # (REKEY_TIMEOUT); a handshake is one round trip to the VPN server (well under
 # a second). Six seconds covers the first try and one repeat; a VPN search
-# with a dead tunnel fails after this long, and the status check on the page
-# (inside the host's 25-second deadline, with the setup before it) waits it
-# at most.
+# with a dead tunnel fails after this long. The page's status never waits it:
+# the check runs in the background and the page reads its last result.
 VPN_HANDSHAKE_WAIT_S = 6
 # Why a VPN search does not run (its outcome's reason starts so).
 VPN_NOT_UP = "the VPN tunnel is not up: "
@@ -662,10 +661,28 @@ def ensure_searxng() -> str | None:
 
 # --- the VPN gateway and the VPN's SearXNG ---------------------------------------------
 
+# Held while the gateway is set up, and for a moment by every look at it:
+# never across a wait for a handshake.
 _vpn_lock = threading.Lock()
 # Why the last setup of the gateway failed (None when it did not): the
 # status says it until the next setup.
 _vpn_error: str | None = None
+# The tunnel's checks (status.sh's renew-and-wait). One runs at a time (it
+# holds _check_run_lock for its whole wait); _check_lock guards the fields
+# below and is held only for a moment, so a read never waits on a check.
+_check_run_lock = threading.Lock()
+_check_lock = threading.Lock()
+# The last finished check since the configuration was last applied
+# ({tunnel, handshake_s, error}, None when none finished) and when it
+# finished (time.monotonic()).
+_check_result: dict | None = None
+_check_at = 0.0
+# Bumped at every setup of the gateway: a check started before it records
+# nothing (it looked at a tunnel that is gone).
+_check_gen = 0
+# Checks running or waiting to run, and whether the background one is out.
+_checks_running = 0
+_check_background = False
 _WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
 # A port and a keepalive interval are 16-bit numbers in WireGuard.
 _U16_MAX = 65535
@@ -784,23 +801,27 @@ def ensure_vpn() -> str | None:
     """Bring the VPN gateway in line with the delivered configuration: none
     delivered, it and the VPN's SearXNG go; one delivered, the gateway runs
     (re-created when its image changed) and is set up again with it, then the
-    VPN's SearXNG runs on its route. None, or why it is not set up (also
-    kept for the status)."""
+    VPN's SearXNG runs on its route, and a check of the tunnel starts in the
+    background (the previous one's result is forgotten). None, or why it is
+    not set up (also kept for the status)."""
     global _vpn_error
     with _vpn_lock:
         cfg = read_vpn()
         if cfg is None:
             remove_vpn()
+            _forget_checks()
             _vpn_error = None
             if os.path.exists(VPN_PATH):
                 _vpn_error = "the VPN configuration the search service was handed is not usable"
             return _vpn_error
         _vpn_error = _ensure_vpn(cfg)
+        _forget_checks()
         if _vpn_error:
             log(f"vpn: {_vpn_error}")
-        else:
-            log("vpn gateway set up")
-        return _vpn_error
+            return _vpn_error
+        log("vpn gateway set up")
+    start_check()
+    return None
 
 
 def _ensure_vpn(cfg: dict) -> str | None:
@@ -887,24 +908,37 @@ def ensure_searxng_vpn(cfg: dict, gateway_fresh: bool) -> str | None:
     return None
 
 
-def vpn_status() -> dict:
-    """{tunnel: up | down | off, handshake_s, error}: off when no
-    configuration was delivered or the gateway does not run; else up when
-    the tunnel has a handshake younger than VPN_SESSION_MAX_AGE_S (renewed
-    and awaited up to VPN_HANDSHAKE_WAIT_S when it is older)."""
+def _vpn_look() -> tuple[dict | None, dict | None, str | None]:
+    """(cfg, off-or-error reply, peek): the delivered configuration; the
+    reply when the tunnel cannot be checked (no configuration, the gateway
+    not running, its setup failed), else None; and the tunnel's state from
+    its current handshake alone (status.sh peek: nothing renewed or awaited),
+    "up <age>" or None when it is not fresh or could not be read."""
     with _vpn_lock:
         cfg = read_vpn()
         if cfg is None:
-            return {"tunnel": "off", "handshake_s": None,
-                    "error": "no VPN configuration is stored (the operator stores one "
-                             "under Search → Settings → VPN)"}
+            return None, {"tunnel": "off", "handshake_s": None, "checking": False,
+                          "error": "no VPN configuration is stored (the operator stores "
+                                   "one under Search → Settings → VPN)"}, None
         if container_state(VPN_CONTAINER)[0] != "running":
-            return {"tunnel": "off", "handshake_s": None,
-                    "error": _vpn_error or "the VPN gateway is not running"}
+            return cfg, {"tunnel": "off", "handshake_s": None, "checking": False,
+                         "error": _vpn_error or "the VPN gateway is not running"}, None
         if _vpn_error:
-            return {"tunnel": "down", "handshake_s": None, "error": _vpn_error}
+            return cfg, {"tunnel": "down", "handshake_s": None, "checking": False,
+                         "error": _vpn_error}, None
         r = docker("exec", VPN_CONTAINER, "/bin/sh", f"{VPN_SCRIPTS}/status.sh",
-                   str(VPN_HANDSHAKE_WAIT_S), str(VPN_SESSION_MAX_AGE_S))
+                   "peek", str(VPN_SESSION_MAX_AGE_S))
+    words = r.stdout.decode("utf-8", "replace").split() if r.returncode == 0 else []
+    up = len(words) == 2 and words[0] == "up" and words[1].isdigit()
+    return cfg, None, (int(words[1]) if up else None)
+
+
+def _tunnel_check(cfg: dict) -> dict:
+    """One check: status.sh renews a handshake older than
+    VPN_SESSION_MAX_AGE_S and awaits it up to VPN_HANDSHAKE_WAIT_S.
+    {tunnel: up | down, handshake_s, error}."""
+    r = docker("exec", VPN_CONTAINER, "/bin/sh", f"{VPN_SCRIPTS}/status.sh",
+               str(VPN_HANDSHAKE_WAIT_S), str(VPN_SESSION_MAX_AGE_S))
     words = r.stdout.decode("utf-8", "replace").split() if r.returncode == 0 else []
     server = f"{cfg['endpoint_ip']}:{cfg['endpoint_port']}"
     if len(words) == 2 and words[0] == "up" and words[1].isdigit():
@@ -913,7 +947,9 @@ def vpn_status() -> dict:
         return {"tunnel": "down", "handshake_s": None,
                 "error": f"the VPN server at {server} did not answer the tunnel's handshake "
                          f"within {VPN_HANDSHAKE_WAIT_S} seconds (check the configuration's "
-                         "keys and endpoint, and that the VPN account is active)"}
+                         "keys and endpoint, that the VPN account is active, and that the "
+                         "network this host is on lets UDP to port "
+                         f"{cfg['endpoint_port']} out)"}
     if len(words) == 3 and words[:2] == ["down", "stale"] and words[2].isdigit():
         return {"tunnel": "down", "handshake_s": int(words[2]),
                 "error": f"the VPN server at {server} has not answered for {words[2]} seconds"}
@@ -921,6 +957,109 @@ def vpn_status() -> dict:
         return {"tunnel": "down", "handshake_s": None, "error": "the tunnel is not set up"}
     return {"tunnel": "down", "handshake_s": None,
             "error": f"the VPN gateway's state could not be read ({first_line(r)})"}
+
+
+def _forget_checks() -> None:
+    """The gateway was set up again (or removed): no check has finished on
+    it, and a check that runs now records nothing. Called under _vpn_lock."""
+    global _check_result, _check_gen
+    with _check_lock:
+        _check_result = None
+        _check_gen += 1
+
+
+def _run_check() -> dict:
+    """Run one check, after any check already running (at most one runs at
+    a time), and record its result as the last finished one unless the
+    gateway was set up again meanwhile. A check that finished while this one
+    waited for its turn answers for it. The result."""
+    global _checks_running, _check_result, _check_at
+    asked = time.monotonic()
+    with _check_lock:
+        gen = _check_gen
+        _checks_running += 1
+    try:
+        with _check_run_lock:
+            with _check_lock:
+                if gen == _check_gen and _check_result is not None and _check_at >= asked:
+                    return dict(_check_result)
+            cfg, off, _peek = _vpn_look()
+            res = off if off is not None else _tunnel_check(cfg)
+            res = {k: res[k] for k in ("tunnel", "handshake_s", "error")}
+            with _check_lock:
+                if gen == _check_gen:
+                    _check_result, _check_at = dict(res), time.monotonic()
+            return res
+    finally:
+        with _check_lock:
+            _checks_running -= 1
+
+
+def _background_check() -> None:
+    global _check_background
+    while True:
+        with _check_lock:
+            gen = _check_gen
+        try:
+            _run_check()
+        except Exception as e:      # the thread ends; the next read starts another
+            log(f"vpn: the tunnel's check failed ({type(e).__name__})")
+        with _check_lock:
+            if gen == _check_gen:
+                _check_background = False
+                return
+        # The gateway was set up again while it ran: check the new tunnel.
+
+
+def start_check() -> None:
+    """Start a check of the tunnel in the background, unless one is out."""
+    global _check_background
+    with _check_lock:
+        if _check_background:
+            return
+        _check_background = True
+    threading.Thread(target=_background_check, daemon=True).start()
+
+
+def vpn_status() -> dict:
+    """The tunnel as the operator's page reads it, at once (never awaiting a
+    handshake): {tunnel: up | down | off | checking, handshake_s, error,
+    checking}. off when no configuration was delivered or the gateway does
+    not run; up when its handshake is younger than VPN_SESSION_MAX_AGE_S;
+    else the last finished check's result (checking: no check has finished
+    since the configuration was last applied), and a check starts in the
+    background unless one runs or the last one found the tunnel down less
+    than VPN_SESSION_MAX_AGE_S ago (a result is trusted as long as a
+    handshake would be). `checking` (the field): a check runs now."""
+    _cfg, off, peek = _vpn_look()
+    if off is not None:
+        return off
+    with _check_lock:
+        busy = _checks_running > 0 or _check_background
+        if peek is not None:
+            return {"tunnel": "up", "handshake_s": peek, "error": None, "checking": busy}
+        last = None if _check_result is None else dict(_check_result)
+        trusted = (last is not None and last["tunnel"] == "down"
+                   and time.monotonic() - _check_at < VPN_SESSION_MAX_AGE_S)
+    if not busy and not trusted:
+        start_check()
+        busy = True
+    if last is None:
+        return {"tunnel": "checking", "handshake_s": None, "error": None, "checking": busy}
+    return dict(last, checking=busy)
+
+
+def vpn_wait_up() -> dict:
+    """The tunnel as a VPN search's start needs it: a fresh handshake as it
+    is, else a check (renewed and awaited up to VPN_HANDSHAKE_WAIT_S), whose
+    result is recorded as the last finished one. {tunnel, handshake_s,
+    error}."""
+    _cfg, off, peek = _vpn_look()
+    if off is not None:
+        return off
+    if peek is not None:
+        return {"tunnel": "up", "handshake_s": peek, "error": None}
+    return _run_check()
 
 
 # --- the agent's output, followed live -----------------------------------------------
@@ -2446,7 +2585,7 @@ def run_search(rec: dict, started, stopped) -> tuple[str, dict]:
     if rec["vpn"]:
         # A VPN search runs only on a tunnel that is up: never from the
         # host's address, and nothing is made for it otherwise.
-        st = vpn_status()
+        st = vpn_wait_up()
         vpn_cfg = read_vpn()
         if st["tunnel"] != "up" or vpn_cfg is None:
             return "failed", {"reason": VPN_NOT_UP + (st["error"] or "the VPN gateway is "
@@ -2971,7 +3110,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/vpn" and not post:
             return self._json(200, vpn_status())
         if path == "/admin/vpn/apply" and post:
-            ensure_vpn()
+            ensure_vpn()                # the gateway set up again; a check starts
             return self._json(200, vpn_status())
         if path == "/admin/clear" and post:
             return self._json(200, SEARCHES.clear_ended())

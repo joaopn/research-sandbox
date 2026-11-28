@@ -24590,8 +24590,9 @@ SEARCH_VPN_NONE_GIVEN = "give the VPN configuration as the configuration file or
 # A VPN configuration stored while the VPN version is unticked: the service
 # holds no key and runs no gateway.
 SEARCH_VPN_UNTICKED = "the VPN version is off (Enable the VPN version turns it on)"
-# The tunnel's states as the service reports them (service.py — MIRROR).
-_SEARCH_TUNNEL_STATES = ("up", "down", "off")
+# The tunnel's states as the service reports them (service.py — MIRROR);
+# "checking": no check of it has finished since the configuration was applied.
+_SEARCH_TUNNEL_STATES = ("up", "down", "off", "checking")
 
 
 @dataclass(frozen=True)
@@ -24637,27 +24638,33 @@ def _search_vpn_resolve(record: dict) -> dict:
 
 
 def _search_tunnel(deadline: float | None, apply: bool) -> dict:
-    """{tunnel, handshake_s, error} from the running service (`apply`: after
-    it (re)applied the configuration it holds), or tunnel "off" when it is not
-    running. The answer is checked again (the service runs search agents)."""
+    """{tunnel, handshake_s, error, checking} from the running service
+    (`apply`: after it (re)applied the configuration it holds), or tunnel
+    "off" when it is not running. The service answers at once: `checking`
+    says a check of the tunnel runs there now. The answer is checked again
+    (the service runs search agents)."""
     state, labels = _search_container(deadline)
     if state != "running" or labels.get(search.OWNER_LABEL) != search.OWNER_VALUE:
-        return {"tunnel": "off", "handshake_s": None, "error": None}
+        return {"tunnel": "off", "handshake_s": None, "error": None, "checking": False}
     out = _search_admin("vpn-apply" if apply else "vpn", deadline)
     if out is None:
-        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_NO_ANSWER}
+        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_NO_ANSWER,
+                "checking": False}
     tunnel, hs, err = out.get("tunnel"), out.get("handshake_s"), out.get("error")
-    if tunnel not in _SEARCH_TUNNEL_STATES             or not (hs is None or (isinstance(hs, int) and not isinstance(hs, bool) and hs >= 0))             or not (err is None or isinstance(err, str)):
-        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_BAD_ANSWER}
+    checking = out.get("checking")
+    if tunnel not in _SEARCH_TUNNEL_STATES             or not (hs is None or (isinstance(hs, int) and not isinstance(hs, bool) and hs >= 0))             or not (err is None or isinstance(err, str))             or not isinstance(checking, bool):
+        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_BAD_ANSWER,
+                "checking": False}
     return {"tunnel": tunnel, "handshake_s": hs,
-            "error": None if err is None else err[:_SEARCH_REASON_MAX]}
+            "error": None if err is None else err[:_SEARCH_REASON_MAX], "checking": checking}
 
 
 def _search_tunnel_shown(record: dict | None, deadline: float | None, apply: bool) -> dict:
     """The tunnel as the page shows it: off (and why) while the VPN version
     is unticked with a configuration stored, else as the service sees it."""
     if record is not None and not _search_settings()["vpn"]:
-        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_VPN_UNTICKED}
+        return {"tunnel": "off", "handshake_s": None, "error": SEARCH_VPN_UNTICKED,
+                "checking": False}
     return _search_tunnel(deadline, apply=apply)
 
 
@@ -24666,23 +24673,25 @@ def _search_vpn_reply(record: dict | None, tunnel: dict) -> dict:
     return {"configured": pub["configured"], "endpoint": pub["endpoint"],
             "endpoint_ip": pub["endpoint_ip"], "address": pub["address"], "dns": pub["dns"],
             "tunnel": tunnel["tunnel"], "handshake_s": tunnel["handshake_s"],
-            "error": tunnel["error"], "note": pub["note"]}
+            "error": tunnel["error"], "checking": tunnel["checking"], "note": pub["note"]}
 
 
 def search_vpn(deadline: float | None = None) -> dict:
     """The VPN as the Search page shows it: the stored configuration's public
-    parts (never a key), and the tunnel as the running service sees it
-    (`off` when the service or its gateway is not running)."""
+    parts (never a key), and the tunnel as the running service last saw it
+    (`off` when the service or its gateway is not running, `checking` while
+    no check has finished since the configuration was applied), answered at
+    once: `checking` says a check runs now."""
     deadline = _mcp_deadline() if deadline is None else deadline
     try:
         record = search.read_vpn_file()
     except search.SearchError as e:
         return dict(_search_vpn_reply(None, {"tunnel": "off", "handshake_s": None,
-                                             "error": str(e)}))
+                                             "error": str(e), "checking": False}))
     try:
         tunnel = _search_tunnel_shown(record, deadline, apply=False)
     except search.SearchError as e:
-        tunnel = {"tunnel": "off", "handshake_s": None, "error": str(e)}
+        tunnel = {"tunnel": "off", "handshake_s": None, "error": str(e), "checking": False}
     return _search_vpn_reply(record, tunnel)
 
 
