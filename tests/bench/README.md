@@ -41,7 +41,7 @@ when the eval is done. By default: `researcher` and `floor` (a plain
 `sandbox-dind` project). Opt in with `--arms`: `researcher-pi`,
 `researcher-nohook` (no start hook), `research` (the research flow, with its
 `/log` at each session's end; the scripted PI approves every plan and staged cycle it asks about).
-`researcher-subagents` runs the researcher-subagents type with Claude; each referee run's tokens are read from its verdict file and shown apart in the table, as part of the eval's tokens.
+`researcher-subagents` runs the researcher type with Claude and its default switches (analyst helpers, finding checks); each referee run's tokens are read from its verdict file and shown apart in the table, as part of the eval's tokens. The other researcher arms (`researcher`, `researcher-pi`, `researcher-nohook`) run the researcher type with both its switches off (`--subagents off --checks off`), which is what the retired plain researcher type was; the arms keep their names so earlier results stay comparable.
 
 ## Running
 

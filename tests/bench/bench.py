@@ -31,7 +31,8 @@ line: a Claude token is written over stdin as the project's Claude credentials
 file (where /login puts it); keys go over stdin into a 0600 file under the
 project's own /dev/shm, sourced by the agent's shell.
 
-Arms:
+Arms (researcher, researcher-pi and researcher-nohook run the researcher type
+with its subagents and checks off, what the retired plain researcher type was):
   researcher        the researcher type with Claude
   floor             a plain sandbox-dind project with Claude (no memory kit;
                     Claude's built-in memory on)
@@ -40,8 +41,9 @@ Arms:
   research          the existing research flow (Claude as supervisor; the
                     PI's /log at each session's end, its own memory; the PI
                     approves every plan and staged cycle the flow asks about)
-  researcher-subagents  the researcher-subagents type with Claude (analyst
-                    helpers; each referee run's tokens counted apart)
+  researcher-subagents  the researcher type with Claude and its default
+                    switches (analyst helpers, finding checks; each referee
+                    run's tokens counted apart)
 """
 from __future__ import annotations
 
@@ -72,13 +74,20 @@ STANDIN_PORT = 8719
 STANDIN_KEY = "sk-ant-stub-0123456789abcdefghij"
 PI_KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY",
               "openai": "OPENAI_API_KEY", "google": "GEMINI_API_KEY"}
+# The researcher type's switches with both off: what the retired plain
+# researcher type was, as near as the switches make it (the arms keep their
+# labels, so earlier results stay comparable).
+PLAIN_SWITCHES = {"subagents": "off", "checks": "off"}
 ARMS = {
-    "researcher": {"workflow": "researcher", "agent": "claude", "memory": True},
+    "researcher": {"workflow": "researcher", "agent": "claude", "memory": True,
+                   "switches": PLAIN_SWITCHES},
     "floor": {"workflow": "sandbox-dind", "agent": "claude", "memory": False},
-    "researcher-pi": {"workflow": "researcher", "agent": "pi", "memory": True},
-    "researcher-nohook": {"workflow": "researcher", "agent": "claude", "memory": True, "nohook": True},
+    "researcher-pi": {"workflow": "researcher", "agent": "pi", "memory": True,
+                      "switches": PLAIN_SWITCHES},
+    "researcher-nohook": {"workflow": "researcher", "agent": "claude", "memory": True, "nohook": True,
+                          "switches": PLAIN_SWITCHES},
     "research": {"workflow": "research", "agent": "claude", "memory": False, "log": True, "approves": True},
-    "researcher-subagents": {"workflow": "researcher-subagents", "agent": "claude", "memory": True},
+    "researcher-subagents": {"workflow": "researcher", "agent": "claude", "memory": True},
 }
 DEFAULT_ARMS = ("researcher", "floor")
 # What the PI says to whatever an arm with "approves" waits on: the research
@@ -124,12 +133,13 @@ ANSWER: {answer}
 # The instruction rs-memory's background run is started with (container/researcher/rs-memory).
 CONSOLIDATION_TEXT = "and do exactly what it says. It is the whole task."
 PATH_RE = re.compile(r"(/workspace/[^\s`'\"()\[\],;]+)")
-# The project types whose findings are refereed: rs-memory's referee runs keep
+# The project types whose findings are refereed (unless an arm turns the
+# checks off): rs-memory's referee runs keep
 # no transcript (no session persistence), so their tokens are read from the
 # verdict each run writes, memory/checks/<id>/<n>/verdict.md, whose `usage:`
 # line names Claude's fields (input, output, cache_read, cache_creation) or
 # pi's (input, output, cacheRead, cacheWrite) (container/researcher/rs-memory).
-REFEREE_WORKFLOWS = ("researcher-subagents",)
+REFEREE_WORKFLOWS = ("researcher",)
 CHECKS_DIR = "/workspace/memory/checks"
 VERDICT_NAME = "verdict.md"
 VERDICT_FIELDS = {"input": ("input",), "output": ("output",),
@@ -406,6 +416,8 @@ class Bench:
         args = ["--workflow", spec["workflow"]]
         if spec["workflow"] != "research":
             args += ["--agent", spec["agent"]]
+        for k, v in spec.get("switches", {}).items():
+            args += [f"--{k}", v]
         c = self.create(p, *args)
         buf = io.BytesIO()                        # the data, as the PI would give it: /workspace/data
         with tarfile.open(fileobj=buf, mode="w") as t:
@@ -1047,7 +1059,8 @@ def side_transcript(p: str, others: "dict | set | None" = None) -> bool:
 
 
 def refereed(arm: str) -> bool:
-    return ARMS[arm]["workflow"] in REFEREE_WORKFLOWS
+    return (ARMS[arm]["workflow"] in REFEREE_WORKFLOWS
+            and ARMS[arm].get("switches", {}).get("checks") != "off")
 
 
 def verdict_file(p: str) -> bool:
