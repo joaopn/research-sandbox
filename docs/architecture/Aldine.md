@@ -43,7 +43,7 @@ Some agents can check the citations of a paper in Aldine and leave review commen
 
 | Where | Who has the check |
 |---|---|
-| A `researcher`, `researcher-subagents` or `companion` project | The project's own agent |
+| A `researcher` or `companion` project | The project's own agent |
 | A zotero box | The box's agent, in every project type that holds boxes except `research` |
 | A `research` project, other project types, other box types | No one |
 

@@ -6,7 +6,7 @@ nav_order: 1
 ---
 # Research workflow
 
-The `research` workflow is the original research workflow, one of the two built today. Its agent is a **supervisor**: it plans analyses with the user, runs each in a **worker** container inside the project, reviews the results and reports back. It is one of four research workflows; see [Research](Research.md) for the comparison.
+The `research` workflow, shown as **research (legacy)** in the New Project window, is the original research workflow, kept until the planned lab takes its parts. Its agent is a **supervisor**: it plans analyses with the user, runs each in a **worker** container inside the project, reviews the results and reports back. See [Research](Research.md) for the comparison with the other research workflows.
 
 ```mermaid
 flowchart TD

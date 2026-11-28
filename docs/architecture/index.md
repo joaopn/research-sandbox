@@ -36,9 +36,9 @@ flowchart TD
 |---|---|
 | [Projects](Projects.md) | What a project is, project types, agents, lifecycle |
 | [Research](Research.md) | The research workflows compared: three built, one planned |
-| ↳ [Research workflow](Research-workflow.md) | Built: how a supervisor plans, runs and reviews workers |
-| ↳ [Researcher workflow](Researcher-workflow.md) | Built: one long-lived agent with a memory, the pages it writes for the user, and a logbook; the companion, the same agent for one-off and mixed tasks |
-| ↳ [Researcher with subagents](Researcher-with-subagents.md) | Built: a researcher whose helpers, checks and work packages are switches: by default it hands analyses to parallel helpers and has each staged finding re-run and refereed |
+| ↳ [Research workflow](Research-workflow.md) | Built, research (legacy): how a supervisor plans, runs and reviews workers |
+| ↳ [Researcher: memory and pages](Researcher-workflow.md) | Built: the researcher, one long-lived agent with a memory, the pages it writes for the user, and a logbook; the companion, the same agent for one-off and mixed tasks |
+| ↳ [Researcher: helpers, checks and work packages](Researcher-with-subagents.md) | Built: the researcher's switches: by default it hands analyses to parallel helpers and has each staged finding re-run and refereed; a planner splits the work into packages |
 | ↳ [Lab workflow](Lab-workflow.md) | Planned: several researchers, a board, a lab meeting, budgets |
 | [Boxes](Boxes.md) | Box types; what a box can see of its project |
 | [MCP servers](MCP-servers.md) | The shared gateway, its server list, wiring to agents and boxes; the older per-project registry |
@@ -65,8 +65,8 @@ Each page ends with its full list of design decisions and their costs; these are
 
 ### [Research](Research.md)
 
-- The existing research workflow is the benchmark and is not changed; three lab-agenda workflows are added beside it, the first two (researcher, researcher with subagents) built and the lab planned.
-- The lab-agenda workflows are independent and built in order: a researcher, a researcher with subagents, a lab.
+- The existing research workflow, research (legacy), is the benchmark and is not changed; the lab-agenda workflows are added beside it: the researcher built, the lab planned. The companion stands beside them.
+- The lab-agenda workflows are independent and built in order: a researcher (its memory, then its helpers, checks and work packages, as switches of one type), then a lab.
 - Nothing becomes established knowledge without the user's acceptance; a referee advises the user and binds the agent.
 - Tools before prose, and the same behaviour under Claude and pi.
 
@@ -76,7 +76,7 @@ Each page ends with its full list of design decisions and their costs; these are
 - Supervision is enforced by checks: an approved plan before every spawn, no report while a finished worker's log is unread, a shape check on every accepted result.
 - Logs are immutable and read from summary down to source.
 
-### [Researcher workflow](Researcher-workflow.md)
+### [Researcher: memory and pages](Researcher-workflow.md)
 
 - Memory is four things kept apart: front page, record, journal, skills.
 - The record is immutable; a finding enters it only when the user accepts it.
@@ -86,7 +86,7 @@ Each page ends with its full list of design decisions and their costs; these are
 - The logbook is the story and the record is the truth: where they disagree, the record's standing holds.
 - The companion is its own type, not a setting on the researcher, and the same memory command in a mode, so the journal, jobs, skills and paper check are shared.
 
-### [Researcher with subagents](Researcher-with-subagents.md)
+### [Researcher: helpers, checks and work packages](Researcher-with-subagents.md)
 
 - Subagents keep nothing; knowledge stays in the researcher's one memory.
 - Analysts run in parallel and in the background; each result arrives on its own.

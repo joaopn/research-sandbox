@@ -1,14 +1,14 @@
 ---
-title: Researcher workflow
+title: "Researcher: memory and pages"
 parent: Research
 grand_parent: Architecture
 nav_order: 2
 ---
-# Researcher workflow
+# Researcher: memory and pages
 
-**Built (phase 1 of the lab agenda).** See [Research](Research.md) for the other workflows.
+**Built (phases 1 and 2 of the lab agenda).** See [Research](Research.md) for the other workflows.
 
-A `researcher` project holds one agent that pursues one line of inquiry for weeks. The user talks to it directly, and it does the analysis itself, in the project's own container. It has no workers and no subagents.
+A `researcher` project holds one agent that pursues one line of inquiry for weeks. The user talks to it directly, in the project's own container; it has no workers. This page describes its memory, the pages it writes for the user and its logbook. By default it also hands analyses to short-lived helpers and has every finding re-run and refereed before the user accepts it; those are switches, described with its work packages in [Researcher: helpers, checks and work packages](Researcher-with-subagents.md). A researcher with its subagents and checks off is what the plain researcher type was: that type is retired.
 
 Its purpose is memory. A finding from the first week is still there in the fourth week without anyone carrying it over. A dead end is remembered as a dead end, and a wiped context costs minutes.
 
@@ -82,13 +82,13 @@ The agent keeps its memory through one command, `rs-memory`. Its refusals name t
 
 A claim is one kind: a finding, an open question (`--question`), a retraction (`--withdraws`) or a fact (`--fact`). A claim given two kinds is refused. Every claim has a title (`--title`), a few words naming the result, by which the user's pages list it; a claim without one is refused. A title is a label, like a topic: changing it with `amend` voids no check. An entry staged before titles existed shows its statement in their place.
 
-A fact (`claim --fact`, an id `D-<n>`) is a descriptive result about the data: an inventory line, a gap, a count. It needs a scope and evidence like a finding, and the user's accept, but never the checks of a project with analysts. One accept can take several facts at once.
+A fact (`claim --fact`, an id `D-<n>`) is a descriptive result about the data: an inventory line, a gap, a count. It needs a scope and evidence like a finding, and the user's accept, but never a finding's checks. One accept can take several facts at once.
 
 The front page ends with a section of its own, "What we know about the data": one line per current accepted fact, with its id, statement and scope. It is written from the record every time the page is written, and an accept that changes it rewrites the page under the same page number. A fact that is withdrawn or superseded leaves it. The section is never read back as items, so consolidation cannot change it, but its beliefs may point at a fact, as at a finding.
 
 A finding's standing (current, superseded, contested, withdrawn) is computed from its relations each time it is shown. Accepted entries are never edited, so a correction of one is a new entry that supersedes it.
 
-A staged claim, still waiting for the user, can be corrected in place with `amend`. It keeps its id, and every earlier version stays on the entry. In a project with analysts, a changed statement, scope, hedge or evidence voids the finding's checks, which must run again.
+A staged claim, still waiting for the user, can be corrected in place with `amend`. It keeps its id, and every earlier version stays on the entry. A changed statement, scope, hedge or evidence voids the finding's checks, which must run again.
 
 A long run left going, such as a build of many hours, is registered with `job add`, by its process id and its log. Every session start shows each registered job as running, ended (with its log's last line, so a crash shows) or gone, so the next session knows about it and a crash does not go unnoticed.
 

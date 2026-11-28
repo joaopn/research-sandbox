@@ -8,7 +8,7 @@ nav_order: 4
 
 **Planned, not built.** Phase 3 of the lab agenda; see [Research](Research.md) for the other workflows.
 
-A `lab` project reproduces a research group. Several long-lived members each own a line of inquiry and the understanding behind it. Each student is a researcher, as in the [Researcher workflow](Researcher-workflow.md), working one line.
+A `lab` project reproduces a research group. Several long-lived members each own a line of inquiry and the understanding behind it. Each student is a researcher, as in [Researcher: memory and pages](Researcher-workflow.md), working one line.
 
 | Lab role | Member | Holds | Does |
 |---|---|---|---|

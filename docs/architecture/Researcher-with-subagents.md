@@ -1,14 +1,14 @@
 ---
-title: Researcher with subagents
+title: "Researcher: helpers, checks and work packages"
 parent: Research
 grand_parent: Architecture
 nav_order: 3
 ---
-# Researcher with subagents
+# Researcher: helpers, checks and work packages
 
 **Built (phase 2 of the lab agenda).** See [Research](Research.md) for the other workflows.
 
-A `researcher-subagents` project holds one researcher, as in the [Researcher workflow](Researcher-workflow.md): the same agent (Claude, pi or both), the same memory and logbook, the same Reader tab. It adds two things. The researcher hands analyses to short-lived helpers that run in parallel, and a finding is re-run and read by an independent referee before the user can accept it.
+A `researcher` project holds one researcher (Claude, pi or both) with the memory, pages and logbook described in [Researcher: memory and pages](Researcher-workflow.md). This page describes how it works by default and what its switches change. By default the researcher hands analyses to short-lived helpers that run in parallel, and a finding is re-run and read by an independent referee before the user can accept it; both are switches, and a third setting splits the work into packages.
 
 It is meant to do what the [Research workflow](Research-workflow.md) does with far fewer parts: no worker containers, no role-service containers, no supervision hook.
 
@@ -38,7 +38,7 @@ flowchart TD
 
 ## Creating one
 
-**Researcher with subagents** is a project type in the New Project window, beside `research` and `researcher`. Everything a researcher project gets, it gets: the memory, the Reader tab, at least one agent. The helpers are installed into the project's agents when it is created.
+**Researcher** is a project type in the Research group of the New Project window, beside **companion** and **research (legacy)**. It gets the memory, the Reader tab and at least one agent. The helpers are installed into the project's agents when it is created, whatever its switches, so a session can switch them on.
 
 ## Analysts
 
@@ -167,7 +167,7 @@ Under Claude the referee runs the model set for the whole installation in **Host
 
 **With the search service wired, all web access goes through it.** The isolation is the point, against prompt injection: pages are read by a search agent in a container of its own, and the researcher and its analysts see only its written summary. The web helper is something RS builds and can improve over time, not a Claude built-in subagent. Analysts call the service themselves, because the working session's context is the limit when every search is relayed through it. The cost: a quick lookup (a function's signature, a dataset's page) becomes a search of minutes instead of a fetch of seconds, and the paper check's source checker reads its sources through a search too. The deny binds the built-in web tools of the Claude Code RS installs; the agents' shell can still reach the web (the project's egress is unchanged), so the rest is the instructions'.
 
-**The checks exist only in projects of this type.** A `researcher` project behaves exactly as before.
+**The checks exist only in researcher projects.** A companion has none: its claims are made only when the user asks, and a record that sets both is refused.
 
 **The switches are the project's default, switchable per session.** As with a dev project's working mode, the project's setting is what a new session starts with and `/rs-mode` changes one running session. The cost is that a change in the project's settings does not reach a session already running.
 
@@ -179,7 +179,7 @@ Under Claude the referee runs the model set for the whole installation in **Host
 
 **The planner lock is a convenience; the update is the check.** The browser reads the packages once when the window opens and never polls; the update re-reads them before it writes. The cost is that a package opened meanwhile shows up only as a refused save.
 
-**Packages are folders of the same layout.** A package is one researcher's folder, as the top is, so its pages, memory and checks are the ones already built; the cost is that ids repeat across packages (each has its `F-1`), and the project's front page names the package beside each.
+**Packages are folders of the same layout.** A package is laid out like a researcher's workspace, as the top is, so its pages, memory and checks are the ones already built; the cost is that ids repeat across packages (each has its `F-1`), and the project's front page names the package beside each.
 
 **Holding is checked by the agent's process, not by a lease.** A take names the agent's process and its start time, so a session that ended frees its package by itself, and a reused process id is never mistaken for it. The cost is that a session that is still running but idle keeps its package until the user ends it.
 
